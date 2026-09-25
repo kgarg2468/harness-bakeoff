@@ -75,7 +75,9 @@ If you'd do something differently, edit this file in a PR, and A will be changed
       and the request is sent only after the runner has handled them. A history that ends with the
       user's request is passed as-is, with no `user_prompt`. A crash resume whose history already
       ends the turn (the final answer, or a cancelled response) sends nothing; a response with
-      neither text nor calls is no answer (the library asks again). A complete response with
+      neither text nor calls is no answer (the library asks again), unless the library raised on
+      it (out of output tokens, or empty and filtered: its saved finish reason says so), and then
+      the resume ends with an error as well, and sends nothing. A complete response with
       nothing to show (only a Responses reasoning item, which the library replays, or an empty
       one) still gets an item, with no content: without it the requests on either side would
       merge on rebuild, and the merge puts the retry prompt before the user's message.*
@@ -143,9 +145,9 @@ The library has no mechanism for these, so A has its own code (counted like ever
   so the retry is not a new step. No tool runs before a response is complete, so this is safe.
   `_retry_reason` has to recognize errors the library does not wrap (below).
 - **Deciding from the history what a resume must do** (`mapping.close_abandoned`, `this_turn`,
-  `spent`, `finished`: about 25 lines, and 8 in `_run`): close calls that must never run, end a
-  turn whose end is already saved without a request, and carry the steps and cost over. The
-  library resumes a history as it is and starts its usage at zero.
+  `spent`, `finished`: about 30 lines, and 10 in `_run`): close calls that must never run, end a
+  turn whose end is already saved without a request (with the stop the run reported), and carry
+  the steps and cost over. The library resumes a history as it is and starts its usage at zero.
 - **Keeping the response that crosses the budget** (4 lines in `_run`).
 - **Saving a sequential tool's result when it finishes** (`_Turn.tool_done`, the tool-node
   branch in `_run` and a skip in `flush`: about 20 lines); the library adds results to history
@@ -202,7 +204,9 @@ The library has no mechanism for these, so A has its own code (counted like ever
   on both (above). So when `max_output_tokens` runs out while the model reasons (OpenAI documents a
   reasoning-only `.incomplete` output), 2.31.1 asks again with its retry prompt ("Please return text
   or call a tool."), while 2.50.0 ends the turn with `UnexpectedModelBehavior` (token limit
-  exceeded). A failed attempt's usage is not reported (no `usage` event), even when
+  exceeded). A crash resume after that response was saved ends the same way on each (History,
+  above); its error says only "the model stopped before it answered", since the library's message is
+  not saved. A failed attempt's usage is not reported (no `usage` event), even when
   `response.failed` carries it, as for any stream that fails.
 - **Recorded**: the library merges consecutive requests before it sends them, with tool results
   and retry prompts first. A response it sends nothing for (a reasoning-only or empty one) still

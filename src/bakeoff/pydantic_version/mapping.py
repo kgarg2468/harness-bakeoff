@@ -174,20 +174,28 @@ def spent(history: list[ModelMessage]) -> RunUsage:
 
 
 def finished(history: list[ModelMessage], max_cost_usd: float | None = None) -> str | None:
-    """How the turn ended if its end is already saved (a crash came after it): "end_turn" after
-    the final answer ("budget" if the turn's cost crossed `max_cost_usd`, as the original run
-    reported), "cancelled" after a response cut short (a cancel, or a failed stream that ended
-    the turn). None if the turn goes on: a response with no text and no calls (say, reasoning
-    only) is no answer, and the library asks again."""
+    """How the turn ended if its end is already saved (a crash came after it), as the original
+    run reported it: "end_turn" after the final answer ("budget" if the turn's cost crossed
+    `max_cost_usd`), "cancelled" after a response cut short (a cancel, or a failed stream that
+    ended the turn), "error" after a response with neither text nor calls that the library
+    raises on instead of asking again: out of output tokens (finish reason "length", say a
+    reasoning-only `.incomplete` on 2.50.0), or empty and stopped by a content filter. None if
+    the turn goes on: any other response with neither (say, reasoning only on 2.31.1, which
+    gives `.incomplete` no finish reason) is no answer, and the library asks again."""
     turn = this_turn(history)
     response = next((m for m in reversed(turn) if isinstance(m, ModelResponse)), None)
     if response is not None and response.state == "interrupted":
         return "cancelled"
-    if turn and turn[-1] is response and not response.tool_calls and response.text:
+    if response is None or turn[-1] is not response or response.tool_calls:
+        return None
+    if response.text:
         cost = spent(history).cost or 0
         over = max_cost_usd is not None and cost > Decimal(str(max_cost_usd))
         return "budget" if over else "end_turn"
-    return None
+    # The library's rule for a response without output (the same in 2.31.1 and 2.50.0).
+    out_of_tokens = response.finish_reason == "length"
+    filtered = response.finish_reason == "content_filter" and not response.parts
+    return "error" if out_of_tokens or filtered else None
 
 
 def _tool(call_id: str, content: str) -> dict[str, Any]:

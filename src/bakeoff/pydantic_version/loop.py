@@ -57,6 +57,7 @@ from pydantic_ai import (
     ToolDefinition,
     ToolDenied,
     ToolFailed,
+    UnexpectedModelBehavior,
     UsageLimitExceeded,
     UsageLimits,
 )
@@ -90,6 +91,9 @@ _RETRY_HEADER = "x-stainless-retry-count"
 # Backoff before retrying a failed stream: the OpenAI SDK's own schedule (0.5 s doubling, max 8 s).
 _STREAM_RETRY_BASE_S = 0.5
 _STEP_CAP_RESULT = "Not run: the turn reached its step limit."
+# A crash resume's error when the saved last response already ended the turn with the library's
+# token limit (or content filter) error, whose text is not saved.
+_NO_ANSWER = "the model stopped before it answered (token limit or content filter)"
 # The Responses stream events that end a response the library may take: complete, or out of
 # `max_output_tokens` (the library answers that itself). Not `response.failed` or `error`.
 _RESPONSE_ENDS = ("response.completed", "response.incomplete")
@@ -307,7 +311,10 @@ class PydanticLoop:
             state.steps = usage.requests
             limit = turn.limits.max_cost_usd
             if turn.resume is not None and (stop := mapping.finished(history, limit)):
-                return {"stop": stop}  # a crash came after the turn's end was saved
+                # A crash came after the turn's end was saved: end it as the run did.
+                if stop == "error":
+                    raise UnexpectedModelBehavior(_NO_ANSWER)
+                return {"stop": stop}
         deferred = None
         if pending := mapping.pending_calls(history):
             # The library needs an answer for every open call; `_before_execute` asks again for

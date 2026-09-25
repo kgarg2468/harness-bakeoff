@@ -1172,11 +1172,11 @@ def responses_server(tmp_path: Path, *exchanges: dict[str, Any]) -> FakeProvider
     return FakeProvider(tmp_path, tmp_path / "wire")
 
 
-def responses_config(srv: FakeProvider, **kw: Any) -> ModelConfig:
+def responses_config(srv: FakeProvider, run: str = "r1", **kw: Any) -> ModelConfig:
     kw.setdefault("max_retries", 0)
     kw.setdefault("reasoning", {"effort": "xhigh", "summary": "auto"})
     return ModelConfig(
-        base_url=srv.base_url("R", "r1", "pydantic"),
+        base_url=srv.base_url("R", run, "pydantic"),
         model="gpt-6-luna",
         kind="openai_responses",
         temperature=None,
@@ -1184,9 +1184,9 @@ def responses_config(srv: FakeProvider, **kw: Any) -> ModelConfig:
     )
 
 
-def sent(tmp_path: Path) -> list[bytes]:
+def sent(tmp_path: Path, run: str = "r1") -> list[bytes]:
     """The request bodies fakeprov recorded for `responses_config`'s cursor, in order."""
-    return [body for body, _ in load_wire(tmp_path / "wire" / "R" / "r1" / "pydantic")]
+    return [body for body, _ in load_wire(tmp_path / "wire" / "R" / run / "pydantic")]
 
 
 async def test_responses_reasoning_goes_back_verbatim_and_stays_out_of_the_chat_view(
@@ -1440,3 +1440,63 @@ async def test_the_event_that_ends_a_responses_stream_is_read_across_chunks():
         state = loop_module._Turn("t", StubTools(), 1, set(), set(), responses_api=True)
         passed = [chunk async for chunk in loop_module._note_events(chunks(), state)]
         assert (b"".join(passed), state.event) == (body, "response.failed")
+
+
+@pytest.mark.parametrize(
+    ("reason", "reasoned", "run_ends"),
+    [
+        ("max_output_tokens", True, "length"),
+        ("content_filter", False, "content_filter"),
+        ("content_filter", True, None),
+    ],
+)
+async def test_a_crash_after_a_responses_response_without_output_ends_as_the_run_did(
+    loop, tmp_path, reason, reasoned, run_ends
+):
+    """Greptile #4105933163: 2.50.0 ends the run with the library's token limit error on a
+    reasoning-only `.incomplete` (content filter error on an empty one); 2.31.1 gives
+    `.incomplete` no finish reason and asks again, as 2.50.0 does for filtered reasoning. A crash
+    right after that response is saved (run r2) ends the resumed turn as the whole run (r1) did,
+    with the same requests."""
+    usage = {"input_tokens": 20, "output_tokens": 16, "reason": reason}
+    reasoning = [{"reasoning_item": REASONING}] if reasoned else []
+    exchanges = [
+        {"respond": {"stream": [*reasoning, {"incomplete": usage}]}},
+        {"respond": {"stream": [{"text": "Hello!"}, COMPLETED]}},
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        whole = await run(loop, turn([user("hi")], responses_config(srv)), StubTools())
+        cfg = responses_config(srv, run="r2")
+        history = [user("hi")]
+        stream = loop.run_turn(turn(history, cfg), StubTools(), asyncio.Event())
+        async with contextlib.aclosing(stream):
+            async for event in stream:
+                if event.type == "item":
+                    history.append(items([event])[0])
+                    break  # SIGKILL once the response is saved
+        [saved] = history[1:]
+        resumed = await run(loop, turn(history, cfg, resume=Resume("crash")), StubTools())
+
+    # 2.50.0 saves the finish reason and raises on it; 2.31.1 saves none and asks again.
+    raised = run_ends is not None and saved.native["finish_reason"] == run_ends
+    stop = of(whole, "turn.end")[0]["stop"]
+    assert stop == ("error" if raised else "end_turn")
+    assert of(resumed, "turn.end")[0]["stop"] == stop
+    assert len(sent(tmp_path, "r2")) == len(sent(tmp_path))
+
+
+@pytest.mark.parametrize("finish", ["length", "content_filter"])
+async def test_a_crash_after_an_empty_chat_response_that_ended_the_run_sends_nothing(loop, finish):
+    """Greptile #4105933163 on chat completions (2.31.1 too): an empty response that ran out of
+    tokens (or was filtered) ends the run with the library's error. After a crash that came once
+    it was saved, the resume ends the turn with an error too, and sends nothing."""
+    with SSEServer(Reply([done(finish, completion=16)]), Reply([*text("Hi"), done()])) as srv:
+        first = await run(loop, turn([user("hi")], config(srv)), StubTools())
+        history = [user("hi"), *items(first)]  # SIGKILL after the response was saved
+        resumed = await run(loop, turn(history, config(srv), resume=Resume("crash")), StubTools())
+
+    assert of(first, "turn.end")[0]["stop"] == "error"
+    assert [e["retryable"] for e in of(resumed, "error")] == [False]
+    assert of(resumed, "turn.end")[0]["stop"] == "error"
+    assert of(resumed, "turn.end")[0]["steps"] == 1
+    assert len(srv.bodies) == 1
