@@ -231,3 +231,11 @@ def test_empty_spans_are_not_mistaken_for_ambiguity():
     empty = "".join([])  # a real (empty) span, as a replacer could produce
     assert empty is not edit_match.AMBIGUOUS
     assert isinstance(edit_match.AMBIGUOUS, str)
+
+
+def test_tie_is_not_broken_by_a_later_replacer_with_two_candidates():
+    """Greptile's case: after a block-anchor tie, a later replacer that returns both blocks must
+    not have its first candidate silently edited."""
+    content = "start\nfoo bar\nbaz quX\nend\nstart\nfoo baX\nbaz qux\nend\n"
+    with pytest.raises(MultipleMatches):
+        replace(content, "start\nfoo bar\nbaz qux\nend", "NEW")

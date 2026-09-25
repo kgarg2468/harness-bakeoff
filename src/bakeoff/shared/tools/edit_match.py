@@ -338,15 +338,22 @@ def replace(content: str, old: str, new: str, replace_all: bool = False) -> str:
         )
 
     not_found = True
+    ambiguous = False  # an earlier replacer found several equally good spans
     for replacer in REPLACERS:
-        for search in replacer(content, old):
-            if search is AMBIGUOUS:
-                not_found = False  # something matched, just not uniquely
-                continue
+        spans = list(replacer(content, old))
+        if any(span is AMBIGUOUS for span in spans):
+            ambiguous = True
+            not_found = False  # something matched, just not uniquely
+        # An empty span would "match" between every character.
+        found = [s for s in dict.fromkeys(spans) if s and s is not AMBIGUOUS and s in content]
+        if ambiguous and len(found) > 1:
+            # Deviation from OpenCode: after a tie, never pick one of several candidates.
+            raise MultipleMatches(
+                "Found several similar blocks for old_string. Provide more surrounding context "
+                "to make the match unique."
+            )
+        for search in found:
             index = content.find(search)
-            # An empty span would "match" between every character.
-            if not search or index == -1:
-                continue
             not_found = False
             if _is_disproportionate(search, old):
                 raise EditError(
