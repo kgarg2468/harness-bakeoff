@@ -52,12 +52,15 @@ async def describe_component(args: dict[str, Any], ctx: ToolContext) -> str:
     return _json({"ok": True, "name": name, **service})
 
 
+def _one_pipeline(args: dict[str, Any]) -> str | None:
+    """`validate_pipeline` takes exactly one of `pipeline` and `path`."""
+    if ("pipeline" in args) == ("path" in args):
+        return "pass exactly one of 'pipeline' or 'path'"
+    return None
+
+
 async def validate_pipeline(args: dict[str, Any], ctx: ToolContext) -> str:
     """Validate an inline pipeline or a pipeline file from the working copy."""
-    if ("pipeline" in args) == ("path" in args):
-        raise ToolError(
-            "Invalid arguments for validate_pipeline: pass exactly one of 'pipeline' or 'path'"
-        )
     pipeline = args.get("pipeline")
     if pipeline is None:
         path = args["path"]
@@ -114,7 +117,7 @@ ENGINE_TOOLS = (
                 "zero drift)."
             ),
             # The engine's schema requires `pipeline`; `path` is the alternative. "Exactly one"
-            # is checked in the tool: providers reject a top-level oneOf in tool schemas.
+            # is `check_args`: providers reject a top-level oneOf in tool schemas.
             parameters={
                 "type": "object",
                 "properties": {
@@ -128,5 +131,6 @@ ENGINE_TOOLS = (
             read_only=True,
         ),
         validate_pipeline,
+        _one_pipeline,
     ),
 )

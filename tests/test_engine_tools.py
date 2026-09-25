@@ -91,10 +91,13 @@ async def test_validate_path_matches_inline(ctx):
     assert by_path == await validate_pipeline({"pipeline": LANE_ERROR}, ctx)
 
 
-@pytest.mark.parametrize("args", [{}, {"pipeline": VALID, "path": "p.pipe"}])
-async def test_validate_needs_exactly_one_source(ctx, args):
-    with pytest.raises(ToolError, match="exactly one of 'pipeline' or 'path'"):
-        await validate_pipeline(args, ctx)
+def test_validate_needs_exactly_one_source():
+    check = ENGINE_TOOLS[2].check_args
+    assert check is not None
+    for bad in ({}, {"pipeline": VALID, "path": "p.pipe"}):
+        assert check(bad) == "pass exactly one of 'pipeline' or 'path'"
+    assert check({"pipeline": VALID}) is None
+    assert check({"path": "p.pipe"}) is None
 
 
 @pytest.mark.parametrize(

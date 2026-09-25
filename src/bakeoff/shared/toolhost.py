@@ -118,6 +118,8 @@ class ToolHostImpl:
             where = "/".join(map(str, error.absolute_path))
             message = f"{where}: {error.message}" if where else error.message
             return f"Invalid arguments for {call.name}: {message}"[:MAX_ERROR]
+        if tool.check_args and (problem := tool.check_args(args)):
+            return f"Invalid arguments for {call.name}: {problem}"
         return tool, args
 
     def _decide(self, tool: Tool, args: dict[str, Any]) -> tuple[Decision, str]:

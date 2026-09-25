@@ -24,10 +24,15 @@ class ToolContext:
 
 @dataclass(slots=True, frozen=True)
 class Tool:
-    """A tool: the spec the model sees and the coroutine that runs it."""
+    """A tool: the spec the model sees and the coroutine that runs it.
+
+    `check_args` adds argument rules the provider-facing schema cannot state. It returns what is
+    wrong, or None; the `ToolHost` applies it with the schema, before anything runs.
+    """
 
     spec: ToolSpec
     fn: Callable[[dict[str, Any], ToolContext], Awaitable[str]]
+    check_args: Callable[[dict[str, Any]], str | None] | None = None
 
 
 class ToolError(Exception):

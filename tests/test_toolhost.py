@@ -146,18 +146,23 @@ async def test_ask_is_the_loops_job(make, tmp_path):
             "Invalid arguments for validate_pipeline: pipeline:",
         ),
         ("validate_pipeline", "{}", "Invalid arguments for validate_pipeline: pass exactly one"),
+        (
+            "validate_pipeline",
+            '{"pipeline": {}, "path": "a.pipe"}',
+            "Invalid arguments for validate_pipeline: pass exactly one of 'pipeline' or 'path'",
+        ),
         ("delete_everything", "{}", "Unknown tool: delete_everything"),
     ],
 )
 async def test_bad_calls_are_reported_not_raised(make, name, arguments, message):
-    host = make({"*": "deny", "validate_pipeline": "allow"})
+    host = make({"*": "ask"})
     bad = ToolCall(id="c1", name=name, arguments=arguments)
-    if name != "validate_pipeline":
-        # run() rejects these without executing, so the loop need not ask first.
-        assert host.check(bad) == "allow"
+    # run() rejects these without executing, so the loop need not ask first.
+    assert host.check(bad) == "allow"
     result = await host.run(bad)
     assert not result.ok
     assert result.content.startswith(message)
+    assert host.run_counts == {}
 
 
 async def test_long_schema_errors_are_shortened(make):
