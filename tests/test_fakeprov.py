@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
+from bakeoff.fakeprov.__main__ import main
 from bakeoff.fakeprov.script import SCENARIOS_DIR, ScenarioError, load_scenario
 from bakeoff.fakeprov.server import FakeProvider
 
@@ -93,6 +94,10 @@ def chat(provider: FakeProvider, body: Any, sid: str = "T", run: str = "r1", imp
 
 def meta(provider: FakeProvider, n: int, sid: str = "T", run: str = "r1", impl: str = "our"):
     return json.loads((provider.wire_dir / sid / run / impl / f"{n:03d}.meta.json").read_text())
+
+
+def deltas(response: httpx.Response) -> list[dict[str, Any]]:
+    return [c["choices"][0]["delta"] for c in frames(response) if isinstance(c, dict)]
 
 
 def test_sse_frames_are_http_chunks(serve):
@@ -189,6 +194,48 @@ def test_keep_alive_reuses_one_connection(serve):
     assert meta(provider, 3)["conn_id"] != meta(provider, 1)["conn_id"]
 
 
+def test_reasoning_goes_to_the_requested_delta_field(serve):
+    ops = [
+        {"reasoning": "Let me think", "chunks": 2},
+        {"reasoning": "hm", "field": "reasoning_content"},
+    ]
+    provider = serve(scenario("T", {"respond": {"stream": [*ops, {"text": "ok"}]}}, style="openai"))
+    assert deltas(chat(provider, request())) == [
+        {"role": "assistant", "reasoning": "Let me"},
+        {"reasoning": " think"},
+        {"reasoning_content": "hm"},
+        {"content": "ok"},
+    ]
+
+
+DETAILS = [
+    {"type": "reasoning.text", "text": "Plan: ", "format": "anthropic-claude-v1", "index": 0},
+    {"type": "reasoning.text", "signature": "sig", "index": 0},  # metadata only
+    {"type": "reasoning.encrypted", "data": "opaque", "index": 1, "future_field": [1]},
+]
+
+
+@pytest.mark.parametrize("style", ["openrouter", "openai"])
+def test_reasoning_details_are_sent_verbatim(serve, style):
+    provider = serve(
+        scenario("T", {"respond": {"stream": [{"reasoning_details": DETAILS}]}}, style=style)
+    )
+    sent = [d for d in deltas(chat(provider, request())) if "reasoning_details" in d]
+    assert [d["reasoning_details"] for d in sent] == [[detail] for detail in DETAILS]
+    # OpenRouter mirrors the text of a reasoning.text fragment (only one with text) in `reasoning`
+    mirrored = ["Plan: ", None, None] if style == "openrouter" else [None] * 3
+    assert [d.get("reasoning") for d in sent] == mirrored
+
+
+def test_delay_ms_pauses_before_each_chunk(serve):
+    provider = serve(
+        scenario("T", {"respond": {"stream": [{"text": "abc", "chunks": 3, "delay_ms": 50}]}})
+    )
+    started = time.monotonic()
+    assert text_of(frames(chat(provider, request()))) == "abc"
+    assert time.monotonic() - started >= 0.15
+
+
 def test_rate_limit_with_retry_after_then_ok(serve):
     limited = {"respond": {"status": 429, "headers": {"retry-after": "1"}}}
     provider = serve(scenario("T", limited, says("ok")))
@@ -200,6 +247,12 @@ def test_rate_limit_with_retry_after_then_ok(serve):
     assert second.status_code == 200
     assert text_of(frames(second)) == "ok"
     assert [meta(provider, n)["status"] for n in (1, 2)] == [429, 200]
+
+
+def test_openai_style_error_body(serve):
+    provider = serve(scenario("T", {"respond": {"status": 503}}, style="openai"))
+    error = {"message": "Service Unavailable", "type": "api_error", "param": None, "code": None}
+    assert chat(provider, request()).json() == {"error": error}
 
 
 def test_sse_error_ends_the_stream_after_http_200(serve):
@@ -266,6 +319,12 @@ def test_stop_ends_a_waiting_stream_promptly(serve, op):
 CALLS_F = {
     "respond": {"stream": [{"tool_calls": [{"id": "call_1", "name": "f", "arguments": {}}]}]}
 }
+CALL_1 = {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+TOOL_TURN = [
+    USER,
+    {"role": "assistant", "content": None, "tool_calls": [CALL_1]},
+    {"role": "tool", "tool_call_id": "call_1", "content": "2 rows"},
+]
 
 
 def test_expect_checks_pass_on_a_matching_request(serve):
@@ -280,14 +339,35 @@ def test_expect_checks_pass_on_a_matching_request(serve):
     }
     provider = serve(scenario("T", CALLS_F, says("ok", expect=expect)))
     assert chat(provider, request()).status_code == 200
-    call = {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
     messages = [
         {"role": "system", "content": "s"},
-        USER,
-        {"role": "assistant", "content": None, "tool_calls": [call]},
+        *TOOL_TURN[:2],
         {"role": "tool", "tool_call_id": "call_1", "content": [{"type": "text", "text": "3 rows"}]},
     ]
     assert chat(provider, request(*messages, tools=[])).status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("expect", "failure"),
+    [
+        ({"body_has": ["tools"]}, "body lacks 'tools'"),
+        ({"body_lacks": ["stream"]}, "body has 'stream'"),
+        ({"model": "other/model"}, f"model is '{MODEL}', expected 'other/model'"),
+        ({"messages_len": 2}, "3 messages, expected 2"),
+        ({"last_role": "user"}, "last role is 'tool', expected 'user'"),
+        ({"last_content_contains": "bye"}, "last message lacks 'bye': '2 rows'"),
+        (
+            {"tool_result_contains": {"call_1": "3 rows"}},
+            "tool result call_1 lacks '3 rows': '2 rows'",
+        ),
+    ],
+)
+def test_each_expect_mismatch_is_named(serve, expect, failure):
+    provider = serve(scenario("T", CALLS_F, says("never", expect=expect)))
+    chat(provider, request())
+    response = chat(provider, request(*TOOL_TURN))
+    assert response.status_code == 500
+    assert response.json()["error"]["message"] == f"expect failed (exchange 2): {failure}"
 
 
 def test_expect_mismatch_is_a_recorded_500(serve):
@@ -509,6 +589,14 @@ def test_invalid_scenarios_have_clear_errors(tmp_path: Path, change, error: str)
         load_scenario(tmp_path / "T.json")
     assert str(info.value).startswith("T.json: ")
     assert error in str(info.value)
+
+
+def test_check_command(tmp_path: Path, capsys):
+    assert main(["--check"]) == 0
+    assert capsys.readouterr().out.count("ok    ") == len(SCENARIO_FILES)
+    (tmp_path / "T.json").write_text("{}")
+    assert main(["--check", "--scenarios", str(tmp_path)]) == 1
+    assert capsys.readouterr().out.startswith("FAIL  T.json: ")
 
 
 def test_a_broken_scenario_is_reported_by_the_server(serve):
