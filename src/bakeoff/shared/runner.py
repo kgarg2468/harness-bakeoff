@@ -176,9 +176,10 @@ class Runner:
         thread = self._thread(thread_id)
         if loop.name != thread["impl"]:
             raise ValueError(f"thread {thread_id} belongs to {thread['impl']!r}, not {loop.name!r}")
-        self._check_idle(thread_id, crash_resume=resume is not None and resume.kind == "crash")
         wc = WorkCopy(self.workdir(thread_id))
         await wc.init()
+        # No await between the check and the new row, so a second turn() cannot slip in.
+        self._check_idle(thread_id, crash_resume=resume is not None and resume.kind == "crash")
         row = self.log.start_turn(thread_id, resume.kind if resume else "user")
         turn_id = row["id"]
         pub = _Publisher(self.log, self.sink, thread_id, turn_id, thread["impl"])

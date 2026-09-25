@@ -317,6 +317,18 @@ async def test_crash_leaves_turn_running_and_crash_resume_continues(runner, log,
         assert check.ok, check.detail
 
 
+async def test_concurrent_turns_on_one_thread_are_rejected(runner, log, tid):
+    await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
+    results = await asyncio.gather(
+        runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two"),
+        runner.turn(FakeLoop(writes("c.pipe")), tid, model=MODEL, user_text="three"),
+        return_exceptions=True,
+    )
+    assert results[0]["stop"] == "end_turn"
+    assert isinstance(results[1], RuntimeError)
+    assert [t["status"] for t in log.turns(tid)] == ["done", "done"]
+
+
 async def test_loop_exception_ends_turn_with_error(runner, log, tid):
     async def boom(turn, tools, cancel):
         yield Event("request.start", {"step": 1, "attempt": 1})
