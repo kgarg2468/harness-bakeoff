@@ -97,9 +97,11 @@ class Stall(httpx.AsyncByteStream):
     def __init__(self, first: bytes):
         self.first = first
         self.closed = asyncio.Event()
+        self.stalled = asyncio.Event()  # `first` was read and the client waits for more
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         yield self.first
+        self.stalled.set()
         await self.closed.wait()
         raise httpx.ReadError("connection closed")
 
@@ -803,6 +805,43 @@ async def test_max_steps_stops_after_exactly_n_requests() -> None:
         "tool_call_id": "c1",
         "content": "Not run: the turn reached its step limit",
     }
+
+
+async def test_cancel_after_the_last_allowed_answer_ends_cancelled() -> None:
+    """The last allowed step's answer is complete (finish_reason plus usage), and the cancel
+    comes while the loop drains the body's end: the user stopped the turn (contract rule 6),
+    so its call gets "Cancelled by user" and the turn does not end with max_steps."""
+    usage = {"prompt_tokens": 10, "completion_tokens": 1}
+    stall = Stall(sse_bytes(call(0, "{}", "c0", "describe_component"), finish("tool_calls", usage)))
+    server, tools, cancel = Server(httpx.Response(200, stream=stall)), StubTools(), asyncio.Event()
+
+    async def cancel_while_draining() -> None:
+        await stall.stalled.wait()
+        cancel.set()
+
+    canceller = asyncio.ensure_future(cancel_while_draining())
+    history = [user("go")]
+    async with asyncio.timeout(2):
+        events = await run(server.loop(), history, tools, cancel, limits=Limits(max_steps=1))
+    await canceller
+    assert events[-1].data == {"stop": "cancelled", "steps": 1}
+    answer, result = items(events)
+    assert answer.status == "complete" and answer.message["tool_calls"][0]["id"] == "c0"
+    assert result.message == {"role": "tool", "tool_call_id": "c0", "content": "Cancelled by user"}
+    assert tools.run_counts == {}
+    assert_no_orphans(history + items(events))
+
+
+async def test_cancelled_resume_at_the_step_limit_ends_cancelled() -> None:
+    """A resume whose pending call belongs to the last allowed step, with the cancel already set."""
+    history = spent_history()[:-1]  # c0 has no result yet
+    cancel = asyncio.Event()
+    cancel.set()
+    events = await run(
+        Server().loop(), history, StubTools(), cancel, resume=Resume("crash"), limits=Limits(1)
+    )
+    assert events[-1].data == {"stop": "cancelled", "steps": 1}
+    assert items(events)[-1].message["content"] == "Cancelled by user"
 
 
 async def test_budget_stops_before_the_next_request() -> None:

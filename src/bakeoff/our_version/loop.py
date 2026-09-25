@@ -339,14 +339,18 @@ class _Turn:
 
     async def _tools_within_cap(self, calls: list[ToolCall]) -> AsyncIterator[Event]:
         """`_tools`, unless this step was the last one allowed: then no call runs, each still
-        gets a result (no orphans), and the turn ends with max_steps."""
+        gets a result (no orphans), and the turn ends with max_steps, or cancelled if the
+        cancel came first (contract rule 6)."""
         if self.steps < self.turn.limits.max_steps:
             async for event in self._tools(calls):
                 yield event
             return
+        # A cancel can land after the answer is complete (e.g. while draining the body's end):
+        # the user stopped the turn, so it must not be reported as a step limit.
+        cancelled = self.cancel.is_set()
         for call in calls:
-            yield self._result(ToolResult(call.id, False, _STEP_CAP))
-        yield self._end("max_steps")
+            yield self._result(ToolResult(call.id, False, CANCELLED if cancelled else _STEP_CAP))
+        yield self._end("cancelled" if cancelled else "max_steps")
 
     async def _tools(self, calls: list[ToolCall]) -> AsyncIterator[Event]:
         """Run the calls and append one result per call, in call order.
