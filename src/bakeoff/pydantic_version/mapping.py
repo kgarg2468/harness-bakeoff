@@ -10,6 +10,7 @@ was saved. `Item.message` is the OpenAI-shaped view, as the model puts it on the
 from __future__ import annotations
 
 from dataclasses import replace
+from decimal import Decimal
 from typing import Any
 
 from pydantic_ai import (
@@ -154,16 +155,19 @@ def spent(history: list[ModelMessage]) -> RunUsage:
     return usage
 
 
-def finished(history: list[ModelMessage]) -> str | None:
+def finished(history: list[ModelMessage], max_cost_usd: float | None = None) -> str | None:
     """How the turn ended if its end is already saved (a crash came after it): "end_turn" after
-    the final answer, "cancelled" after a response cut short (a cancel, or a failed stream that
-    ended the turn). None if the turn goes on."""
+    the final answer ("budget" if the turn's cost crossed `max_cost_usd`, as the original run
+    reported), "cancelled" after a response cut short (a cancel, or a failed stream that ended
+    the turn). None if the turn goes on."""
     turn = this_turn(history)
     response = next((m for m in reversed(turn) if isinstance(m, ModelResponse)), None)
     if response is not None and response.state == "interrupted":
         return "cancelled"
     if turn and turn[-1] is response and not response.tool_calls:
-        return "end_turn"
+        cost = spent(history).cost or 0
+        over = max_cost_usd is not None and cost > Decimal(str(max_cost_usd))
+        return "budget" if over else "end_turn"
     return None
 
 

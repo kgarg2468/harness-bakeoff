@@ -1107,3 +1107,37 @@ async def test_a_cancel_after_a_saved_write_result_closes_only_the_rest(loop):
     results = [(i.message["tool_call_id"], i.message["content"]) for i in items(events)[1:]]
     assert results == [("w1", "write_file ok"), ("r1", interrupted)]
     assert of(events, "turn.end")[0]["stop"] == "cancelled"
+
+
+async def test_a_crash_after_a_budget_crossing_answer_keeps_the_budget_stop(loop):
+    """Greptile #4103448062: the saved final answer crossed max_cost_usd, so a crash resume must
+    report "budget" (what the original run reported), not "end_turn"."""
+    answer = Reply([*text("Hello there"), done(cost=0.002)])
+    with SSEServer(answer) as srv:
+        limits = Limits(max_cost_usd=0.001)
+        first = await run(loop, turn([user("hi")], config(srv), limits=limits), StubTools())
+        history = [user("hi"), *items(first)]  # SIGKILL after the answer was saved
+        resumed = await run(
+            loop, turn(history, config(srv), resume=Resume("crash"), limits=limits), StubTools()
+        )
+
+    assert of(first, "turn.end") == [{"stop": "budget", "steps": 1}]
+    assert of(resumed, "turn.end") == [{"stop": "budget", "steps": 1}]
+    assert len(srv.bodies) == 1  # nothing more is sent
+
+
+@pytest.mark.parametrize("decision", ["yes", "ALLOW", "", "approve"])
+async def test_only_an_explicit_allow_approves_an_ask_protected_call(loop, decision):
+    """Greptile #4103448071: a malformed decision is not an approval. The call is asked again
+    and never runs."""
+    tools = StubTools({"write_file": "ask"})
+    call = tool_call(0, "c1", "write_file", '{"path": "a", "content": "x"}')
+    with SSEServer(Reply([*call, done("tool_calls")])) as srv:
+        first = await run(loop, turn([user("go")], config(srv)), tools)
+        history = [user("go"), *items(first)]
+        bad = Resume("approval", {"c1": decision})
+        second = await run(loop, turn(history, config(srv), resume=bad), tools)
+
+    assert tools.runs == []
+    assert of(second, "turn.end")[0]["stop"] == "paused"
+    assert of(second, "turn.end")[0]["pending"] == ["c1"]

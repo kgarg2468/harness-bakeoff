@@ -219,7 +219,10 @@ class PydanticLoop:
     async def run_turn(
         self, turn: TurnInput, tools: ToolHost, cancel: asyncio.Event
     ) -> AsyncIterator[Event]:
-        decided = set(turn.resume.decisions) if turn.resume else set()
+        # Only an explicit allow/deny counts as the user's answer; anything else is treated as
+        # unanswered, so the ask rule is checked again before the call can run.
+        decisions = turn.resume.decisions if turn.resume else {}
+        decided = {cid for cid, d in decisions.items() if d in ("allow", "deny")}
         read_only = {spec.name for spec in tools.specs() if spec.read_only}
         state = _Turn(turn.turn_id, tools, turn.limits.max_steps, decided, read_only)
         task = asyncio.create_task(self._drive(turn, state, cancel))
@@ -293,7 +296,8 @@ class PydanticLoop:
             # A resume continues the turn: its steps and cost count against the limits.
             usage = mapping.spent(history)
             state.steps = usage.requests
-            if turn.resume is not None and (stop := mapping.finished(history)):
+            limit = turn.limits.max_cost_usd
+            if turn.resume is not None and (stop := mapping.finished(history, limit)):
                 return {"stop": stop}  # a crash came after the turn's end was saved
         deferred = None
         if pending := mapping.pending_calls(history):
