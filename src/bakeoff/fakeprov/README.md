@@ -213,7 +213,7 @@ false`. `output_index` counts the response's items from 0.
 | `{"completed": {"input_tokens", "output_tokens", "cached_tokens"?, "cache_write_tokens"?, "reasoning_tokens"?}}` | `response.completed`: status `completed`, `output` = every done item, `usage: {"input_tokens", "input_tokens_details": {"cached_tokens", "cache_write_tokens"}, "output_tokens", "output_tokens_details": {"reasoning_tokens"}, "total_tokens"}` |
 | `{"incomplete": {"input_tokens", "output_tokens", ...as completed, "reason"?: "max_output_tokens" \| "content_filter"}}` | `response.incomplete`, as the API ends a response that ran out of `max_output_tokens` (say, while it reasoned): status `incomplete`, `incomplete_details: {"reason"}` (default `max_output_tokens`), `output` = the items done so far, `usage` as in `completed` |
 | `{"error": {"code"?: "server_error", "message"}}` | the `error` event after HTTP 200: `{"type": "error", "sequence_number", "code", "message", "param": null}`; the stream ends |
-| `{"failed": {"code"?: "server_error", "message"}}` | `response.failed`: status `failed`, `error: {"code", "message"}`, `output` = the items done so far |
+| `{"failed": {"code"?: "server_error", "message", "usage"?: {"input_tokens", "output_tokens", ...as completed}}}` | `response.failed`: status `failed`, `error: {"code", "message"}`, `output` = the items done so far, `usage` as in `completed` if given, else null (a failed response may carry what it used) |
 | `{"stall": true}` | as in chat: nothing more, the socket stays open until the client leaves |
 
 Every stream ends with exactly one of `completed`, `incomplete`, `error`, `failed` or `stall`,

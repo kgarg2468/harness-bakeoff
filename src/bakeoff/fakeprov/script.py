@@ -196,7 +196,18 @@ _RESPONSES_OPS = {
         ),
     ),
     "error": _op("error", _ERROR),
-    "failed": _op("failed", _ERROR),
+    # The failed response object has a `usage` field too: null, or what the attempt used.
+    "failed": _op(
+        "failed",
+        _obj(
+            {
+                "code": _STR,
+                "message": _STR,
+                "usage": _obj(_RESPONSES_USAGE, "input_tokens", "output_tokens"),
+            },
+            "message",
+        ),
+    ),
     "stall": _op("stall", {"const": True}),
 }
 # The ops that end a Responses stream: every stream has exactly one, as its last op.
@@ -1166,8 +1177,10 @@ class _ResponsesStream:
             error = {"code": "server_error", **op["error"]}
             return [self._event("error", code=error["code"], message=error["message"], param=None)]
         if "failed" in op:
-            error = {"code": "server_error", **op["failed"]}
-            failed = self._response("failed", error=error)
+            spec = op["failed"]
+            usage = _responses_usage(spec["usage"]) if "usage" in spec else None
+            error = {"code": spec.get("code", "server_error"), "message": spec["message"]}
+            failed = self._response("failed", usage, error=error)
             return [self._event("response.failed", response=failed)]
         return [Stall()]  # the only kind left
 
