@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Callable, Iterator
+from itertools import islice
 
 Replacer = Callable[[str, str], Iterator[str]]
 
@@ -340,20 +341,26 @@ def replace(content: str, old: str, new: str, replace_all: bool = False) -> str:
     not_found = True
     ambiguous = False  # an earlier replacer found several equally good spans
     for replacer in REPLACERS:
-        spans = list(replacer(content, old))
-        if any(span is AMBIGUOUS for span in spans):
-            ambiguous = True
-            not_found = False  # something matched, just not uniquely
-        # An empty span would "match" between every character.
-        found = [s for s in dict.fromkeys(spans) if s and s is not AMBIGUOUS and s in content]
-        if ambiguous and len(found) > 1:
-            # Deviation from OpenCode: after a tie, never pick one of several candidates.
-            raise MultipleMatches(
-                "Found several similar blocks for old_string. Provide more surrounding context "
-                "to make the match unique."
-            )
-        for search in found:
+        candidates: Iterator[str] = replacer(content, old)
+        if ambiguous:
+            # Deviation from OpenCode: after a tie, a replacer only counts if it pins down
+            # exactly one span. Looking for a second one stops as soon as it is found.
+            found = list(islice(_distinct_spans(candidates, content), 2))
+            if len(found) > 1:
+                raise MultipleMatches(
+                    "Found several similar blocks for old_string. Provide more surrounding "
+                    "context to make the match unique."
+                )
+            candidates = iter(found)
+        for search in candidates:
+            if search is AMBIGUOUS:
+                ambiguous = True
+                not_found = False  # something matched, just not uniquely
+                continue
             index = content.find(search)
+            # An empty span would "match" between every character.
+            if not search or index == -1:
+                continue
             not_found = False
             if _is_disproportionate(search, old):
                 raise EditError(
@@ -376,6 +383,15 @@ def replace(content: str, old: str, new: str, replace_all: bool = False) -> str:
         "Found multiple matches for old_string. Provide more surrounding context to make the "
         "match unique."
     )
+
+
+def _distinct_spans(candidates: Iterator[str], content: str) -> Iterator[str]:
+    """Candidate spans that are non-empty, present in `content`, and not yet seen (lazily)."""
+    seen: set[str] = set()
+    for span in candidates:
+        if span and span is not AMBIGUOUS and span not in seen and span in content:
+            seen.add(span)
+            yield span
 
 
 def _is_disproportionate(search: str, old: str) -> bool:
