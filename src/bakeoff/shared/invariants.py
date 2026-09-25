@@ -20,6 +20,7 @@ from bakeoff.shared.sessionlog import SessionLog
 from bakeoff.shared.workcopy import GIT_CONFIG, git_env
 
 _REASONING_KEYS = ("type", "text", "signature", "data", "format", "index")
+_SYSTEM_ROLES = ("system", "developer")
 _COMMITTED = ("done", "error", "cancelled")
 _QUOTE, _BACKSLASH, _COLON, _COMMA = b'"'[0], b"\\"[0], b":"[0], b","[0]
 _OPEN, _CLOSE = b"[{", b"]}"
@@ -54,7 +55,8 @@ def check_prefix(bodies: Sequence[bytes]) -> Check:
     """I1: each request's `messages` are a prefix of the next request's.
 
     `ok` is semantic equality; byte equality of the raw message elements is reported in
-    `info["byte_prefix"]`. A prefix may reset only where a new compaction summary starts.
+    `info["byte_prefix"]`. A prefix may reset only at a new compaction summary, placed right
+    after the unchanged system messages (contract rule 8).
     """
     requests: list[tuple[list[dict[str, Any]], list[bytes]]] = []
     for i, body in enumerate(bodies):
@@ -131,17 +133,17 @@ def _first_difference(prev: Sequence[Any], cur: Sequence[Any]) -> int | None:
 
 
 def _is_reset(prev: list[dict[str, Any]], cur: list[dict[str, Any]]) -> bool:
-    first = _first_conversation_message(cur)
+    """True if `cur` starts over as rule 8 says: `prev`'s system messages, then a new summary."""
+    n = next((i for i, m in enumerate(prev) if m["role"] not in _SYSTEM_ROLES), len(prev))
+    if len(cur) <= n or cur[:n] != prev[:n]:
+        return False
+    first = cur[n]
     return (
-        first is not None
+        first["role"] == "user"
         and isinstance(first["content"], str)
         and first["content"].startswith(SUMMARY_PREFIX)
-        and first != _first_conversation_message(prev)  # a new summary, not the same one again
+        and prev[n : n + 1] != [first]  # a new summary, not the same one again
     )
-
-
-def _first_conversation_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
-    return next((m for m in messages if m["role"] not in ("system", "developer")), None)
 
 
 def _raw_messages(body: bytes) -> list[bytes]:
@@ -207,26 +209,58 @@ def _skip_space(body: bytes, i: int) -> int:
 # I2, I3 ----------------------------------------------------------------------------------
 
 
+_I2_PROBLEMS = (
+    "missing",  # a call without a result
+    "extra",  # a call with more than one result
+    "orphans",  # a result without a call
+    "misplaced",  # a result that does not answer the latest assistant message before it
+    "duplicate_calls",  # a call id in more than one assistant message
+    "reran",  # more than one tool.start for a call id
+    "unknown_runs",  # a tool ran for a call id that is in no assistant message
+    "late_runs",  # a tool started after the loop's turn.end (kept in the commit's `late`)
+)
+
+
 def check_tool_results(items: Sequence[Item], events: Sequence[dict[str, Any]]) -> Check:
-    """I2: every tool call has exactly one result, no result lacks a call, no call runs twice."""
+    """I2: every tool call has exactly one result, right after its call; every run belongs
+    to a call in history, and no call runs twice."""
     calls: Counter[Any] = Counter()
     results: Counter[Any] = Counter()
+    out_of_place: list[Any] = []
+    latest: list[Any] = []  # call ids of the latest assistant message
     for item in items:
         role = item.message.get("role")
         if role == "assistant":
-            calls.update(c.get("id") for c in item.message.get("tool_calls") or [])
+            latest = [c.get("id") for c in item.message.get("tool_calls") or []]
+            calls.update(latest)
         elif role == "tool":
-            results[item.message.get("tool_call_id")] += 1
-    starts = Counter(e["data"].get("call_id") for e in events if e["type"] == "tool.start")
+            call_id = item.message.get("tool_call_id")
+            results[call_id] += 1
+            if call_id not in latest:
+                out_of_place.append(call_id)
+    starts: Counter[Any] = Counter()
+    late: list[Any] = []
+    for e in events:
+        if e["type"] == "tool.start":
+            starts[e["data"].get("call_id")] += 1
+        elif e["type"] == "commit":
+            for x in e["data"].get("late", []):
+                if x["type"] == "tool.start":
+                    starts[x["data"].get("call_id")] += 1
+                    late.append(x["data"].get("call_id"))
     info = {
         "calls": sum(calls.values()),
         "results": sum(results.values()),
         "missing": [c for c in calls if results[c] == 0],
         "extra": [c for c in calls if results[c] > 1],
         "orphans": [r for r in results if r not in calls],
+        "misplaced": [c for c in out_of_place if c in calls],
+        "duplicate_calls": [c for c, n in calls.items() if n > 1],
         "reran": [c for c, n in starts.items() if n > 1],
+        "unknown_runs": [c for c in starts if c not in calls],
+        "late_runs": late,
     }
-    problems = [f"{k}: {info[k]}" for k in ("missing", "extra", "orphans", "reran") if info[k]]
+    problems = [f"{k}: {info[k]}" for k in _I2_PROBLEMS if info[k]]
     detail = "; ".join(problems) or f"{info['calls']} calls, each with exactly one result"
     return Check("I2", not problems, detail, info)
 

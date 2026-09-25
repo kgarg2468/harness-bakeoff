@@ -145,6 +145,10 @@ def test_reset_only_at_a_new_compaction_summary():
     assert not check_prefix([before, after, dropped]).ok
     # A summary-looking message that is not first after the system prompt is no reset.
     assert not check_prefix([before, encode(SYSTEM, USER, summary)]).ok
+    # The reset keeps the system messages exactly as they were.
+    changed = {"role": "system", "content": "changed"}
+    for later in [(changed, summary), (summary,), (SYSTEM, changed, summary)]:
+        assert not check_prefix([before, encode(*later)]).ok, later
 
 
 def test_unreadable_body_fails():
@@ -191,7 +195,11 @@ def test_tool_results_ok():
         ((USER, CALL, ANSWER), ["c1"], "missing"),
         ((USER, CALL, RESULT, RESULT), ["c1"], "extra"),
         ((USER, RESULT), [], "orphans"),
+        ((USER, RESULT, CALL), ["c1"], "misplaced"),  # the result before its call
+        ((USER, CALL, ANSWER, RESULT), ["c1"], "misplaced"),  # the model answered without it
+        ((USER, CALL, RESULT, CALL), ["c1"], "duplicate_calls"),  # e.g. re-emitted on resume
         ((USER, CALL, RESULT), ["c1", "c1"], "reran"),
+        ((USER,), ["ghost"], "unknown_runs"),  # e.g. an eager tool of a retried stream
     ],
 )
 def test_tool_result_violations(messages, starts, problem):
@@ -199,6 +207,14 @@ def test_tool_result_violations(messages, starts, problem):
     assert not check.ok
     assert check.info[problem]
     assert check.detail.startswith(problem)
+
+
+def test_a_tool_started_after_turn_end_counts_as_a_run():
+    late = {"t_us": 9, "type": "tool.start", "data": {"call_id": "c1", "name": "read_file"}}
+    commit = {"type": "commit", "data": {"sha": "abc", "files": [], "late": [late]}}
+    check = check_tool_results(items(USER, CALL, RESULT), [tool_start("c1"), commit])
+    assert not check.ok
+    assert (check.info["reran"], check.info["late_runs"]) == (["c1"], ["c1"])
 
 
 # I3
