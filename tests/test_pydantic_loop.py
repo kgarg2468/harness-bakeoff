@@ -65,6 +65,7 @@ class StubTools:
         self.rules = rules or {}
         self.slow = slow
         self.runs: list[ToolCall] = []
+        self.checked: list[str] = []
         self.log: list[str] = []
         self.started = asyncio.Event()
 
@@ -72,6 +73,7 @@ class StubTools:
         return SPECS
 
     def check(self, call: ToolCall) -> Decision:
+        self.checked.append(call.id)
         return self.rules.get(call.name, "allow")
 
     async def run(self, call: ToolCall) -> ToolResult:
@@ -82,7 +84,11 @@ class StubTools:
         self.started.set()
         if call.name == self.slow:
             await asyncio.sleep(5)
-        args = json.loads(call.arguments)
+        try:
+            args = json.loads(call.arguments)
+        except ValueError:
+            invalid = f"Invalid arguments for {call.name}: not valid JSON"
+            return ToolResult(call.id, False, invalid, error="invalid_args")
         if "path" not in args:
             invalid = "invalid arguments: 'path' is a required property"
             return ToolResult(call.id, False, invalid, error="invalid_args")
@@ -266,17 +272,26 @@ async def test_denied_and_failed_calls_use_the_library_outcomes(loop):
     assert [c.id for c in tools.runs] == ["c1", "c2", "c3"]  # each through ToolHost.run
 
 
-async def test_arguments_that_are_not_json_never_reach_the_toolhost(loop):
-    """Recorded behavior (A_CHECKLIST): pydantic-ai validates the arguments itself before it
-    calls the tool, so the model gets the library's retry prompt and ToolHost is not called."""
+async def test_arguments_that_are_not_json_go_to_the_toolhost_like_any_others(loop):
+    """Rule 5 also for arguments the library cannot parse: a `tool_validate_error` hook lets the
+    call go on, so it is checked, ToolHost gets the raw text and answers with its own error, and
+    the model sees that text as the retry prompt (not a pydantic error dump)."""
     truncated = tool_call(0, "c1", "read_file", '{"path": "a.txt"')
     with SSEServer(Reply([*truncated, done("tool_calls")]), Reply([*text("ok"), done()])) as srv:
         tools = StubTools()
         events = await run(loop, turn([user("go")], config(srv)), tools)
 
-    assert tools.runs == []
-    result = items(events)[1].message
-    assert result["tool_call_id"] == "c1" and "json_invalid" in result["content"]
+    assert tools.checked == ["c1"]
+    assert [c.arguments for c in tools.runs] == ['{"path": "a.txt"']  # verbatim, as streamed
+    assert of(events, "tool_call.ready")[0]["arguments"] == '{"path": "a.txt"'
+    call, result = items(events)[:2]
+    assert result.message == {
+        "role": "tool",
+        "tool_call_id": "c1",
+        "content": "Invalid arguments for read_file: not valid JSON\n\nFix the errors and try again.",
+    }
+    # Recorded library behavior: the call is replayed with its text wrapped as {"INVALID_JSON": ...}.
+    assert srv.requests[1]["messages"][2:] == [call.message, result.message]
     assert of(events, "turn.end")[0]["stop"] == "end_turn"
 
 

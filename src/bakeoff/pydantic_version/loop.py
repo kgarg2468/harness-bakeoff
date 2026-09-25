@@ -338,7 +338,11 @@ class PydanticLoop:
                 output_type=[str, DeferredToolRequests],
                 toolsets=[toolset],
                 capabilities=[
-                    Hooks(after_model_request=_on_model_response, before_tool_execute=_step_cap),
+                    Hooks(
+                        after_model_request=_on_model_response,
+                        tool_validate_error=_unparsed_args,
+                        before_tool_execute=_step_cap,
+                    ),
                     ProcessHistory(mapping.replayable),
                 ],
                 name=self.name,
@@ -386,6 +390,20 @@ def _needs_approval(ctx: RunContext[_Turn], tool_def: ToolDefinition, args: dict
     return ctx.deps.tools.check(_running_call(ctx)) == "ask"
 
 
+def _unparsed_args(
+    ctx: RunContext[_Turn],
+    /,
+    *,
+    call: ToolCallPart,
+    tool_def: ToolDefinition,
+    args: Any,
+    error: Any,
+) -> dict[str, Any]:
+    """Arguments the library cannot parse (not a JSON object) go on like any others: `check()`,
+    then ToolHost validates the raw text and answers with its own error (rule 5)."""
+    return {}
+
+
 def _step_cap(
     ctx: RunContext[_Turn], /, *, call: ToolCallPart, tool_def: ToolDefinition, args: Any
 ) -> Any:
@@ -403,16 +421,14 @@ def _running_call(ctx: RunContext[_Turn]) -> ToolCall:
 
 
 def _to_call(part: ToolCallPart) -> ToolCall:
-    # args_as_json_str() returns the streamed text verbatim when it is a JSON object.
-    return ToolCall(id=part.tool_call_id, name=part.tool_name, arguments=part.args_as_json_str())
+    # The streamed text verbatim: args_as_json_str() wraps text that is not a JSON object.
+    raw = part.args if isinstance(part.args, str) and part.args else part.args_as_json_str()
+    return ToolCall(id=part.tool_call_id, name=part.tool_name, arguments=raw)
 
 
 def _call_data(part: ToolCallPart) -> dict[str, Any]:
-    return {
-        "call_id": part.tool_call_id,
-        "name": part.tool_name,
-        "arguments": part.args_as_json_str(),
-    }
+    call = _to_call(part)
+    return {"call_id": call.id, "name": call.name, "arguments": call.arguments}
 
 
 def _answers(
