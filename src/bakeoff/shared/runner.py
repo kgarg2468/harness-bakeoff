@@ -94,7 +94,7 @@ class _Publisher:
         self._t0 = time.perf_counter_ns()
         self._batch: list[EventRow] = []
         self._open = True  # until the loop's turn.end
-        # Tool events after the loop's turn.end: `{"t_us", "type", "data"}`.
+        # Tool events after the loop's turn.end, `{"t_us", "type", "data"}`; kept on the turn row.
         self.late: list[dict[str, Any]] = []
 
     def _t_us(self) -> int:
@@ -132,7 +132,8 @@ class _Publisher:
 
     def publish(self, event: Event) -> None:
         """The ToolHost's `emit` callback. A tool event after the loop's `turn.end` cannot
-        join the stream (`commit` must follow `turn.end` directly), so it goes to `late`."""
+        join the stream (`commit` must follow `turn.end` directly), so it goes to `late`, which
+        the runner stores on the turn row."""
         if self._open:
             self.emit(event.type, event.data)
         else:
@@ -280,9 +281,9 @@ class Runner:
             stop = end.get("stop", "error")
             if stop == "paused":
                 pending = list(end.get("pending") or [])
-                self.log.set_turn_status(turn_id, "paused", stop=stop, pending=pending)
-                if pub.late:  # no commit event to carry them
-                    logger.warning("turn %s: tool events after turn.end: %s", turn_id, pub.late)
+                self.log.set_turn_status(
+                    turn_id, "paused", stop=stop, pending=pending, late=pub.late or None
+                )
                 return {"turn_id": turn_id, "stop": stop, "pending": pending, "commit": None}
             try:
                 sha, files = await wc.commit(f"turn {row['idx'] + 1}: {stop}")
@@ -290,12 +291,12 @@ class Runner:
                 # Record it, or the turn stays "running" and blocks the thread.
                 self.log.set_turn_status(turn_id, "error", stop=stop)
                 raise
-            self.log.set_turn_status(turn_id, _STATUS.get(stop, "error"), stop=stop, commit_sha=sha)
-            commit: dict[str, Any] = {"sha": sha, "files": files}
-            if pub.late:  # evidence for the checks (I2) without breaking rule 7
-                commit["late"] = pub.late
+            status = _STATUS.get(stop, "error")
+            self.log.set_turn_status(
+                turn_id, status, stop=stop, commit_sha=sha, late=pub.late or None
+            )
             # Last, so a consumer that sees `commit` finds the turn row complete (rule 7).
-            pub.emit("commit", commit)
+            pub.emit("commit", {"sha": sha, "files": files})
             return {"turn_id": turn_id, "stop": stop, "pending": [], "commit": sha}
         finally:
             if watcher is not None:

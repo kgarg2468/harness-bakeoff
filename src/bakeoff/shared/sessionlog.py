@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS turns(
     status TEXT NOT NULL
         CHECK (status IN ('running', 'paused', 'done', 'error', 'cancelled')),
     stop TEXT, pending TEXT, commit_sha TEXT, started_us INTEGER NOT NULL, ended_us INTEGER,
-    UNIQUE (thread, idx));
+    late TEXT, UNIQUE (thread, idx));
 CREATE TABLE IF NOT EXISTS items(
     thread TEXT NOT NULL, seq INTEGER NOT NULL, turn TEXT NOT NULL, id TEXT NOT NULL,
     json TEXT NOT NULL, PRIMARY KEY (thread, seq));
@@ -159,17 +159,23 @@ class SessionLog:
         stop: str | None = None,
         pending: list[str] | None = None,
         commit_sha: str | None = None,
+        late: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Record how a turn ended (sets `ended_us` unless the status is "running")."""
+        """Record how a turn ended (sets `ended_us` unless the status is "running").
+
+        `late` keeps tool events that came after the loop's `turn.end`, which cannot join the
+        event stream (contract rule 7).
+        """
         self._db.execute(
-            "UPDATE turns SET status = ?, stop = ?, pending = ?, commit_sha = ?, ended_us = ?"
-            " WHERE id = ?",
+            "UPDATE turns SET status = ?, stop = ?, pending = ?, commit_sha = ?, ended_us = ?,"
+            " late = ? WHERE id = ?",
             (
                 status,
                 stop,
                 None if pending is None else json.dumps(pending),
                 commit_sha,
                 None if status == "running" else now_us(),
+                None if late is None else json.dumps(late),
                 turn_id,
             ),
         )
@@ -189,7 +195,10 @@ class SessionLog:
     def _turn_rows(self, where: str, arg: str) -> list[dict[str, Any]]:
         rows = self._db.execute(f"SELECT * FROM turns {where}", (arg,)).fetchall()
         return [
-            {**dict(r), "pending": None if r["pending"] is None else json.loads(r["pending"])}
+            {
+                **dict(r),
+                **{k: None if r[k] is None else json.loads(r[k]) for k in ("pending", "late")},
+            }
             for r in rows
         ]
 

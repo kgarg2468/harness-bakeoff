@@ -206,7 +206,7 @@ async def test_next_turn_sees_history_and_seq_continues(runner, log, tid):
     assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
     for check in (
         check_seq(events, log.items(tid)),
-        check_tool_results(log.items(tid), events),
+        check_tool_results(log.items(tid), events, log.turns(tid)),
         check_commits(log, tid, runner.workdir(tid)),
     ):
         assert check.ok, check.detail
@@ -318,7 +318,7 @@ async def test_crash_leaves_turn_running_and_crash_resume_continues(runner, log,
     assert log.events(tid)[-1]["data"]["files"] == ["a.pipe"]
     for check in (
         check_seq(log.events(tid), log.items(tid)),
-        check_tool_results(log.items(tid), log.events(tid)),
+        check_tool_results(log.items(tid), log.events(tid), log.turns(tid)),
         check_commits(log, tid, runner.workdir(tid)),
     ):
         assert check.ok, check.detail
@@ -508,7 +508,8 @@ async def test_commit_directly_follows_turn_end(runner, log, tid, published):
     assert types(log, tid) == ["turn.start", "item", "turn.end", "commit"]
     assert published == log.events(tid)
     assert log.last_turn(tid)["status"] == "done"
-    (late,) = published[-1]["data"]["late"]  # kept as evidence, outside the stream
+    assert published[-1]["data"] == {"sha": log.last_turn(tid)["commit_sha"], "files": []}
+    (late,) = log.last_turn(tid)["late"]  # kept as evidence, outside the stream
     assert (late["type"], late["data"]["call_id"]) == ("tool.end", "c9")
     assert late["t_us"] >= published[-2]["t_us"]
     StubTools.made[0].emit(Event("tool.start", {"call_id": "c9", "name": "x"}))  # after commit
@@ -528,23 +529,35 @@ async def test_a_tool_run_after_turn_end_fails_i2(runner, log, tid):
     await runner.turn(FakeLoop(reruns), tid, model=MODEL, user_text="go")
     events = log.events(tid)
     assert [e["type"] for e in events][-2:] == ["turn.end", "commit"]
-    assert [x["type"] for x in events[-1]["data"]["late"]] == ["tool.start", "tool.end"]
-    check = check_tool_results(log.items(tid), events)
+    assert [x["type"] for x in log.last_turn(tid)["late"]] == ["tool.start", "tool.end"]
+    check = check_tool_results(log.items(tid), events, log.turns(tid))
     call_id = f"{tid}.0:c"
     assert (check.ok, check.info["reran"], check.info["late_runs"]) == (False, [call_id], [call_id])
 
 
-async def test_tool_events_after_a_paused_turn_end_are_logged(runner, log, tid, caplog):
+async def test_a_tool_run_after_a_paused_turn_end_is_recorded_and_fails_i2(runner, log, tid):
     async def pauses(turn, tools, cancel):
+        call = write_call(turn, "a.txt")
+        yield item(turn, "a", assistant(call))
         try:
-            yield Event("turn.end", {"stop": "paused", "steps": 1, "pending": ["c1"]})
-        finally:
-            tools.emit(Event("tool.start", {"call_id": "c1", "name": "write_file"}))
+            yield Event("turn.end", {"stop": "paused", "steps": 1, "pending": [call.id]})
+        finally:  # runs when the runner closes the loop: the pending call runs anyway
+            await tools.run(call)
 
     summary = await runner.turn(FakeLoop(pauses), tid, model=MODEL, user_text="go")
     assert summary["stop"] == "paused"
-    assert types(log, tid)[-1] == "turn.end"
-    assert "tool events after turn.end" in caplog.text
+    assert types(log, tid)[-1] == "turn.end"  # nothing after turn.end in the stream (rule 7)
+    call_id = f"{tid}.0:c"
+    reader = SessionLog(runner.wc_root.parent / "log.sqlite")  # durable, e.g. for `bakeoff report`
+    paused = reader.last_turn(tid)
+    assert (paused["status"], paused["pending"]) == ("paused", [call_id])
+    assert [(x["type"], x["data"]["call_id"]) for x in paused["late"]] == [
+        ("tool.start", call_id),
+        ("tool.end", call_id),
+    ]
+    check = check_tool_results(reader.items(tid), reader.events(tid), reader.turns(tid))
+    reader.close()
+    assert (check.ok, check.info["late_runs"]) == (False, [call_id])
 
 
 async def wait_for_cancel(turn, tools, cancel):

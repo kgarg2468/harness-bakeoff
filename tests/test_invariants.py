@@ -212,7 +212,7 @@ def tool_start(call_id):
 
 
 def test_tool_results_ok():
-    check = check_tool_results(items(USER, CALL, RESULT, ANSWER), [tool_start("c1")])
+    check = check_tool_results(items(USER, CALL, RESULT, ANSWER), [tool_start("c1")], [])
     assert check.ok, check.detail
     assert (check.info["calls"], check.info["results"]) == (1, 1)
 
@@ -232,7 +232,7 @@ def test_tool_results_ok():
     ],
 )
 def test_tool_result_violations(messages, starts, problem):
-    check = check_tool_results(items(*messages), [tool_start(c) for c in starts])
+    check = check_tool_results(items(*messages), [tool_start(c) for c in starts], [])
     assert not check.ok
     assert check.info[problem]
     assert check.detail.startswith(problem)
@@ -240,10 +240,13 @@ def test_tool_result_violations(messages, starts, problem):
 
 def test_a_tool_started_after_turn_end_counts_as_a_run():
     late = {"t_us": 9, "type": "tool.start", "data": {"call_id": "c1", "name": "read_file"}}
-    commit = {"type": "commit", "data": {"sha": "abc", "files": [], "late": [late]}}
-    check = check_tool_results(items(USER, CALL, RESULT), [tool_start("c1"), commit])
+    turns = [{"id": "t.0", "late": None}, {"id": "t.1", "late": [late]}]
+    check = check_tool_results(items(USER, CALL, RESULT), [tool_start("c1")], turns)
     assert not check.ok
     assert (check.info["reran"], check.info["late_runs"]) == (["c1"], ["c1"])
+    # The only run of a paused turn's pending call, started after its turn.end.
+    check = check_tool_results(items(USER, CALL), [], turns)
+    assert (check.info["missing"], check.info["late_runs"]) == (["c1"], ["c1"])
 
 
 # I3

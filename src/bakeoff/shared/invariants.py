@@ -226,13 +226,19 @@ _I2_PROBLEMS = (
     "duplicate_calls",  # a call id in more than one assistant message
     "reran",  # more than one tool.start for a call id
     "unknown_runs",  # a tool ran for a call id that is in no assistant message
-    "late_runs",  # a tool started after the loop's turn.end (kept in the commit's `late`)
+    "late_runs",  # a tool started after the loop's turn.end (kept in the turn row's `late`)
 )
 
 
-def check_tool_results(items: Sequence[Item], events: Sequence[dict[str, Any]]) -> Check:
+def check_tool_results(
+    items: Sequence[Item], events: Sequence[dict[str, Any]], turns: Sequence[dict[str, Any]]
+) -> Check:
     """I2: every tool call has exactly one result, right after its call; every run belongs
-    to a call in history, and no call runs twice."""
+    to a call in history, and no call runs twice.
+
+    Runs are the `tool.start` events plus those the turn rows (`SessionLog.turns`) keep in
+    `late`: tools that started after their loop's `turn.end`.
+    """
     calls: Counter[Any] = Counter()
     results: Counter[Any] = Counter()
     out_of_place: list[Any] = []
@@ -248,16 +254,14 @@ def check_tool_results(items: Sequence[Item], events: Sequence[dict[str, Any]]) 
             tool_calls = item.message.get("tool_calls") if role == "assistant" else None
             latest = [c.get("id") for c in tool_calls or []]
             calls.update(latest)
-    starts: Counter[Any] = Counter()
-    late: list[Any] = []
-    for e in events:
-        if e["type"] == "tool.start":
-            starts[e["data"].get("call_id")] += 1
-        elif e["type"] == "commit":
-            for x in e["data"].get("late", []):
-                if x["type"] == "tool.start":
-                    starts[x["data"].get("call_id")] += 1
-                    late.append(x["data"].get("call_id"))
+    starts = Counter(e["data"].get("call_id") for e in events if e["type"] == "tool.start")
+    late = [
+        x["data"].get("call_id")
+        for turn in turns
+        for x in turn.get("late") or []
+        if x["type"] == "tool.start"
+    ]
+    starts.update(late)
     info = {
         "calls": sum(calls.values()),
         "results": sum(results.values()),

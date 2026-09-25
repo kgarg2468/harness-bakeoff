@@ -63,16 +63,17 @@ def test_turns_get_indexes_and_status(log):
         "running",
         None,
     )
-    log.set_turn_status("th.0", "paused", stop="paused", pending=["c1", "c2"])
+    late = [{"t_us": 5, "type": "tool.start", "data": {"call_id": "c1", "name": "x"}}]
+    log.set_turn_status("th.0", "paused", stop="paused", pending=["c1", "c2"], late=late)
     second = log.start_turn("th", "approval")
     assert second["idx"] == 1
     log.set_turn_status("th.1", "done", stop="end_turn", commit_sha="abc")
     turns = log.turns("th")
     assert [t["status"] for t in turns] == ["paused", "done"]
-    assert turns[0]["pending"] == ["c1", "c2"]
+    assert (turns[0]["pending"], turns[0]["late"]) == (["c1", "c2"], late)
     assert turns[0]["ended_us"] >= turns[0]["started_us"]
     assert turns[1]["commit_sha"] == "abc"
-    assert turns[1]["pending"] is None
+    assert turns[1]["pending"] is turns[1]["late"] is None
     assert log.last_turn("th")["id"] == "th.1"
     assert log.last_turn("other") is None
 
