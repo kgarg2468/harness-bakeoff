@@ -12,7 +12,7 @@ from bakeoff.shared.invariants import (
     check_tool_results,
     load_wire,
 )
-from bakeoff.shared.sessionlog import SessionLog
+from bakeoff.shared.sessionlog import SessionLog, event_row
 from bakeoff.shared.workcopy import GIT_CONFIG, WorkCopy, git_env
 
 SYSTEM = {"role": "system", "content": "sys"}
@@ -357,10 +357,18 @@ def log(tmp_path):
     log.close()
 
 
+def event(log, turn_id, type_="commit", **data):
+    env = {"v": 1, "thread": "th", "turn": turn_id, "impl": "our", "seq": log.next_seq("th")}
+    return event_row({**env, "t_us": 0, "type": type_, "data": data})
+
+
 async def committed_turn(log, wc, status="done", kind="user"):
+    """A turn as the runner records it: the sha on the row, a `commit` event last."""
     turn = log.start_turn("th", kind)
-    sha, _ = await wc.commit(f"turn {turn['idx']}")
-    log.set_turn_status(turn["id"], status, stop="end_turn", commit_sha=sha)
+    log.append_events([event(log, turn["id"], "turn.start")])
+    sha, files = await wc.commit(f"turn {turn['idx']}")
+    commit = event(log, turn["id"], sha=sha, files=files)
+    log.set_turn_status(turn["id"], status, stop="end_turn", commit_sha=sha, events=[commit])
     return sha
 
 
@@ -391,6 +399,46 @@ async def test_an_error_turn_that_failed_to_commit_is_not_a_committed_turn(log, 
     check = check_commits(log, "th", wc.root)
     assert check.ok, check.detail
     assert check.info["turns"] == check.info["commits"] == 2
+
+
+async def test_an_error_turn_needs_a_later_commit(log, tmp_path):
+    wc = WorkCopy(tmp_path / "wc")
+    await wc.init()
+    await committed_turn(log, wc)
+    failed = log.start_turn("th", "user")
+    log.set_turn_status(failed["id"], "error", stop="end_turn")  # its commit failed
+    (wc.root / "b.pipe").write_text("{}")  # ...and nothing ever committed its change
+    check = check_commits(log, "th", wc.root)
+    assert (check.ok, check.info["uncommitted"]) == (False, ["th.1"])
+    log.set_turn_status(log.start_turn("th", "compact")["id"], "done")
+    paused = log.start_turn("th", "user")
+    log.set_turn_status(paused["id"], "paused", stop="paused", pending=["c1"])
+    assert check_commits(log, "th", wc.root).info["uncommitted"] == ["th.1"]
+    await committed_turn(log, wc, kind="approval")  # its commit includes b.pipe
+    check = check_commits(log, "th", wc.root)
+    assert check.ok, check.detail
+
+
+async def test_each_commit_is_its_turns_last_event(log, tmp_path):
+    wc = WorkCopy(tmp_path / "wc")
+    await wc.init()
+    sha = await committed_turn(log, wc)
+    assert check_commits(log, "th", wc.root).ok
+    log.append_events([event(log, "th.0", "text.delta", text="after the commit")])
+    check = check_commits(log, "th", wc.root)
+    assert (check.ok, check.info["commit_events"]) == (False, ["th.0"])
+    assert "commit event is missing, repeated, not their last event" in check.detail
+
+    turn = log.start_turn("th", "user")  # the sha is on the row, but no commit event
+    (wc.root / "a.pipe").write_text("{}")
+    sha, _ = await wc.commit("turn 1")
+    log.set_turn_status(turn["id"], "done", stop="end_turn", commit_sha=sha)
+    assert check_commits(log, "th", wc.root).info["commit_events"] == ["th.0", "th.1"]
+    # A commit event for another sha, or for a turn without one, is wrong too.
+    log.append_events([event(log, "th.1", sha="0" * 40)])
+    compact = log.start_turn("th", "compact")["id"]
+    log.set_turn_status(compact, "done", events=[event(log, compact, sha=sha)])
+    assert check_commits(log, "th", wc.root).info["commit_events"] == ["th.0", "th.1", "th.2"]
 
 
 async def test_extra_commit_fails(log, tmp_path):
