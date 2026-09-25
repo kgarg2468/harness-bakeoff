@@ -362,13 +362,15 @@ def test_input_problems_show_even_without_a_scenario_run(tmp_path: Path) -> None
     (tmp_path / "metrics.json").write_text("{not json")
     (tmp_path / "live" / "L1" / "our").mkdir(parents=True)
     (tmp_path / "live" / "L1" / "our" / "result.json").write_text("{broken")
+    write_json(tmp_path / "live" / "L2" / "our" / "result.json", "just a string")
     html = build.build(
         runs=tmp_path / "runs", live=tmp_path / "live", metrics=tmp_path / "metrics.json",
         now=NOW, discovered=[],
     )  # fmt: skip
     assert Page(html).problems == []
-    assert "2 data notes" in html
+    assert "3 data notes" in html
     assert "live/L1/our/result.json: unreadable" in html and "metrics.json: unreadable" in html
+    assert "live/L2/our/result.json: not an object" in html
 
 
 def test_output_is_deterministic(out: Path) -> None:

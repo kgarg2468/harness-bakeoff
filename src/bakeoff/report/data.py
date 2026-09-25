@@ -829,6 +829,8 @@ def load_live(live_dir: Path | None) -> tuple[list[dict[str, Any]], list[str]]:
             data, problem = read_json(idir / "result.json")
             if problem:
                 problems.append(f"live/{run.name}/{idir.name}/{problem}")
+            elif data is not None and not isinstance(data, dict):
+                problems.append(f"live/{run.name}/{idir.name}/result.json: not an object")
             if isinstance(data, dict):
                 slim = {k: data.get(k) for k in _LIVE_KEYS if k in data}
                 slim["prompt"] = clip(str(data.get("prompt") or ""), CARD_LIMIT)
