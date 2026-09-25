@@ -134,10 +134,16 @@ class ModelConfig:
     base_url: str  # e.g. https://openrouter.ai/api/v1 or the local fake server
     model: str  # e.g. "anthropic/claude-sonnet-5"
     api_key: str = "dummy"
-    kind: Literal["openrouter", "openai_compat"] = "openrouter"
+    # "openrouter" and "openai_compat" speak chat completions (`<base_url>/chat/completions`).
+    # "openai_responses" speaks OpenAI's Responses API (`<base_url>/responses`): `input` items
+    # instead of messages, named SSE events. Its items still carry a chat-completions-shaped
+    # `Item.message` (for the shared log, UI and checks); a loop may keep the exact Responses
+    # items it must replay (e.g. reasoning items with `encrypted_content`) in `Item.native`.
+    kind: Literal["openrouter", "openai_compat", "openai_responses"] = "openrouter"
     max_tokens: int = 4096
     temperature: float | None = 0.0
-    reasoning: dict[str, Any] | None = None  # OpenRouter `reasoning`, e.g. {"effort": "low"}
+    # OpenRouter's (or the Responses API's) `reasoning` object, e.g. {"effort": "low"}
+    reasoning: dict[str, Any] | None = None
     session_id: str | None = None  # OpenRouter sticky routing, keeps prompt-cache hits
     # Per-endpoint quirks for OpenAI-compatible (BYOK) servers. Keys are documented in
     # DESIGN.md ("Endpoint compat flags"); unknown keys must be ignored.

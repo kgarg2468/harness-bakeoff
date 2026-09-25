@@ -79,6 +79,12 @@ timed identically for every loop.
   verbatim (never rebuilt).
 - tool result: `{"role": "tool", "tool_call_id": "...", "content": "..."}`. One item per call.
 
+With `ModelConfig.kind == "openai_responses"` a loop speaks OpenAI's Responses API
+(`<base_url>/responses`: `input` items, named SSE events). Its items keep this chat-shaped
+`Item.message` all the same (the log, the UI and the invariants read it), and the loop keeps the
+exact Responses items it must replay in `Item.native`: with `store: false` the harness owns the
+history, so reasoning items go back verbatim with their `encrypted_content`.
+
 `Item.native` is loop-private. `pydantic_version` stores pydantic-ai's native `ModelMessage` JSON
 there (each item gets the native of exactly what it shows) and rebuilds its history from it.
 Items the runner created (user messages, revert notes, compaction summaries) have `native=None`, and every
