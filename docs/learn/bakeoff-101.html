@@ -525,7 +525,7 @@
       <div>
         <div class="note">Rules (edit the JSON)</div>
         <textarea id="permRules" class="mono" style="width:100%;height:92px;border:1px solid var(--line);border-radius:8px;padding:8px">{"*": "allow", "write_file": {"*.pipe": "allow", "*": "ask"}, "edit_file": "ask"}</textarea>
-        <div class="ctrl"><select id="permTool" class="btn"><option>write_file</option><option>edit_file</option><option>read_file</option><option>validate_pipeline</option><option>list_components</option></select><input id="permPath" class="btn mono" value="agent.pipe" style="width:180px" placeholder="path"></div>
+        <div class="ctrl"><select id="permTool" class="btn"><option>write_file</option><option>edit_file</option><option>read_file</option><option>validate_pipeline</option><option>list_components</option></select><input id="permPath" class="btn mono" value="agent.pipe" style="width:180px" placeholder="path"><label class="note"><input type="checkbox" id="permWin"> Windows paths (a backslash separates folders)</label></div>
       </div>
       <div><div class="status" id="permStatus" style="margin-top:0;min-height:120px"></div></div>
     </div>
@@ -1491,9 +1491,10 @@ chips('sqlBtns', b => {
     // what resolve_path does before any rule is read: relative to the working copy, "." and ".." collapsed;
     // only "/" separates (match() later reads a backslash as "/", as OpenCode's matcher does)
     // (it also follows symlinks, which a web page can't see)
-    if (path.startsWith('/')) return null;
+    if (path.startsWith('/') || ($('#permWin').checked && /^([A-Za-z]:|\\)/.test(path))) return null;
     const out = [];
-    for (const part of path.split('/')) {  // on POSIX a backslash is part of a file name, not a separator
+    const win = $('#permWin').checked;  // Windows paths also separate on a backslash; on Linux (where the engine runs) it's part of a name
+    for (const part of (win ? path.replace(/\\/g, '/') : path).split('/')) {
       if (!part || part === '.') continue;
       if (part === '..') { if (!out.length) return null; out.pop(); } else out.push(part);
     }
@@ -1518,6 +1519,7 @@ chips('sqlBtns', b => {
     status('permStatus', `<b>${d}</b> — ${meaning}.<br><span class="note">Why: ${why}.${resolved} The tool's own key is tried before <code>"*"</code>; inside a mapping the first matching glob wins. (The real <code>resolve_path</code> also follows symlinks, so a link pointing outside the working copy is denied; this page can't see your files.)</span>`, d === 'allow' ? 'good' : d === 'deny' ? 'bad' : 'warn');
   }
   ['permRules', 'permTool', 'permPath'].forEach(id => $('#' + id).addEventListener('input', run));
+  $('#permWin').addEventListener('change', run);
   $('#permTool').addEventListener('change', run); run();
 })();
 
