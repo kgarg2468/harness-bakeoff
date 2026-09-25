@@ -110,7 +110,10 @@ Only `respond` is required. Before answering, the server applies, in order:
    `body_has` / `body_lacks` (top-level keys), `model` (equal), `last_role`,
    `last_content_contains` (substring; list content is joined text parts), `messages_len`,
    `tool_result_contains: {call_id: substring}` (a `role: tool` message for that call contains
-   it; `""` only checks that the result exists).
+   it; `""` only checks that the result exists), `messages_at: [{index, role?, contains?}]`
+   (checks one message; a negative index counts from the end), and `min_gap_ms` (the request
+   must arrive at least this long after the cursor's previous one, e.g. a retry that honours
+   `retry-after`).
 
 `respond.status` other than 200 sends a JSON error with `headers` (e.g. `{"retry-after": "1"}`)
 and `body`, which defaults to OpenRouter's `{"error": {"code", "message", "metadata"}}` (or

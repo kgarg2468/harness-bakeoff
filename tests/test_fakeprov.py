@@ -360,6 +360,12 @@ def test_expect_checks_pass_on_a_matching_request(serve):
             {"tool_result_contains": {"call_1": "3 rows"}},
             "tool result call_1 lacks '3 rows': '2 rows'",
         ),
+        (
+            {"messages_at": [{"index": 0, "role": "system"}]},
+            "message 0 role is 'user', expected 'system'",
+        ),
+        ({"messages_at": [{"index": -1, "contains": "zzz"}]}, "message -1 lacks 'zzz'"),
+        ({"messages_at": [{"index": 9}]}, "no message at index 9"),
     ],
 )
 def test_each_expect_mismatch_is_named(serve, expect, failure):
@@ -604,3 +610,31 @@ def test_a_broken_scenario_is_reported_by_the_server(serve):
     response = chat(provider, request())
     assert response.status_code == 500
     assert "status 200 needs a stream" in response.json()["error"]["message"]
+
+
+def test_min_gap_rejects_an_immediate_retry_and_accepts_a_patient_one(serve):
+    """A retry that ignores retry-after arrives too soon and fails the scenario."""
+    limited = {"respond": {"status": 429, "headers": {"retry-after": "1"}}}
+    provider = serve(
+        scenario("T", limited, says("ok", expect={"min_gap_ms": 200}), limited, says("ok"))
+    )
+    assert chat(provider, request()).status_code == 429
+    early = chat(provider, request())
+    assert early.status_code == 500
+    assert "expected at least 200 ms" in early.json()["error"]["message"]
+
+    provider2 = serve(scenario("U", limited, says("ok", expect={"min_gap_ms": 200})))
+    assert chat(provider2, request(), sid="U").status_code == 429
+    time.sleep(0.25)
+    assert chat(provider2, request(), sid="U").status_code == 200
+
+
+def test_restart_is_a_new_server_run(serve):
+    """stop() + start() on the same instance: cursors restart and recordings are fresh."""
+    provider = serve(scenario("T", says("first"), says("second")))
+    assert text_of(frames(chat(provider, request()))) == "first"
+    provider.stop()
+    provider.start()
+    assert text_of(frames(chat(provider, request()))) == "first"
+    wire = provider.wire_dir / "T" / "r1" / "our"
+    assert sorted(p.name for p in wire.glob("*.json")) == ["001.json", "001.meta.json"]

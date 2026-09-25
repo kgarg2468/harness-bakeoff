@@ -65,6 +65,7 @@ class FakeProvider:
         self._lock = threading.Lock()
         self._scenarios: dict[str, Scenario] = {}
         self._cursors: dict[tuple[str, str, str], int] = {}
+        self._last_us: dict[tuple[str, str, str], int] = {}  # previous request per cursor
         self._claimed: set[tuple[str, str, str]] = set()
         self._conn_ids = itertools.count(1)
         self._conns: set[socket.socket] = set()
@@ -73,7 +74,14 @@ class FakeProvider:
         self._server: _Server | None = None
 
     def start(self) -> Self:
-        """Bind and serve in a background thread. `port=0` picks a free port."""
+        """Bind and serve in a background thread. `port=0` picks a free port.
+
+        Every start is a new server run: cursors restart at the first exchange and recording
+        folders are emptied again on first use."""
+        with self._lock:
+            self._cursors.clear()
+            self._last_us.clear()
+            self._claimed.clear()
         self._stopping.clear()
         self._server = _Server((self.host, self.port), _Handler)
         self._server.provider = self
@@ -145,8 +153,10 @@ class FakeProvider:
         with self._lock:
             index = self._cursors.get(key, 0)
             self._cursors[key] = index + 1
+            prev_us, self._last_us[key] = self._last_us.get(key), t_us
+        gap_ms = None if prev_us is None else (t_us - prev_us) / 1000
         try:
-            answer = reply(self._scenario(key[0]), index, raw)
+            answer = reply(self._scenario(key[0]), index, raw, gap_ms)
         except ScenarioError as exc:
             answer = rejected(500, str(exc))
         meta |= {"t_us": t_us, "status": answer.status}

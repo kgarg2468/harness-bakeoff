@@ -15,7 +15,7 @@
     },
     {
       "note": "The same request again.",
-      "expect": {"last_role": "user", "messages_len": 2},
+      "expect": {"last_role": "user", "messages_len": 2, "min_gap_ms": 900},
       "respond": {
         "stream": [
           {"text": "Hi!", "chunks": 1},

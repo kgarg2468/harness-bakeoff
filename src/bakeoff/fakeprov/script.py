@@ -186,6 +186,14 @@ _EXCHANGE_EXPECT = _obj(
         "last_content_contains": _STR,
         "messages_len": _INT1,
         "tool_result_contains": {"type": "object", "additionalProperties": _STR},
+        # Checks on specific messages; `index` may be negative (from the end).
+        "messages_at": {
+            "type": "array",
+            "items": _obj({"index": {"type": "integer"}, "role": _STR, "contains": _STR}),
+        },
+        # The request must arrive at least this long after the cursor's previous request
+        # (e.g. a retry that honours `retry-after`).
+        "min_gap_ms": {"type": "number", "minimum": 0},
     }
 )
 _RESPOND = _obj(
@@ -341,8 +349,10 @@ def rejected(status: int, message: str, param: str | None = None) -> Reply:
     return Reply(status, body, headers={"x-should-retry": "false"}, error=message)
 
 
-def reply(scenario: Scenario, index: int, raw: bytes) -> Reply:
-    """Answer request number `index` (0-based) of one (scenario, run, impl) cursor."""
+def reply(scenario: Scenario, index: int, raw: bytes, gap_ms: float | None = None) -> Reply:
+    """Answer request number `index` (0-based) of one (scenario, run, impl) cursor.
+
+    `gap_ms` is the time since the cursor's previous request (None for the first one)."""
     try:
         body = json.loads(raw)
     except ValueError as exc:
@@ -360,7 +370,7 @@ def reply(scenario: Scenario, index: int, raw: bytes) -> Reply:
     strict = scenario.strict | exchange.get("strict", {})
     if problem := _strict_violation(strict, body):
         return rejected(400, *problem)
-    if failures := _expect_failures(exchange.get("expect", {}), body):
+    if failures := _expect_failures(exchange.get("expect", {}), body, gap_ms):
         return rejected(500, f"expect failed (exchange {index + 1}): " + "; ".join(failures))
 
     style = exchange.get("style", scenario.style)
@@ -404,7 +414,9 @@ def _unsigned_reasoning(details: object) -> list[str]:
     return [key for key, ok in signed.items() if not ok]
 
 
-def _expect_failures(expect: dict[str, Any], body: dict[str, Any]) -> list[str]:
+def _expect_failures(
+    expect: dict[str, Any], body: dict[str, Any], gap_ms: float | None = None
+) -> list[str]:
     messages: list[dict[str, Any]] = body["messages"]
     last = messages[-1]
     failures = [f"body lacks {key!r}" for key in expect.get("body_has", []) if key not in body]
@@ -429,6 +441,21 @@ def _expect_failures(expect: dict[str, Any], body: dict[str, Any]) -> list[str]:
             failures.append(f"no tool result for {call_id}")
         elif not any(needle in result for result in results):
             failures.append(f"tool result {call_id} lacks {needle!r}: {results[0][:200]!r}")
+    for check in expect.get("messages_at", []):
+        i = check["index"]
+        if not -len(messages) <= i < len(messages):
+            failures.append(f"no message at index {i}")
+            continue
+        message = messages[i]
+        if "role" in check and message.get("role") != check["role"]:
+            failures.append(
+                f"message {i} role is {message.get('role')!r}, expected {check['role']!r}"
+            )
+        if "contains" in check and check["contains"] not in _text(message.get("content")):
+            failures.append(f"message {i} lacks {check['contains']!r}")
+    if "min_gap_ms" in expect and (gap_ms is None or gap_ms < expect["min_gap_ms"]):
+        got = "no previous request" if gap_ms is None else f"{gap_ms:.0f} ms"
+        failures.append(f"arrived after {got}, expected at least {expect['min_gap_ms']} ms")
     return failures
 
 

@@ -42,7 +42,12 @@
     },
     {
       "note": "The prefix resets at the compaction item: system, summary, new user message.",
-      "expect": {"last_role": "user", "messages_len": 3, "last_content_contains": "Read notes.md"},
+      "expect": {
+        "last_role": "user",
+        "messages_len": 3,
+        "last_content_contains": "Read notes.md",
+        "messages_at": [{"index": 1, "role": "user", "contains": "It was created with the title '# Notes'"}]
+      },
       "respond": {
         "stream": [
           {
@@ -58,7 +63,8 @@
       "expect": {
         "last_role": "tool",
         "messages_len": 5,
-        "tool_result_contains": {"call_S15_2": "# Notes"}
+        "tool_result_contains": {"call_S15_2": "# Notes"},
+        "messages_at": [{"index": 1, "role": "user", "contains": "It was created with the title '# Notes'"}]
       },
       "respond": {
         "stream": [

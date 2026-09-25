@@ -50,6 +50,6 @@
     "stops": ["max_steps"],
     "requests": 3,
     "commits": 1,
-    "tool_runs": {"call_S11_1": 1, "call_S11_2": 1}
+    "tool_runs": {"call_S11_1": 1, "call_S11_2": 1, "call_S11_3": 0}
   }
 }
