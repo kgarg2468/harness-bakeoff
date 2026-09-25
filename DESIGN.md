@@ -169,7 +169,7 @@ recordings and the session log, never from what a loop says about itself.
 | S05 | approval across processes: one batch with `validate_pipeline` (allow) + `write_file` (ask); the process exits; `bakeoff approve` resumes in a new process | write runs once; validate not re-run; history prefix holds across resume; file in the commit |
 | S06 | deny with a reason | tool not run; the denial reaches the model as the tool result; file absent |
 | S07 | cancel mid-stream (stall) and during a slow tool | stops within 200 ms; next turn succeeds against `reject_unsigned_reasoning`; no orphan tool calls |
-| S08 | crash: SIGKILL the worker after `tool.end`, before the next request; resume | tool not re-run; resumed request continues the same history |
+| S08 | crash: SIGKILL the worker right after the tool-result item for the scripted call is persisted (`{"crash_after": "item", "call_id": ...}`), before the next request; resume | tool not re-run; resumed request continues the same history |
 | S09 | 429 with `retry-after: 1`, then OK; variant: `sse_error` mid-stream | wire: exactly 2 attempts, waited per Retry-After. Observability (a visible `retry` event) is scored separately |
 | S10a | `reasoning_details` round-trip with known fields, split across chunks, incl. metadata-only fragments | semantic equality of {type,text,signature,data,format,index}; byte equality reported as info |
 | S10b | same plus a synthetic unknown field | informational footnote only |
