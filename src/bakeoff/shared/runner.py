@@ -394,6 +394,7 @@ class Runner:
         lock_fd: int | None,
     ) -> dict[str, Any]:
         kind = resume.kind if resume else "user"
+        self._retire_dead(thread_id, lock_fd)
         if resume is None:
             self._refuse_while(thread_id, "start a user turn", _PAUSED)
         row = self.log.start_turn(thread_id, kind)  # raises if a turn is running (unless crash)
@@ -489,7 +490,8 @@ class Runner:
         Appends a runner item telling the model what was reverted. Returns the same summary
         shape as `turn()`. The note, the sha and the `commit` event are recorded in one
         transaction; if git fails (e.g. a conflict) or the log cannot record them, git is
-        undone and no turn is recorded. It refuses while the last turn is paused or failed to
+        undone and no turn is recorded. If its process dies, the next call on the thread undoes
+        it (see `_retire_dead`). It refuses while the last turn is paused or failed to
         commit: that turn's changes are not committed, so the revert would take them into its
         own commit, or lose them if git aborts it.
         """
@@ -500,6 +502,7 @@ class Runner:
         # Held until the revert is fully recorded: while its row says "running", a crash resume
         # that got the lock would take git's revert commit for one that no turn recorded.
         with _exclusive(self._lock_path(thread_id)) as lock_fd:
+            self._retire_dead(thread_id, lock_fd)
             self._refuse_while(thread_id, "revert", _REVERT_WAITS)
             row = self.log.start_turn(thread_id, "revert")
             wc = WorkCopy(self.workdir(thread_id), lock_fd)
@@ -532,7 +535,8 @@ class Runner:
         turn is paused: the summary would come between the pending calls and their results.
         """
         thread = self._thread(thread_id)
-        with _exclusive(self._lock_path(thread_id)):
+        with _exclusive(self._lock_path(thread_id)) as lock_fd:
+            self._retire_dead(thread_id, lock_fd)
             self._refuse_while(thread_id, "compact", _PAUSED)
             row = self.log.start_turn(thread_id, "compact")
             item = Item(
@@ -587,6 +591,24 @@ class Runner:
             logger.exception("discarding turn %s failed", turn_id)
             with _logged_failure(f"recording turn {turn_id} as an error"):
                 self.log.set_turn_status(turn_id, "error")
+
+    def _retire_dead(self, thread_id: str, lock_fd: int | None) -> None:
+        """Retire the thread's last turn if it is a revert or compaction that died.
+
+        Called with the thread's lock held. Every revert and compaction holds it while it runs,
+        so a "running" one is dead: its process died, or its failure could not be recorded. It
+        recorded nothing (each records its end in one transaction). A compaction is deleted; a
+        revert is marked "error" and the next `_reconcile` undoes what git did for it. A dead
+        loop turn is left for a crash resume. Without OS locks (`lock_fd` None) a running turn
+        may be alive, so nothing is retired.
+        """
+        last = self.log.last_turn(thread_id)
+        if lock_fd is None or last is None or last["status"] != "running":
+            return
+        if last["kind"] == "compact":
+            self.log.discard_turn(last["id"])
+        elif last["kind"] == "revert":
+            self.log.set_turn_status(last["id"], "error")
 
     def _refuse_while(self, thread_id: str, what: str, waits: dict[str, str]) -> None:
         """Raise if the thread's last git turn has no commit and a status in `waits`: it left

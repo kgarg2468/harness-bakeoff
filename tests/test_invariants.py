@@ -417,6 +417,10 @@ async def test_an_error_turn_needs_a_later_commit(log, tmp_path):
     await committed_turn(log, wc, kind="approval")  # its commit includes b.pipe
     check = check_commits(log, "th", wc.root)
     assert check.ok, check.detail
+    # A failed revert recorded nothing (the runner undid git's part): no commit is owed.
+    log.set_turn_status(log.start_turn("th", "revert")["id"], "error")
+    check = check_commits(log, "th", wc.root)
+    assert check.ok, check.detail
 
 
 async def test_each_commit_is_its_turns_last_event(log, tmp_path):

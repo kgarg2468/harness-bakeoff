@@ -1061,8 +1061,9 @@ async def test_a_revert_the_log_cannot_record_is_undone(runner, log, tid, monkey
     assert check.ok, check.detail
 
 
+@pytest.mark.parametrize("next_call", ["crash-resume", "user-turn", "revert"])
 @pytest.mark.parametrize("died", ["after-revert", "after-commit", "in-a-conflict"])
-async def test_a_crash_resume_undoes_a_revert_that_died(runner, log, tid, died):
+async def test_the_call_after_a_revert_that_died_undoes_it(runner, log, tid, died, next_call):
     await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
     wd = runner.workdir(tid)
     if died == "in-a-conflict":  # reverting turn 1 conflicts with turn 2's change
@@ -1075,25 +1076,46 @@ async def test_a_crash_resume_undoes_a_revert_that_died(runner, log, tid, died):
     if died == "after-commit":
         git(wd, "commit", "-q", "--no-edit")
     assert git(wd, "status", "--porcelain") != "" or died == "after-commit"
-    # Only a crash resume may start; it undoes the revert the model was never told about.
-    with pytest.raises(RuntimeError, match="running turn"):
-        await runner.revert(tid, f"{tid}.0")
+
+    # Nobody holds the thread's lock, so that revert is dead: the next call undoes it.
     finish = FakeLoop(only(Event("turn.end", {"stop": "end_turn", "steps": 0})))
-    await runner.turn(finish, tid, model=MODEL, resume=Resume(kind="crash"))
-    assert log.events(tid)[-1]["data"]["files"] == []
-    assert git(wd, "rev-parse", "HEAD~1") == head
-    assert (wd / "a.pipe").read_text() == ("changed\n" if died == "in-a-conflict" else "{}")
-    assert git(wd, "status", "--porcelain") == ""
-    assert [(t["kind"], t["status"]) for t in log.turns(tid)][2:] == [
-        ("revert", "error"),
-        ("crash", "done"),
-    ]
-    assert not any("Reverted" in str(i.message.get("content")) for i in log.items(tid))
+    if next_call == "crash-resume":
+        await runner.turn(finish, tid, model=MODEL, resume=Resume(kind="crash"))
+    elif next_call == "user-turn":
+        await runner.turn(finish, tid, model=MODEL, user_text="three")
+    if next_call != "revert":
+        assert log.events(tid)[-1]["data"]["files"] == []
+        assert git(wd, "rev-parse", "HEAD~1") == head
+        assert (wd / "a.pipe").read_text() == ("changed\n" if died == "in-a-conflict" else "{}")
+        assert git(wd, "status", "--porcelain") == ""
+        assert not any("Reverted" in str(i.message.get("content")) for i in log.items(tid))
+    elif died == "in-a-conflict":  # the retry conflicts again: git's refusal, nothing else
+        with pytest.raises(RuntimeError, match="git revert failed"):
+            await runner.revert(tid, f"{tid}.0")
+        assert (wd / "a.pipe").read_text() == "changed\n"
+    else:
+        await runner.revert(tid, f"{tid}.0")
+        assert not (wd / "a.pipe").exists()
+        assert log.events(tid)[-1]["data"]["files"] == ["a.pipe"]
+    assert [(t["kind"], t["status"]) for t in log.turns(tid)][2] == ("revert", "error")
     check = check_commits(log, tid, wd)
     assert check.ok, check.detail
-    if died != "in-a-conflict":
-        await runner.revert(tid, f"{tid}.0")  # it can be tried again
-        assert not (wd / "a.pipe").exists()
+
+
+async def test_a_compaction_that_died_does_not_block_the_thread(runner, log, tid):
+    await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
+    log.start_turn(tid, "compact")  # its process died, or its failure could not be recorded
+    summary = await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")
+    assert summary["stop"] == "end_turn"
+    assert [t["kind"] for t in log.turns(tid)] == ["user", "user"]  # it recorded nothing
+    log.start_turn(tid, "compact")
+    assert runner.compact(tid, "wrote two files").id == f"{tid}.2:compact"
+    held = _try_lock(runner._lock_path(tid))  # alive: it holds the lock, so it is left alone
+    log.start_turn(tid, "compact")
+    with pytest.raises(ThreadBusy):
+        await runner.turn(FakeLoop(writes("c.pipe")), tid, model=MODEL, user_text="three")
+    assert log.last_turn(tid)["status"] == "running"
+    _unlock(held)
 
 
 async def test_a_refused_revert_the_log_cannot_discard_raises_gits_error(

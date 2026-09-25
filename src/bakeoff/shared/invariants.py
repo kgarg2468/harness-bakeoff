@@ -332,8 +332,9 @@ def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
 
     Completed = done, error or cancelled. Compaction turns change no files and have no
     commit; paused turns are committed by the turn that resumes them. An "error" turn without
-    a commit failed to commit (or, for a revert, recorded nothing): a later turn's commit
-    includes its changes, so a later git turn must have a commit.
+    a commit failed to commit: a later turn's commit includes its changes, so a later git turn
+    must have a commit. (A revert without a commit recorded nothing, and the runner undid what
+    git did for it.)
     """
     all_turns = log.turns(thread_id)
     rows = [t for t in all_turns if t["kind"] != "compact"]
@@ -346,6 +347,7 @@ def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
         t["id"]
         for i, t in enumerate(rows)
         if t["status"] == "error"
+        and t["kind"] != "revert"
         and not t["commit_sha"]
         and not any(later["commit_sha"] for later in rows[i + 1 :])
     ]
