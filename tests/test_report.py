@@ -604,3 +604,11 @@ def test_header_reads_the_driver_summary(out: Path) -> None:
     assert "git <code>0123456789</code> (with uncommitted changes)" in html
     assert "bakeoff.our_version:OurLoop, httpx 0.28.1" in html
     assert "pydantic-ai-slim 2.31.1, openai 2.8.1" in html and "{&#x27;" not in html
+
+
+def test_bakeoff_report_command_builds_the_page(out: Path) -> None:
+    from bakeoff.cli import main
+
+    target = out / "page.html"
+    assert main(["report", "--out-dir", str(out), "-o", str(target)]) == 0
+    assert target.read_text().startswith("<!doctype html>")
