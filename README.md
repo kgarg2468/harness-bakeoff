@@ -252,7 +252,7 @@ Only what the measurements show, plus a few design properties labelled as such. 
 - **Options both take:** `--model`, `--reasoning EFFORT`, `--max-steps`, `--max-tokens`, `--base-url` (`{impl}` becomes the loop name), `--kind` (`openai_compat`, the default, or `openrouter`) and `--api responses`.
 - **`--api responses`** uses OpenAI's Responses API instead of chat completions: `gpt-6-luna` takes function tools on chat completions only with reasoning `none`, so tools plus reasoning need it. There `--reasoning` also asks for a reasoning summary. Both loops speak it ([#13](https://github.com/kgarg2468/harness-bakeoff/pull/13), [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14)).
 - **`live`** streams each loop's run (text inline, each tool call and result on one line), then prints tokens, time to first token, total time and steps side by side. `--interactive` asks before each write. Without it the run is unattended: the system prompt tells the model that nobody can answer the skills' approval gates, so it goes on, while checks such as validation still have to pass. A run that fails, is interrupted or can't start still writes its `result.json`, with the error.
-- **`chat`** is a REPL on one loop in which writes ask for approval. Ctrl-C during a turn cancels the turn, and at a prompt it ends the chat. It exits 1 if any turn stopped short (error, `max_steps`, budget, cancelled) or an invariant failed.
+- **`chat`** is a REPL on one loop in which writes ask for approval (`--yes` allows every tool and asks nothing: the thread is unattended, as in `live`). Ctrl-C during a turn cancels the turn, and at a prompt it ends the chat. It exits 1 if any turn stopped short (error, `max_steps`, budget, cancelled) or an invariant failed.
 
 </details>
 

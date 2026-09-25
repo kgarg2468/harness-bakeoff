@@ -742,19 +742,24 @@ async def chat(
     term: TextIO,
     ask: Ask,
     max_steps: int = 12,
+    yes: bool = False,
 ) -> dict[str, Any]:
-    """An interactive REPL on one thread: each line is a user turn; writes ask for approval.
+    """An interactive REPL on one thread: each line is a user turn; writes ask for approval,
+    unless `yes`: then every tool is allowed and the thread is unattended, as in `live`.
     `/revert N` undoes turn N, `/compact TEXT` compacts, `/exit`, end of input or Ctrl-C at a
     prompt quits (Ctrl-C during a turn cancels the turn). The result passes unless a turn
     stopped short (error, max_steps, budget, cancelled) or an invariant failed."""
     directory = fresh_dir(out / "live" / run_id / impl)
+    rules = LIVE_RULES if yes else ASK_RULES
     thread: LiveThread | None = None
     started, error = time.perf_counter(), None
     try:
         thread = LiveThread(
-            impl, directory, model, term, rules=ASK_RULES, max_steps=max_steps, must_answer=False
+            impl, directory, model, term, rules=rules, max_steps=max_steps, must_answer=False
         )
         term.write(f"chat with {impl} on {model.model}; thread {thread.thread_id} in {directory}\n")
+        if yes:
+            term.write("--yes: every tool is allowed and nobody approves anything\n")
         term.write("/revert N, /compact TEXT, /exit\n")
         while True:
             try:
@@ -783,7 +788,7 @@ async def chat(
             "(chat)",
             started,
             error,
-            rules=ASK_RULES,
+            rules=rules,
             max_steps=max_steps,
         )
         point_latest(out / "live", run_id)

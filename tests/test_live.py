@@ -287,6 +287,44 @@ async def test_chat_asks_before_writing(tmp_path: Path) -> None:
     assert "?? write_file(path='notes.md', content='# Notes') needs approval" in term.getvalue()
 
 
+async def test_chat_yes_writes_without_asking(tmp_path: Path) -> None:
+    write_scenario(
+        tmp_path / "scenarios",
+        "C2",
+        [
+            calls(
+                {
+                    "id": "call_C2_1",
+                    "name": "write_file",
+                    "arguments": {"path": "notes.md", "content": "# Notes"},
+                }
+            ),
+            {"expect": {"tool_result_contains": {"call_C2_1": "Wrote"}}, **says("Saved notes.md.")},
+        ],
+    )
+    answers = iter(["Create notes.md", "/exit"])  # no approval answer: none is asked for
+    prompts: list[str] = []
+
+    async def ask(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    term = io.StringIO()
+    with FakeProvider(tmp_path / "scenarios", tmp_path / "wire") as provider:
+        model = live.LiveModel(model="fake-live", base_url=provider.base_url("C2", "r1", "our"))
+        result = await live.chat(
+            "our", model, out=tmp_path / "out", run_id="c2", term=term, ask=ask, yes=True
+        )
+    assert prompts == ["\n> ", "\n> "]  # only the two chat prompts
+    assert result["stops"] == ["end_turn"] and result["final_text"] == "Saved notes.md."
+    assert result["passed"] and result["files"] == ["notes.md"]
+    assert result["attended"] is False  # nobody approves: the unattended system prompt
+    assert "needs approval" not in term.getvalue()
+    log = SessionLog(tmp_path / "out" / "live" / "c2" / "our" / "log.sqlite")
+    assert live.UNATTENDED in log.get_thread("live-our")["system"]
+    log.close()
+
+
 def fail_git_init(monkeypatch: pytest.MonkeyPatch, thread: str) -> None:
     """Make creating `thread`'s working copy fail, as a broken git would."""
     init_sync = WorkCopy.init_sync
