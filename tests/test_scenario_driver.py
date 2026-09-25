@@ -811,7 +811,7 @@ async def test_the_scenario_model_reaches_the_loop_unchanged(
     assert (model.kind, model.model, model.reasoning) == (
         "openai_responses",
         "gpt-6-luna",
-        {"effort": "xhigh"},
+        {"effort": "xhigh", "summary": "auto"},
     )
     assert model.temperature is None  # the scenario's null: reasoning models reject one
     assert model.base_url.endswith("/v1")

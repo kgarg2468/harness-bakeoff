@@ -58,7 +58,10 @@ def says(text: str, **exchange: Any) -> dict[str, Any]:
 
 
 def request(*items: dict[str, Any], **extra: Any) -> dict[str, Any]:
-    return {"model": MODEL, "stream": True, "input": list(items or [USER]), **extra}
+    """A request that asks for reasoning summaries (the API streams none otherwise)."""
+    reasoning = {"effort": "xhigh", "summary": "auto"}
+    return {"model": MODEL, "stream": True, "input": list(items or [USER]), "reasoning": reasoning,
+            **extra}  # fmt: skip
 
 
 @pytest.fixture
@@ -407,7 +410,7 @@ def test_expect_checks_pass_on_a_matching_request(serve):
     post(provider, request())
     shape = {
         "store": False,
-        "reasoning": {"effort": "xhigh"},
+        "reasoning": {"effort": "xhigh", "summary": "auto"},
         "include": ["reasoning.encrypted_content"],
         "tools": [{"type": "function", "name": "read_file", "parameters": {}}],
     }
@@ -455,6 +458,19 @@ def test_each_expect_mismatch_is_named(serve, expect, failure):
     response = post(provider, request(*TOOL_TURN))
     assert response.status_code == 500
     assert response.json()["error"]["message"] == f"expect failed (exchange 2): {failure}"
+
+
+def test_reasoning_summaries_stream_only_when_asked_for(serve):
+    """The API streams no summary unless the request asks for one (`reasoning.summary`): the
+    reasoning item's summary is then empty, and it is replayed so."""
+    expect = {"reasoning_replayed": ["rs_1"]}
+    provider = serve(scenario("T", CALLS, says("ok", expect=expect)))
+    unasked = {"reasoning": {"effort": "xhigh"}}
+    got = events(post(provider, request(**unasked)))
+    assert not [name for name, _ in got if "summary" in name]
+    reasoning = next(data["item"] for name, data in got if name == "response.output_item.done")
+    assert reasoning == {**DONE_REASONING, "summary": []}
+    assert post(provider, request(USER, reasoning, DONE_CALL, OUTPUT, **unasked)).is_success
 
 
 @pytest.mark.parametrize(
@@ -540,7 +556,7 @@ def test_r_scenarios_speak_the_responses_api(sid):
     assert s.model == {
         "kind": "openai_responses",
         "model": "gpt-6-luna",
-        "reasoning": {"effort": "xhigh"},
+        "reasoning": {"effort": "xhigh", "summary": "auto"},
         "temperature": None,
     }
     assert s.strict["reject_unencrypted_reasoning"] is True

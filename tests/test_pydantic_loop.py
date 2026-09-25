@@ -1259,6 +1259,7 @@ async def test_responses_without_a_reasoning_config_still_replays_reasoning(loop
         )
 
     assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+    assert of(events, "reasoning.delta") == []
     request = json.loads(sent(tmp_path)[0])
     assert (request["include"], request["reasoning"]) == (
         ["reasoning.encrypted_content"],
