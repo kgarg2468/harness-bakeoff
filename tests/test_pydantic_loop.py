@@ -1442,47 +1442,77 @@ async def test_the_event_that_ends_a_responses_stream_is_read_across_chunks():
         assert (b"".join(passed), state.event) == (body, "response.failed")
 
 
+BLANK = {"text": "", "phase": "final_answer"}  # a message item with empty text
+
+
+@pytest.mark.parametrize("limit", [None, 1e-7])
 @pytest.mark.parametrize(
-    ("reason", "reasoned", "run_ends"),
+    ("reason", "output", "run_ends"),
     [
-        ("max_output_tokens", True, "length"),
-        ("content_filter", False, "content_filter"),
-        ("content_filter", True, None),
+        ("max_output_tokens", [{"reasoning_item": REASONING}], "length"),
+        ("content_filter", [], "content_filter"),
+        ("content_filter", [BLANK], "content_filter"),
+        ("content_filter", [{"reasoning_item": REASONING}], None),
     ],
+    ids=["reasoning-length", "empty-filtered", "blank-filtered", "reasoning-filtered"],
 )
 async def test_a_crash_after_a_responses_response_without_output_ends_as_the_run_did(
-    loop, tmp_path, reason, reasoned, run_ends
+    loop, tmp_path, reason, output, run_ends, limit
 ):
     """Greptile #4105933163: 2.50.0 ends the run with the library's token limit error on a
-    reasoning-only `.incomplete` (content filter error on an empty one); 2.31.1 gives
-    `.incomplete` no finish reason and asks again, as 2.50.0 does for filtered reasoning. A crash
-    right after that response is saved (run r2) ends the resumed turn as the whole run (r1) did,
-    with the same requests."""
+    reasoning-only `.incomplete` (content filter error on an empty or blank one); 2.31.1 gives
+    `.incomplete` no finish reason and asks again, as 2.50.0 does for filtered reasoning. The
+    library checks the cost limit first: over `max_cost_usd`, each run ends with "budget". A
+    crash right after that response is saved (run r2) ends the resumed turn as the whole run
+    (r1) did, with the same requests."""
     usage = {"input_tokens": 20, "output_tokens": 16, "reason": reason}
-    reasoning = [{"reasoning_item": REASONING}] if reasoned else []
     exchanges = [
-        {"respond": {"stream": [*reasoning, {"incomplete": usage}]}},
+        {"respond": {"stream": [*output, {"incomplete": usage}]}},
         {"respond": {"stream": [{"text": "Hello!"}, COMPLETED]}},
     ]
+    limits = Limits(max_cost_usd=limit)
     with responses_server(tmp_path, *exchanges) as srv:
-        whole = await run(loop, turn([user("hi")], responses_config(srv)), StubTools())
+        cfg = responses_config(srv)
+        whole = await run(loop, turn([user("hi")], cfg, limits=limits), StubTools())
         cfg = responses_config(srv, run="r2")
         history = [user("hi")]
-        stream = loop.run_turn(turn(history, cfg), StubTools(), asyncio.Event())
+        stream = loop.run_turn(turn(history, cfg, limits=limits), StubTools(), asyncio.Event())
         async with contextlib.aclosing(stream):
             async for event in stream:
                 if event.type == "item":
                     history.append(items([event])[0])
                     break  # SIGKILL once the response is saved
         [saved] = history[1:]
-        resumed = await run(loop, turn(history, cfg, resume=Resume("crash")), StubTools())
+        crash = Resume("crash")
+        resumed = await run(loop, turn(history, cfg, resume=crash, limits=limits), StubTools())
 
     # 2.50.0 saves the finish reason and raises on it; 2.31.1 saves none and asks again.
     raised = run_ends is not None and saved.native["finish_reason"] == run_ends
     stop = of(whole, "turn.end")[0]["stop"]
-    assert stop == ("error" if raised else "end_turn")
+    assert stop == ("budget" if limit else "error" if raised else "end_turn")
     assert of(resumed, "turn.end")[0]["stop"] == stop
     assert len(sent(tmp_path, "r2")) == len(sent(tmp_path))
+
+
+@pytest.mark.parametrize("thought", [False, True])
+async def test_a_crash_after_an_unanswered_chat_response_over_the_budget_ends_with_budget(
+    loop, thought
+):
+    """The library checks the cost limit as it adds a response, before it reads it: an empty
+    (or thinking-only) response out of tokens that also crossed `max_cost_usd` ends the run with
+    "budget", not the token limit error. So does a crash resume after it was saved."""
+    thinking = [chunk({"role": "assistant", "reasoning": "Let me think"})] if thought else []
+    limits = Limits(max_cost_usd=0.001)
+    with SSEServer(Reply([*thinking, done("length", completion=16, cost=0.002)])) as srv:
+        first = await run(loop, turn([user("hi")], config(srv), limits=limits), StubTools())
+        history = [user("hi"), *items(first)]  # SIGKILL after the response was saved
+        crash = Resume("crash")
+        resumed = await run(
+            loop, turn(history, config(srv), resume=crash, limits=limits), StubTools()
+        )
+
+    assert of(first, "turn.end") == of(resumed, "turn.end") == [{"stop": "budget", "steps": 1}]
+    assert len(srv.bodies) == 1
 
 
 @pytest.mark.parametrize("finish", ["length", "content_filter"])

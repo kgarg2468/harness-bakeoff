@@ -76,11 +76,13 @@ If you'd do something differently, edit this file in a PR, and A will be changed
       user's request is passed as-is, with no `user_prompt`. A crash resume whose history already
       ends the turn (the final answer, or a cancelled response) sends nothing; a response with
       neither text nor calls is no answer (the library asks again), unless the library raised on
-      it (out of output tokens, or empty and filtered: its saved finish reason says so), and then
-      the resume ends with an error as well, and sends nothing. A complete response with
-      nothing to show (only a Responses reasoning item, which the library replays, or an empty
-      one) still gets an item, with no content: without it the requests on either side would
-      merge on rebuild, and the merge puts the retry prompt before the user's message.*
+      it (out of output tokens, or blank and filtered: its saved finish reason says so), and then
+      the resume ends with an error as well, and sends nothing. Either way it ends with `budget`
+      instead if the turn's cost crossed `max_cost_usd`: the library checks the cost as it adds a
+      response, before it reads it. A complete response with nothing to show (only a Responses
+      reasoning item, which the library replays, or an empty one) still gets an item, with no
+      content: without it the requests on either side would merge on rebuild, and the merge puts the
+      retry prompt before the user's message.*
 - [x] **Cancel**: `CancellationToken`.
       *The token cancels the task that drives the run, so the run gets its own task. Calls a cancel
       leaves open get the same `interrupted` results the library would synthesize, persisted now
