@@ -3,7 +3,7 @@
 A loop's documented failures (`loops.REGISTRY[...].known_failures`) are strict xfails, so the
 matrix records what each loop really does: a fix turns the xfail into a failure (XPASS) until the
 entry is removed. Only the documented failure is an xfail: a cell that fails other checks, or
-with a driver error, fails outright.
+with a driver error its entry does not document, fails outright.
 """
 
 from __future__ import annotations

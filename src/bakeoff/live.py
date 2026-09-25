@@ -54,6 +54,7 @@ ASK_RULES = {"*": "allow", "write_file": "ask", "edit_file": "ask"}
 _OUTPUT = ("text.delta", "reasoning.delta", "tool_call.ready")  # the model's first "token"
 
 Ask = Callable[[str], Awaitable[str]]
+Kind = Literal["openrouter", "openai_compat", "openai_responses"]  # as ModelConfig.kind
 
 
 class LiveError(RuntimeError):
@@ -342,11 +343,14 @@ class LiveModel:
     model: str
     base_url: str = OPENAI_BASE_URL  # may contain "{impl}" (one fakeprov cursor per loop)
     api_key: str = "dummy"
-    kind: Literal["openrouter", "openai_compat"] = "openai_compat"
-    reasoning: str | None = None  # effort; "none" is sent as-is (reasoning_effort=none)
+    kind: Kind = "openai_compat"  # "openai_responses": OpenAI's Responses API
+    reasoning: str | None = None  # effort, sent as-is ("none", ..., "xhigh")
     max_tokens: int = 4096
 
     def config(self, impl: str) -> ModelConfig:
+        reasoning = None if self.reasoning is None else {"effort": self.reasoning}
+        if reasoning and self.kind == "openai_responses" and self.reasoning != "none":
+            reasoning["summary"] = "auto"  # the Responses API streams no summary unless asked
         return ModelConfig(
             base_url=self.base_url.replace("{impl}", impl),
             model=self.model,
@@ -354,7 +358,7 @@ class LiveModel:
             kind=self.kind,
             max_tokens=self.max_tokens,
             temperature=None,  # reasoning models reject a temperature; use the model default
-            reasoning=None if self.reasoning is None else {"effort": self.reasoning},
+            reasoning=reasoning,
             timeout_s=180.0,
         )
 

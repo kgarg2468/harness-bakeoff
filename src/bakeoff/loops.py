@@ -21,10 +21,18 @@ from bakeoff.shared.contract import Loop
 @dataclass(frozen=True, slots=True)
 class KnownFailure:
     """A documented failure of one scenario: the checks that fail (final `expect` keys and
-    invariant names, e.g. {"tool_runs"}), and why."""
+    invariant names, e.g. {"tool_runs"}), and why. If the failure also stops the driver (e.g.
+    an `approve` step that finds no paused turn), `error` is a part of the run's error."""
 
     checks: frozenset[str]
     why: str
+    error: str | None = None
+
+    def matches(self, failing: set[str], error: str | None) -> bool:
+        """Whether a run failed exactly as documented: these checks, and this error or none."""
+        if failing != self.checks:
+            return False
+        return error is None if self.error is None else error is not None and self.error in error
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +46,22 @@ class LoopEntry:
     known_failures: Mapping[str, KnownFailure] = field(default_factory=dict)
 
 
+def _no_responses_api(**checks: frozenset[str]) -> dict[str, KnownFailure]:
+    """R01-R05 script OpenAI's Responses API, which the loops do not speak yet. Each loop's
+    entry names the checks that fail for it; R03's approve step then finds no paused turn."""
+    return {
+        sid: KnownFailure(
+            failed,
+            "Responses API not implemented yet",
+            "has no paused turn" if sid == "R03" else None,
+        )
+        for sid, failed in checks.items()
+    }
+
+
+_NOT_ANSWERED = frozenset({"stops", "text_contains"})
+_NO_TOOLS = _NOT_ANSWERED | {"requests", "tool_runs"}
+
 REGISTRY: dict[str, LoopEntry] = {
     entry.name: entry
     for entry in (
@@ -45,11 +69,27 @@ REGISTRY: dict[str, LoopEntry] = {
             "our",
             "bakeoff.our_version:OurLoop",
             ("httpx",),
+            # It has no compat defaults for the kind, so it fails before sending a request.
+            _no_responses_api(
+                R01=_NOT_ANSWERED | {"requests", "usage"},
+                R02=_NO_TOOLS | {"usage"},
+                R03=_NO_TOOLS | {"files"},
+                R04=_NOT_ANSWERED | {"requests"},
+                R05=_NOT_ANSWERED | {"requests"},
+            ),
         ),
         LoopEntry(
             "pydantic",
             "bakeoff.pydantic_version:PydanticLoop",
             ("pydantic-ai-slim", "openai", "httpx"),
+            # It sends chat completions, which a Responses scenario answers with 404.
+            _no_responses_api(
+                R01=_NOT_ANSWERED | {"usage"},
+                R02=_NO_TOOLS | {"usage"},
+                R03=_NO_TOOLS | {"files"},
+                R04=_NOT_ANSWERED | {"requests"},
+                R05=_NOT_ANSWERED,
+            ),
         ),
         LoopEntry(
             "hybrid", "bakeoff.hybrid_version:HybridLoop", ("pydantic-ai-slim", "openai", "httpx")

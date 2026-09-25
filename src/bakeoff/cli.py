@@ -81,9 +81,19 @@ def _model_args(parser: argparse.ArgumentParser, *, impl_default: str | None) ->
     parser.add_argument(
         "--base-url",
         default=live.OPENAI_BASE_URL,
-        help="chat completions endpoint; {impl} is replaced by the loop name",
+        help="the API's base URL (default: OpenAI's); {impl} is replaced by the loop name",
     )
-    parser.add_argument("--kind", choices=["openai_compat", "openrouter"], default="openai_compat")
+    parser.add_argument(
+        "--api",
+        choices=["chat", "responses"],
+        default="chat",
+        help="chat completions, or OpenAI's Responses API (endpoint kind openai_responses)",
+    )
+    parser.add_argument(
+        "--kind",
+        choices=["openai_compat", "openrouter"],
+        help="the chat completions endpoint's kind (default: openai_compat)",
+    )
     parser.add_argument("--out", type=Path, default=Path("out"))
     parser.add_argument("--run-id", help="default: a new timestamped id")
 
@@ -218,13 +228,26 @@ def _scenario(args: argparse.Namespace) -> int:
     return 1 if scenario.unexpected(summary) else 0
 
 
+def _kind(args: argparse.Namespace) -> live.Kind:
+    """The endpoint kind: `--api responses` is OpenAI's Responses API; `--kind` picks among the
+    chat completions kinds, so it does not go with `--api responses`."""
+    if args.api == "chat":
+        return args.kind or "openai_compat"
+    if args.kind is not None:
+        raise ValueError(
+            f"--kind {args.kind} is a chat completions kind; drop it for --api responses"
+        )
+    return "openai_responses"
+
+
 def _live_model(args: argparse.Namespace) -> live.LiveModel:
+    kind = _kind(args)
     live.guard_network(args.base_url)  # before anything can connect
     return live.LiveModel(
         model=args.model,
         base_url=args.base_url,
         api_key=live.resolve_api_key(args.base_url, args.env_file, key_hosts=args.key_host),
-        kind=args.kind,
+        kind=kind,
         reasoning=args.reasoning,
         max_tokens=args.max_tokens,
     )

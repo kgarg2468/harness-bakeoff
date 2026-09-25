@@ -1,0 +1,110 @@
+{
+  "id": "R04",
+  "title": "Responses API: 429 with retry-after: 1, then OK; next turn: an error event mid-stream, then OK",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {
+    "kind": "openai_responses",
+    "model": "gpt-6-luna",
+    "reasoning": {"effort": "xhigh", "summary": "auto"},
+    "temperature": null
+  },
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "strict": {
+    "reject_params": ["temperature", "max_tokens", "max_completion_tokens", "reasoning_effort"],
+    "reject_unencrypted_reasoning": true
+  },
+  "driver": [{"user": "Say hi."}, {"user": "Say hi again."}],
+  "exchanges": [
+    {
+      "note": "OpenAI's rate limit. The retry must wait at least 1 s.",
+      "expect": {"input_len": 1, "last_role": "user"},
+      "respond": {
+        "status": 429,
+        "headers": {"retry-after": "1"},
+        "body": {
+          "error": {
+            "message": "Rate limit reached for gpt-6-luna on tokens per min (TPM): Limit 30000, Used 29960, Requested 1812. Please try again in 1s.",
+            "type": "tokens",
+            "param": null,
+            "code": "rate_limit_exceeded"
+          }
+        }
+      }
+    },
+    {
+      "note": "The same request again.",
+      "expect": {"input_len": 1, "last_role": "user", "min_gap_ms": 900},
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R04_1",
+              "encrypted_content": "gAAAAABp2p8cjxfetVL6txjm7B009muA0_UamZVcdTMaKjkhSoTFRXxdaMCS77RkYnb6lXu-g0tuiZ2l8wG8a8n1j5KtcuSlz2p_CyKVeMtr0CFHE0ZeR431bELVCRiZCPco1Hxc"
+            }
+          },
+          {"text": "Hi!", "phase": "final_answer"},
+          {"completed": {"input_tokens": 1812, "output_tokens": 30, "reasoning_tokens": 24}}
+        ]
+      }
+    },
+    {
+      "note": "HTTP 200, a complete reasoning item, some text, then an error event and the stream ends. No tool ran, so retry.",
+      "expect": {"input_len": 4, "last_role": "user", "reasoning_replayed": ["rs_R04_1"]},
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R04_2",
+              "encrypted_content": "gAAAAABpTU2cVHwdQnY4AQ083qzhFidQdxLXdtDm0XLSjTwADtZNGBL9UoR7RHjPmTq6aCAF-Mehaq_4tBIdQGKG81T-kw2SreJWU0fK0NVSJIFrWhv7bQ5NdrtH0OlrKAbwaGRc",
+              "summary": ["**Greeting again**\n\nAnother short hello."]
+            }
+          },
+          {"text": "Hi ag", "phase": "final_answer", "done": false},
+          {
+            "error": {
+              "code": "server_error",
+              "message": "The server had an error while processing your request. Sorry about that!"
+            },
+            "delay_ms": 20
+          }
+        ]
+      }
+    },
+    {
+      "note": "The same request again: nothing of the failed attempt (its reasoning, its partial text) is kept.",
+      "expect": {
+        "input_len": 4,
+        "last_role": "user",
+        "last_content_contains": "again",
+        "reasoning_replayed": ["rs_R04_1"]
+      },
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R04_3",
+              "encrypted_content": "gAAAAABpNjkw45MXoBYOmS_P2v7IO2Rtpx8HecOb1QEMtVzOgtJGxOOtoNXFGtHUZiTd9v_QmfzjqtcuC4jWYMiQu6SrXaQ8L15g28R3zQdLBPEVLYNjiRG4PeF-0akGxCFq6_lZ"
+            }
+          },
+          {"text": "Hi again!", "chunks": 2, "phase": "final_answer"},
+          {
+            "completed": {
+              "input_tokens": 1900,
+              "output_tokens": 30,
+              "cached_tokens": 1792,
+              "reasoning_tokens": 22
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn", "end_turn"],
+    "requests": 4,
+    "commits": 2,
+    "text_contains": "Hi again!"
+  }
+}

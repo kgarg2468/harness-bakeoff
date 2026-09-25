@@ -1,8 +1,9 @@
 # fakeprov: scripted OpenRouter-compatible model server
 
-A stdlib `ThreadingHTTPServer` on `127.0.0.1` that answers streaming chat completions from
-scenario scripts, so every loop sees exactly the same model behaviour and every request it
-sends is recorded. Scenario pass/fail is judged from those recordings and the session log.
+A stdlib `ThreadingHTTPServer` on `127.0.0.1` that answers streaming chat completions (and
+OpenAI's Responses API, see [Responses API mode](#responses-api-mode)) from scenario scripts, so
+every loop sees exactly the same model behaviour and every request it sends is recorded.
+Scenario pass/fail is judged from those recordings and the session log.
 
 ```python
 from bakeoff.fakeprov.server import FakeProvider
@@ -22,6 +23,10 @@ uv run python -m bakeoff.fakeprov --port 8787  # serve until Ctrl-C
 - `POST <base>/chat/completions`: streaming only (`"stream": true`, else 400). HTTP/1.1
   keep-alive; the SSE body uses `Transfer-Encoding: chunked`, one SSE event per HTTP chunk,
   ending with `data: [DONE]`. Requests without `Content-Length` get 411.
+- `POST <base>/responses`: the same, for scenarios scripted for the Responses API. A scenario
+  answers only on its own API's endpoint: a request to the other one gets 404 `scenario R01 is
+  scripted for POST <base_url>/responses, not /chat/completions` (recorded, and it uses its
+  exchange like any rejection).
 - `GET <base>/models`: `{"object": "list", "data": [{"id": <scenario model>, ...}]}`.
 - **Cursors.** Each `(scenario, run, impl)` has its own cursor. Request *n* on a cursor is
   answered by exchange *n*, whatever happens to it (strict rejection, failed expect, 429, ...).
@@ -35,7 +40,7 @@ uv run python -m bakeoff.fakeprov --port 8787  # serve until Ctrl-C
 
 ## Wire recording
 
-Every chat request is recorded under `<wire_dir>/<scenario>/<run>/<impl>/`:
+Every model request (either endpoint) is recorded under `<wire_dir>/<scenario>/<run>/<impl>/`:
 
 - `NNN.json`: the raw request body bytes, verbatim (`NNN` = 001, 002, ... per cursor).
 - `NNN.meta.json`: `{"conn_id", "path", "t_us", "status"}`, plus `"error"` when the fake
@@ -59,11 +64,11 @@ a file (JSON schema plus cross-checks) and raises `ScenarioError` naming the exa
 |---|---|
 | `id`, `title` | `S01` ...; one-line description |
 | `system` | the thread's frozen system prompt |
-| `model` | `{"kind": "openrouter" \| "openai_compat", "model", "reasoning"?, "compat"?}` → `ModelConfig` |
+| `model` | `{"kind": "openrouter" \| "openai_compat" \| "openai_responses", "model", "reasoning"?, "temperature"?, "compat"?}` → `ModelConfig` (passed through unchanged; `temperature: null` sends none, absent keeps `ModelConfig`'s default). `openai_responses` scripts the [Responses API](#responses-api-mode) |
 | `rules` | permission rules, e.g. `{"*": "allow", "write_file": "ask"}` |
 | `limits` | `{"max_steps"}` → `Limits` |
 | `engine` | `{"delay_ms"}` → `MockEngine(delay_ms=...)` |
-| `style` | optional wire style of every exchange: `"openrouter"`, or `"openai"` (BYOK endpoints). Default: `"openai"` for `openai_compat`, else `"openrouter"` |
+| `style` | optional wire style of every exchange: `"openrouter"`, or `"openai"` (BYOK endpoints). Default: `"openai"` for `openai_compat`, else `"openrouter"`. Not in Responses scenarios (their style is `"responses"`) |
 | `strict` | optional strict modes for every exchange (see below) |
 | `driver` | the steps the scenario runner performs, in order |
 | `exchanges` | the scripted model responses, in request order |
@@ -111,10 +116,12 @@ Only `respond` is required. Before answering, the server applies, in order:
    `last_content_contains` (substring; list content is joined text parts), `messages_len`,
    `tool_result_contains: {call_id: substring}` (a `role: tool` message for that call contains
    it; `""` only checks that the result exists), `body_equals: {"dotted.path": value}` (exact
-   value at a path in the body), `messages_at: [{index, role?, contains?}]`
-   (checks one message; a negative index counts from the end), and `min_gap_ms` (the request
-   must arrive at least this long after the cursor's previous one, e.g. a retry that honours
-   `retry-after`).
+   value at a path in the body; an integer segment indexes a list, e.g. `"tools.0.name"`),
+   `body_contains: {"dotted.path": value}` (the value at that path is a list that contains
+   it), `messages_at: [{index, role?, contains?}]` (checks one message; a negative index
+   counts from the end), and `min_gap_ms` (the request must arrive at least this long after
+   the cursor's previous one, e.g. a retry that honours `retry-after`). Responses scenarios
+   check `input` instead of `messages` (see below).
 
 `respond.status` other than 200 sends a JSON error with `headers` (e.g. `{"retry-after": "1"}`)
 and `body`, which defaults to OpenRouter's `{"error": {"code", "message", "metadata"}}` (or
@@ -160,6 +167,142 @@ Tool call ids are `call_<scenario>_<n>`, unique per scenario; the loader rejects
 to ids that no exchange scripts. Content checks on tool results stay loose (substrings),
 because results come from the shared tools and `MockEngine`.
 
+## Responses API mode
+
+A scenario whose model kind is `openai_responses` is scripted for OpenAI's Responses API
+(API reference: "Streaming events"; `store: false` statelessness, as a harness that keeps its
+own history uses it). Requests go to `POST <base>/responses` and are recorded verbatim, like
+chat requests. The body must be a JSON object with `stream: true` and `input`: a non-empty list
+of item objects, or a string (one user message, as the API reads it); else 400.
+
+Each input item must have the shape the API requires of its type, else 400 in the API's error
+shape, `param` naming the field (e.g. `Missing required parameter: 'input[3].output'.`, code
+`missing_required_parameter`; or `invalid_type`, `invalid_value`), whatever the script says:
+
+- `message` (`type` may be left out): `role` (`user`, `assistant`, `system`, `developer`) and
+  `content`, a string or parts (`input_text`, `input_image`, `input_file`; for `assistant`,
+  `output_text` or `refusal`); a text part has a string `text`;
+- `function_call`: strings `call_id`, `name` and `arguments`;
+- `function_call_output`: a string `call_id` and `output`, a string or input parts;
+- `reasoning`: a string `id`, a `summary` list of `summary_text` parts, and `encrypted_content`
+  a string or null if present.
+
+Other item types get 400 as well: the fake serves only these four.
+
+**Stream.** Named SSE events, one per HTTP chunk:
+`event: <type>\ndata: {"type": <type>, "sequence_number": n, ...}\n\n`, numbered from 0. There
+is no `data: [DONE]`: the stream ends after its last event. It always starts with
+`response.created` and `response.in_progress`. Their response object (and that of
+`response.completed` / `.incomplete` / `.failed`) does not echo the request, so every loop gets the
+same bytes: `{"id": "resp_<scenario>_<NNN>", "object": "response", "created_at": 1758758400,
+"status", "completed_at", "error", "incomplete_details": null, "instructions": null,
+"max_output_tokens": null, "model": <scenario model>, "output", "parallel_tool_calls": true,
+"previous_response_id": null, "reasoning": {"effort": <scenario effort>, "summary": null},
+"store": false, "temperature": 1, "text": {"format": {"type": "text"}}, "tool_choice": "auto",
+"tools": [], "top_p": 1, "truncation": "disabled", "usage", "user": null, "metadata": {}}`.
+Delta events (`response.output_text.delta`, `response.function_call_arguments.delta`,
+`response.reasoning_summary_text.delta`) carry an `obfuscation` pad, as the API does by
+default (deterministic here), unless the request sets `stream_options.include_obfuscation:
+false`. `output_index` counts the response's items from 0.
+
+| Op | Sends |
+|---|---|
+| `{"reasoning_item": {"id", "encrypted_content", "summary"?: [str]}, "chunks"?: n, "done"?: bool}` | `response.output_item.added` with `{"id", "type": "reasoning", "summary": [], "encrypted_content": <its first half>}` (the API documents that the added item's `encrypted_content` may be incomplete: replay only the done item); if the request asks for a summary (`reasoning.summary`, as the API streams none otherwise), per summary part `response.reasoning_summary_part.added` (`summary_index`, `part: {"type": "summary_text", "text": ""}`), the text in n `response.reasoning_summary_text.delta`, `response.reasoning_summary_text.done` (`text`), `response.reasoning_summary_part.done`; then `response.output_item.done` with `{"id", "type": "reasoning", "summary": [{"type": "summary_text", "text"}, ...] (`[]` unless asked for), "encrypted_content"}`. Reasoning ids are unique per scenario |
+| `{"text": str, "chunks"?: n, "phase"?: "commentary" \| "final_answer", "done"?: bool}` | an assistant message: `response.output_item.added` (`{"id": "msg_<scenario>_<NNN>_<output_index>", "type": "message", "status": "in_progress", "content": [], "role": "assistant", "phase"?}`), `response.content_part.added` (`part: {"type": "output_text", "annotations": [], "logprobs": [], "text": ""}`), n `response.output_text.delta` (`delta`, `logprobs: []`), `response.output_text.done`, `response.content_part.done`, `response.output_item.done` (status `completed`, the full `content`). The API asks to resend `phase` on assistant messages |
+| `{"tool_calls": [{"id", "name", "arguments": str \| object}], "pieces"?: n}` | per call, one after the other: `response.output_item.added` (`{"id": "fc_<id without call_>", "type": "function_call", "status": "in_progress", "arguments": "", "call_id": <id>, "name"}`), the arguments in n `response.function_call_arguments.delta`, `response.function_call_arguments.done` (`name`, `arguments`), `response.output_item.done` (status `completed`, full `arguments`) |
+| `{"completed": {"input_tokens", "output_tokens", "cached_tokens"?, "cache_write_tokens"?, "reasoning_tokens"?}}` | `response.completed`: status `completed`, `output` = every done item, `usage: {"input_tokens", "input_tokens_details": {"cached_tokens", "cache_write_tokens"}, "output_tokens", "output_tokens_details": {"reasoning_tokens"}, "total_tokens"}` |
+| `{"incomplete": {"input_tokens", "output_tokens", ...as completed, "reason"?: "max_output_tokens" \| "content_filter"}}` | `response.incomplete`, as the API ends a response that ran out of `max_output_tokens` (say, while it reasoned): status `incomplete`, `incomplete_details: {"reason"}` (default `max_output_tokens`), `output` = the items done so far, `usage` as in `completed` |
+| `{"error": {"code"?: "server_error", "message"}}` | the `error` event after HTTP 200: `{"type": "error", "sequence_number", "code", "message", "param": null}`; the stream ends |
+| `{"failed": {"code"?: "server_error", "message"}}` | `response.failed`: status `failed`, `error: {"code", "message"}`, `output` = the items done so far |
+| `{"stall": true}` | as in chat: nothing more, the socket stays open until the client leaves |
+
+Every stream ends with exactly one of `completed`, `incomplete`, `error`, `failed` or `stall`,
+as its last op. `"done": false` (on `text` or `reasoning_item`) cuts the stream before that
+item is done: its added and delta events go out, none of its done events (a reasoning item is
+cut inside its last summary part), and the next op must be `incomplete`, `error`, `failed` or
+`stall`. `delay_ms` works as in chat. `status` other than 200 sends OpenAI's error shape (or
+the script's `body`), e.g. a 429 with `retry-after`.
+
+**Strict modes** (`strict`, as in chat): `reject_params: [keys]` answers 400 `Unsupported
+parameter: '<key>'.` (`param` = key, `code: "unsupported_parameter"`).
+`reject_unencrypted_reasoning: true` answers as the API does with `store: false`, where a
+reasoning item exists only as its encrypted content: an input reasoning item without
+`encrypted_content` gets 404 `Item with id '<id>' not found. Items are not persisted when
+`store` is set to false. Try again with `store` set to true, or remove this item from your
+input.`; one whose `encrypted_content` is not the one its done event sent (the added item's
+incomplete one, any for an item that was cut short, or any for an item that no earlier response
+of the cursor sent) gets 400 `The encrypted content for item <id> could not be verified.`
+(`code: "invalid_encrypted_content"`).
+
+**Exchange `expect`.** `body_has`, `body_lacks`, `model`, `body_equals`, `body_contains` and
+`min_gap_ms` read the body as in chat. The others read `input` without the system prompt
+(`instructions`, or the system/developer messages `input` starts with), so they hold wherever a
+loop puts it. An item without a `type` but with a `role` is a `message`.
+
+| Key | Passes when |
+|---|---|
+| `system_contains` | the system prompt (`instructions` plus those leading messages) contains it |
+| `input_len` | the number of input items after the system prompt |
+| `last_type` | the last item's type: `message`, `function_call`, `function_call_output` or `reasoning` |
+| `last_role` | the last item's `role` (`user`, `assistant`) |
+| `last_content_contains` | the last item's text contains it: a message's text (a string or text parts), a `function_call_output`'s `output`, a `function_call`'s `arguments`, a reasoning summary |
+| `input_at` | `[{index, type?, role?, phase?, contains?}]`: checks one item; a negative index counts from the end |
+| `tool_result_contains` | `{call_id: substring}`: a `function_call_output` with that `call_id` contains it (`""`: it exists) |
+| `reasoning_replayed` | `[reasoning id]`: `input` has that reasoning item exactly once, equal to its done item (same keys and values; `encrypted_content` byte for byte; with a summary if this request asks for one, since a thread's requests all do or all don't). The loader checks that an earlier exchange sends it |
+
+A sample (R02's first answer, shortened: one summary part, arguments in 2 pieces; the
+`response.created` and `response.in_progress` data are elided):
+
+```
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_R02_001",...,"status":"in_progress",...,"output":[],...,"usage":null,...}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{...}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"rs_R02_1","type":"reasoning","summary":[],"encrypted_content":"gAAAAABpWe"}}
+
+event: response.reasoning_summary_part.added
+data: {"type":"response.reasoning_summary_part.added","sequence_number":3,"item_id":"rs_R02_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","sequence_number":4,"item_id":"rs_R02_1","output_index":0,"summary_index":0,"delta":"**Plan**\n\nLook it up.","obfuscation":"sTDlM7na"}
+
+event: response.reasoning_summary_text.done
+data: {"type":"response.reasoning_summary_text.done","sequence_number":5,"item_id":"rs_R02_1","output_index":0,"summary_index":0,"text":"**Plan**\n\nLook it up."}
+
+event: response.reasoning_summary_part.done
+data: {"type":"response.reasoning_summary_part.done","sequence_number":6,"item_id":"rs_R02_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"**Plan**\n\nLook it up."}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":7,"output_index":0,"item":{"id":"rs_R02_1","type":"reasoning","summary":[{"type":"summary_text","text":"**Plan**\n\nLook it up."}],"encrypted_content":"gAAAAABpWeVd...R02_1"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":8,"output_index":1,"item":{"id":"fc_R02_1","type":"function_call","status":"in_progress","arguments":"","call_id":"call_R02_1","name":"describe_component"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":9,"item_id":"fc_R02_1","output_index":1,"delta":"{\"name\": \"","obfuscation":"wKHeiD52LQrfPdd"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":10,"item_id":"fc_R02_1","output_index":1,"delta":"tool_pipe\"}","obfuscation":"tBkpy0cUX4Ki"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","sequence_number":11,"item_id":"fc_R02_1","output_index":1,"name":"describe_component","arguments":"{\"name\": \"tool_pipe\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":12,"output_index":1,"item":{"id":"fc_R02_1","type":"function_call","status":"completed","arguments":"{\"name\": \"tool_pipe\"}","call_id":"call_R02_1","name":"describe_component"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":13,"response":{"id":"resp_R02_001",...,"status":"completed","completed_at":1758758401,...,"output":[<the two done items>],...,"usage":{"input_tokens":2100,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":180,"output_tokens_details":{"reasoning_tokens":150},"total_tokens":2280},...}}
+```
+
+The next request replays the done reasoning item verbatim, the function call and its output:
+`input: [{"role": "user", ...}, {"id": "rs_R02_1", "type": "reasoning", "summary": [...],
+"encrypted_content": "..."}, {"type": "function_call", "call_id": "call_R02_1", "name":
+"describe_component", "arguments": "{\"name\": \"tool_pipe\"}", ...}, {"type":
+"function_call_output", "call_id": "call_R02_1", "output": "..."}]`.
+
 ## The scenarios
 
 | ID | Exercises |
@@ -181,3 +324,12 @@ because results come from the shared tools and `MockEngine`.
 | S13 | BYOK thinking: `openai_compat`, `qwen3-32b`, `reasoning_effort` on the wire, `reasoning_content` back |
 | S14 | BYOK strict endpoint: 400 on `reasoning`, `reasoning_effort` or `stream_options` |
 | S15 | compaction: after the summary a request is `[system, summary, new user]`, then append-only |
+| R01 | Responses API, `gpt-6-luna` at effort `xhigh`: the request shape (`store: false`, `include` has `reasoning.encrypted_content`, Responses-style tools, no `temperature`/`max_tokens`/`reasoning_effort`); reasoning with a summary, then the answer |
+| R02 | reasoning (two summary parts), one `describe_component` call, its output, then the answer; the reasoning item is replayed exactly as its done event sent it |
+| R03 | reasoning, a `commentary` message and three calls in one response (`validate_pipeline` and `describe_component` allowed, `write_file` asks); approve in a new process; the resumed request replays everything, `phase` included |
+| R04 | 429 with `retry-after: 1`, then OK; next turn: a complete reasoning item, cut text and an `error` event mid-stream, then the same request again, keeping nothing of the failed attempt |
+| R05 | cancel while a reasoning item streams (cut before its done event); strict `reject_unencrypted_reasoning`: the next turn must not replay the cut item |
+
+Every R scenario uses model kind `openai_responses`, `gpt-6-luna`, `reasoning: {"effort":
+"xhigh"}`, `temperature: null`, and strict `reject_params` (`temperature`, `max_tokens`,
+`max_completion_tokens`, `reasoning_effort`) plus `reject_unencrypted_reasoning`.

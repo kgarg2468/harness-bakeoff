@@ -1,0 +1,73 @@
+{
+  "id": "R05",
+  "title": "Responses API: cancel while reasoning streams; the next turn must not replay the cut reasoning item",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {
+    "kind": "openai_responses",
+    "model": "gpt-6-luna",
+    "reasoning": {"effort": "xhigh", "summary": "auto"},
+    "temperature": null
+  },
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "strict": {
+    "reject_params": ["temperature", "max_tokens", "max_completion_tokens", "reasoning_effort"],
+    "reject_unencrypted_reasoning": true
+  },
+  "driver": [
+    {"user": "Describe the tool_pipe component.", "cancel_after_ms": 300},
+    {"user": "Answer from memory: which lanes does tool_pipe output?"}
+  ],
+  "exchanges": [
+    {
+      "note": "A reasoning item starts (its added event has only part of its encrypted_content), its summary streams, then the stream stalls before the item is done. The client cancels at 300 ms.",
+      "expect": {"input_len": 1, "last_role": "user"},
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R05_1",
+              "encrypted_content": "gAAAAABpoaa66rD7o36W8h3Qf8ucodW8sMUjA6GX5kLxscG6TUwJrFfj_Yp7ZMYezmXMrr-YjaF2PAz1PcVGKF50trcDiWx79c20dwaJ26Q_TKyUooYrunoPbTgTgETreKy5LTaJ",
+              "summary": ["**Recalling tool_pipe**\n\nThe user wants the tool_pipe definition; its lanes are"]
+            },
+            "chunks": 2,
+            "done": false
+          },
+          {"stall": true}
+        ]
+      }
+    },
+    {
+      "note": "Strict: a replay of the cut reasoning item, without its encrypted_content (404) or with the incomplete one (400), is rejected as the API does with store false.",
+      "expect": {
+        "last_type": "message",
+        "last_role": "user",
+        "last_content_contains": "Answer from memory"
+      },
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R05_2",
+              "encrypted_content": "gAAAAABpwZo8FQn0Mrdt2JiTpvu4Q9vWAvIqrRMQwo02eFln65MTL77EeCgx-zGM6odiq_guAU7b98qQ0epc_XxOY0JPmVlzLvAk5PlDampvktU_2LdYQnPUqN6Kq88GBQofxfiL"
+            }
+          },
+          {
+            "text": "tool_pipe outputs text, questions, documents, table and answers.",
+            "chunks": 3,
+            "phase": "final_answer"
+          },
+          {"completed": {"input_tokens": 1900, "output_tokens": 40, "reasoning_tokens": 16}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["cancelled", "end_turn"],
+    "requests": 2,
+    "commits": 2,
+    "text_contains": "tool_pipe outputs",
+    "cancel_within_ms": 200
+  }
+}

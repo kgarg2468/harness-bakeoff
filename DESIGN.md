@@ -35,7 +35,7 @@ src/bakeoff/
   our_version/         loop B   (counted)
   pydantic_version/    loop A   (counted)
   hybrid_version/      loop A'  (our loop + pydantic_ai.direct model layer; counted; phase 3)
-  fakeprov/            scripted OpenAI/OpenRouter-compatible SSE server + scenario scripts
+  fakeprov/            scripted OpenAI/OpenRouter-compatible SSE server (chat + Responses API) + scenarios
   metrics/             loc, deps, bench -> out/metrics.json
   report/              builds out/report.html (side-by-side replay, wire diff, scorecard)
   loops.py             registry of the loops (lazy imports; each loop's documented failures)
@@ -78,6 +78,12 @@ timed identically for every loop.
   `tool_calls[].function.arguments` is the raw streamed string. `reasoning_details` is kept
   verbatim (never rebuilt).
 - tool result: `{"role": "tool", "tool_call_id": "...", "content": "..."}`. One item per call.
+
+With `ModelConfig.kind == "openai_responses"` a loop speaks OpenAI's Responses API
+(`<base_url>/responses`: `input` items, named SSE events). Its items keep this chat-shaped
+`Item.message` all the same (the log, the UI and the invariants read it), and the loop keeps the
+exact Responses items it must replay in `Item.native`: with `store: false` the harness owns the
+history, so reasoning items go back verbatim with their `encrypted_content`.
 
 `Item.native` is loop-private. `pydantic_version` stores pydantic-ai's native `ModelMessage` JSON
 there (each item gets the native of exactly what it shows) and rebuilds its history from it.
@@ -183,6 +189,22 @@ Strict modes emulate real providers: `reject_params: [...]` returns 400 if the b
 listed top-level key. `reject_unsigned_reasoning` returns 400 if any assistant message
 replays a `reasoning.text` detail without a signature, as Anthropic does.
 
+A scenario with model kind `openai_responses` speaks OpenAI's Responses API instead, on
+`<base_url>/responses` only (the other endpoint gets 404): named SSE events
+(`response.created`, `response.output_item.added`/`.done`, `response.output_text.delta`,
+`response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`,
+`response.completed` with `usage`, the `error` event, ...), no `[DONE]`. Its primitives are
+reasoning items (`encrypted_content`, summary deltas if the request asks for them; the added
+item's `encrypted_content` is incomplete, as the API documents), messages (with `phase`),
+function calls, `completed` (usage), `incomplete` (usage; out of `max_output_tokens`), `error`
+and `failed` mid-stream, `stall`, and items cut short before their done events. Its strict mode
+`reject_unencrypted_reasoning` answers as the API does with `store: false`: a replayed reasoning
+item without its `encrypted_content` is 404, one whose `encrypted_content` is not what an earlier
+response's done event sent is 400. An input item of the wrong shape (say, a `function_call_output`
+without `output`) is 400 in the API's error shape. Its `expect` checks read `input` (e.g.
+`input_len`, `last_type`, `tool_result_contains` by `call_id`, `reasoning_replayed`: the item
+exactly as sent). Details: `fakeprov/README.md`.
+
 ## Scenarios
 
 Each scenario is a JSON file: a `driver` (user turns, approvals, cancel-after-ms, crash-after-event,
@@ -208,6 +230,11 @@ recordings and the session log, never from what a loop says about itself.
 | S13 | BYOK thinking: `openai_compat` endpoint, non-OpenAI model name, reasoning requested | the reasoning parameter reaches the wire |
 | S14 | BYOK strict endpoint: 400 if body has `reasoning`, `reasoning_effort` or `stream_options` (configured via compat flags) | the turn finishes |
 | S15 | compaction hand-off: runner appends a summary item; loop sends [system, summary, new user] | prefix resets only at the compaction boundary |
+| R01 | Responses API (`gpt-6-luna`, effort `xhigh`, summary `auto`): text only | `store: false`, `include` has `reasoning.encrypted_content`, `reasoning.summary` sent, Responses tools; exact text; usage from `response.completed` |
+| R02 | reasoning + one function call + its `function_call_output`, then the answer | the reasoning item replayed exactly as sent; tool ran once |
+| R03 | commentary + 3 function calls in one response; `write_file` asks; approve in a new process | as S05; the resumed request replays reasoning, commentary (`phase`) and all calls |
+| R04 | 429 with `retry-after: 1`, then OK; next turn an `error` event mid-stream, then OK | waited per Retry-After; nothing of the failed attempt is replayed |
+| R05 | cancel while reasoning streams | stops within 200 ms; next turn passes `reject_unencrypted_reasoning` |
 
 The driver (`shared/scenario.py`) runs the steps with the real runner, session log, working copy
 and ToolHost on MockEngine. `approve` with `new_process` and the user turn after `crash_after` run
@@ -230,8 +257,9 @@ that fails any other way is a plain failure.
 
 ## Invariants (checked on every scenario)
 
-- **I1 append-only**: each request's `messages` are a prefix of the next request's (semantic
-  equality; byte equality reported separately). Resets only at a compaction item.
+- **I1 append-only**: each request's `messages` (Responses API: `instructions`, then the `input`
+  items) are a prefix of the next request's (semantic equality; byte equality reported
+  separately). Resets only at a compaction item.
 - **I2** every tool call gets exactly one result; no call id runs twice (`tool.start` count);
   every run ends before its turn's `turn.end` (no orphan tools); and every result comes from a
   run, unless the user denied the call or its turn stopped early (cancelled, max_steps, budget,

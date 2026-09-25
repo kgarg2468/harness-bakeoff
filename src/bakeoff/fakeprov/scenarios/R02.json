@@ -1,0 +1,108 @@
+{
+  "id": "R02",
+  "title": "Responses API: reasoning, one function call and its output, then the answer; the reasoning item is replayed exactly as sent",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {
+    "kind": "openai_responses",
+    "model": "gpt-6-luna",
+    "reasoning": {"effort": "xhigh", "summary": "auto"},
+    "temperature": null
+  },
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "strict": {
+    "reject_params": ["temperature", "max_tokens", "max_completion_tokens", "reasoning_effort"],
+    "reject_unencrypted_reasoning": true
+  },
+  "driver": [{"user": "Which lanes does the tool_pipe component output? Look it up."}],
+  "exchanges": [
+    {
+      "note": "Reasoning with a two-part summary (the added item's encrypted_content is incomplete), then a function call with its arguments in 3 deltas.",
+      "expect": {
+        "body_equals": {"store": false, "reasoning.effort": "xhigh"},
+        "body_contains": {"include": "reasoning.encrypted_content"},
+        "input_len": 1,
+        "last_role": "user"
+      },
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R02_1",
+              "encrypted_content": "gAAAAABpWeVdj2UiM5lBZJPvN37nTeIAIWX9Rh_EaNIPmVnh4-dKQUOpHVw3_eyWFPcCpAUWKW_espbE-pFPSGrXBmERwikHPT0A-os1ccm1TOarW0dDcaUD022U69g0H2SLx-5l",
+              "summary": [
+                "**Looking up the component**\n\nThe user asks about tool_pipe; describe_component lists its lanes.",
+                "**Plan**\n\nCall describe_component, then answer from its output."
+              ]
+            },
+            "chunks": 3
+          },
+          {
+            "tool_calls": [
+              {
+                "id": "call_R02_1",
+                "name": "describe_component",
+                "arguments": {"name": "tool_pipe"}
+              }
+            ],
+            "pieces": 3
+          },
+          {
+            "completed": {
+              "input_tokens": 2100,
+              "output_tokens": 180,
+              "cached_tokens": 0,
+              "reasoning_tokens": 150
+            }
+          }
+        ]
+      }
+    },
+    {
+      "note": "The reasoning item exactly as its done event sent it, the function call, its output.",
+      "expect": {
+        "body_equals": {"store": false},
+        "input_len": 4,
+        "input_at": [
+          {"index": 1, "type": "reasoning"},
+          {"index": 2, "type": "function_call", "contains": "tool_pipe"}
+        ],
+        "last_type": "function_call_output",
+        "tool_result_contains": {"call_R02_1": "tool_pipe"},
+        "reasoning_replayed": ["rs_R02_1"]
+      },
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R02_2",
+              "encrypted_content": "gAAAAABpzdpDKVQk-Ygv_CPh7OUxtu3wtsm9U7J1PtOOZwFS-qk6aCZlL849dQGET_ezWZvsGcPmAn5qjb9Au7S-L4Vf_Q4bi-qftwSv5tlGtLYwhyOAL1X2mhYfWRGpzyfPDMvG"
+            }
+          },
+          {
+            "text": "tool_pipe outputs text, questions, documents, table and answers.",
+            "chunks": 3,
+            "phase": "final_answer"
+          },
+          {
+            "completed": {
+              "input_tokens": 2600,
+              "output_tokens": 60,
+              "cached_tokens": 2048,
+              "reasoning_tokens": 20
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn"],
+    "requests": 2,
+    "commits": 1,
+    "tool_runs": {"call_R02_1": 1},
+    "text_contains": "tool_pipe outputs",
+    "usage": {"input_tokens": 4700, "output_tokens": 240, "cached_tokens": 2048}
+  }
+}
