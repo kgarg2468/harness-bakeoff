@@ -1,0 +1,72 @@
+{
+  "id": "S10b",
+  "title": "reasoning_details round-trip with a synthetic unknown field (informational)",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5", "reasoning": {"effort": "low"}},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "strict": {"reject_unsigned_reasoning": true},
+  "driver": [{"user": "Which component turns a sub-pipeline into an agent tool?"}],
+  "exchanges": [
+    {
+      "note": "The signature fragment carries an unknown field, x_bakeoff_extra.",
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "reasoning_details": [
+              {
+                "type": "reasoning.text",
+                "text": "A tool node that wraps a pipeline. ",
+                "format": "anthropic-claude-v1",
+                "index": 0
+              },
+              {
+                "type": "reasoning.text",
+                "text": "Check the catalog.",
+                "format": "anthropic-claude-v1",
+                "index": 0
+              },
+              {
+                "type": "reasoning.text",
+                "signature": "EqoBCkgIBxABGAIiQFakeSignatureForTheBakeoffOnlyNotARealAnthropicSignature0003==",
+                "format": "anthropic-claude-v1",
+                "index": 0,
+                "x_bakeoff_extra": {"note": "synthetic unknown field"}
+              }
+            ]
+          },
+          {"tool_calls": [{"id": "call_S10b_1", "name": "list_components", "arguments": {}}]},
+          {"finish": "tool_calls"},
+          {
+            "usage": {
+              "prompt_tokens": 940,
+              "completion_tokens": 44,
+              "reasoning_tokens": 12,
+              "cost": 0.0035
+            }
+          }
+        ]
+      }
+    },
+    {
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 4,
+        "tool_result_contains": {"call_S10b_1": "tool_pipe"}
+      },
+      "respond": {
+        "stream": [
+          {
+            "text": "Use tool_pipe: it exposes an inline pipeline as an agent tool.",
+            "chunks": 3
+          },
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {"stops": ["end_turn"], "requests": 2, "commits": 1}
+}

@@ -1,0 +1,78 @@
+{
+  "id": "S15",
+  "title": "Compaction hand-off: after the summary item a request is [system, summary, new user]",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [
+    {"user": "Create notes.md with a title."},
+    {"compact": "The user asked for notes.md. It was created with the title '# Notes'."},
+    {"user": "Read notes.md and tell me its title."}
+  ],
+  "exchanges": [
+    {
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S15_1",
+                "name": "write_file",
+                "arguments": {"path": "notes.md", "content": "# Notes\n"}
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "expect": {"last_role": "tool", "messages_len": 4, "tool_result_contains": {"call_S15_1": ""}},
+      "respond": {
+        "stream": [
+          {"text": "Created notes.md.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "The prefix resets at the compaction item: system, summary, new user message.",
+      "expect": {"last_role": "user", "messages_len": 3, "last_content_contains": "Read notes.md"},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [{"id": "call_S15_2", "name": "read_file", "arguments": {"path": "notes.md"}}]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "Append-only again after the boundary.",
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 5,
+        "tool_result_contains": {"call_S15_2": "# Notes"}
+      },
+      "respond": {
+        "stream": [
+          {"text": "The title is 'Notes'.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn", "end_turn"],
+    "requests": 4,
+    "commits": 2,
+    "files": {"notes.md": "# Notes"}
+  }
+}

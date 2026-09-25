@@ -1,0 +1,98 @@
+{
+  "id": "S12",
+  "title": "Cost metering: OpenRouter cost per step and per turn; a BYOK step without cost",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [
+    {"user": "Validate a simple chat pipeline and report the result."},
+    {"user": "Summarize the pipeline in one line."}
+  ],
+  "exchanges": [
+    {
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S12_1",
+                "name": "validate_pipeline",
+                "arguments": {
+                  "pipeline": {
+                    "project_id": "b0000001-0000-4000-8000-000000000001",
+                    "source": "chat_1",
+                    "components": [
+                      {"id": "chat_1", "provider": "chat", "config": {}},
+                      {
+                        "id": "llm_1",
+                        "provider": "llm_openai_api",
+                        "config": {
+                          "profile": "custom",
+                          "custom": {
+                            "model": "${ROCKETRIDE_OLLAMA_MODEL}",
+                            "base_url": "${ROCKETRIDE_OLLAMA_BASE_URL}",
+                            "apikey": "ollama",
+                            "modelTotalTokens": 32768
+                          }
+                        },
+                        "input": [{"lane": "questions", "from": "chat_1"}]
+                      },
+                      {
+                        "id": "response_1",
+                        "provider": "response_answers",
+                        "config": {},
+                        "input": [{"lane": "answers", "from": "llm_1"}]
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {
+            "usage": {
+              "prompt_tokens": 1200,
+              "completion_tokens": 48,
+              "cached_tokens": 1024,
+              "cost": 0.00125
+            }
+          }
+        ]
+      }
+    },
+    {
+      "expect": {"last_role": "tool", "messages_len": 4, "tool_result_contains": {"call_S12_1": ""}},
+      "respond": {
+        "stream": [
+          {"text": "The pipeline is valid.", "chunks": 2},
+          {"finish": "stop"},
+          {
+            "usage": {
+              "prompt_tokens": 1290,
+              "completion_tokens": 9,
+              "cached_tokens": 1152,
+              "cost": 0.0005
+            }
+          }
+        ]
+      }
+    },
+    {
+      "note": "BYOK-style response: usage (without cost) only if stream_options.include_usage was sent. The loop must label any fallback cost.",
+      "style": "openai",
+      "expect": {"last_role": "user", "messages_len": 6},
+      "respond": {
+        "stream": [
+          {"text": "chat -> llm_openai_api -> response_answers.", "chunks": 2},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1310, "completion_tokens": 11, "cached_tokens": 1280}}
+        ]
+      }
+    }
+  ],
+  "expect": {"stops": ["end_turn", "end_turn"], "requests": 3, "commits": 2, "cost_usd": 0.00175}
+}

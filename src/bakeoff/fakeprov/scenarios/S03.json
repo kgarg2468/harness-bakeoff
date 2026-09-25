@@ -1,0 +1,71 @@
+{
+  "id": "S03",
+  "title": "Three parallel describe_component calls, interleaved argument chunks, 300 ms tools",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 300},
+  "driver": [{"user": "Describe the prompt, llm_openai_api and response_answers components."}],
+  "exchanges": [
+    {
+      "note": "Argument pieces of the three calls arrive interleaved across indexes.",
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S03_1",
+                "name": "describe_component",
+                "arguments": {"name": "prompt"}
+              },
+              {
+                "id": "call_S03_2",
+                "name": "describe_component",
+                "arguments": {"name": "llm_openai_api"}
+              },
+              {
+                "id": "call_S03_3",
+                "name": "describe_component",
+                "arguments": {"name": "response_answers"}
+              }
+            ],
+            "pieces": 3,
+            "interleave": true
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "All three results, in call order.",
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 6,
+        "tool_result_contains": {
+          "call_S03_1": "Prompt",
+          "call_S03_2": "OpenAI-Compatible API",
+          "call_S03_3": "Return Answers"
+        }
+      },
+      "respond": {
+        "stream": [
+          {
+            "text": "prompt builds questions from text, llm_openai_api answers questions, and response_answers returns the answers.",
+            "chunks": 3
+          },
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn"],
+    "requests": 2,
+    "commits": 1,
+    "tool_runs": {"call_S03_1": 1, "call_S03_2": 1, "call_S03_3": 1}
+  }
+}

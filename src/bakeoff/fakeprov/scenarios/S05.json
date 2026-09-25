@@ -1,0 +1,92 @@
+{
+  "id": "S05",
+  "title": "Approval across processes: validate (allow) + write (ask), resume in a new process",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow", "write_file": "ask", "edit_file": "ask"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [
+    {"user": "Validate a simple chat pipeline and save a README.md that describes it."},
+    {"approve": {"allow": "all"}, "new_process": true}
+  ],
+  "exchanges": [
+    {
+      "note": "One batch: validate_pipeline is allowed, write_file asks. The turn pauses.",
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S05_1",
+                "name": "validate_pipeline",
+                "arguments": {
+                  "pipeline": {
+                    "project_id": "b0000001-0000-4000-8000-000000000001",
+                    "source": "chat_1",
+                    "components": [
+                      {"id": "chat_1", "provider": "chat", "config": {}},
+                      {
+                        "id": "llm_1",
+                        "provider": "llm_openai_api",
+                        "config": {
+                          "profile": "custom",
+                          "custom": {
+                            "model": "${ROCKETRIDE_OLLAMA_MODEL}",
+                            "base_url": "${ROCKETRIDE_OLLAMA_BASE_URL}",
+                            "apikey": "ollama",
+                            "modelTotalTokens": 32768
+                          }
+                        },
+                        "input": [{"lane": "questions", "from": "chat_1"}]
+                      },
+                      {
+                        "id": "response_1",
+                        "provider": "response_answers",
+                        "config": {},
+                        "input": [{"lane": "answers", "from": "llm_1"}]
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "id": "call_S05_2",
+                "name": "write_file",
+                "arguments": {
+                  "path": "README.md",
+                  "content": "# Chat pipeline\n\nchat -> llm_openai_api -> response_answers\n"
+                }
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "Resumed in a new process: both results, each tool run exactly once.",
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 5,
+        "tool_result_contains": {"call_S05_1": "", "call_S05_2": ""}
+      },
+      "respond": {
+        "stream": [
+          {"text": "README.md is saved and the pipeline validates.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["paused", "end_turn"],
+    "requests": 2,
+    "commits": 1,
+    "files": {"README.md": "# Chat pipeline"},
+    "tool_runs": {"call_S05_1": 1, "call_S05_2": 1}
+  }
+}

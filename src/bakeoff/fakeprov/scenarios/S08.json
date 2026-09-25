@@ -1,0 +1,53 @@
+{
+  "id": "S08",
+  "title": "Crash after tool.end, before the next request; resume without re-running the tool",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [
+    {"crash_after": "tool.end"},
+    {"user": "Write hello.txt containing 'hello from S08', then confirm."},
+    {"resume": "crash"}
+  ],
+  "exchanges": [
+    {
+      "note": "The worker is SIGKILLed right after this call's tool.end.",
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S08_1",
+                "name": "write_file",
+                "arguments": {"path": "hello.txt", "content": "hello from S08\n"}
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "The resumed turn continues the same history.",
+      "expect": {"last_role": "tool", "messages_len": 4, "tool_result_contains": {"call_S08_1": ""}},
+      "respond": {
+        "stream": [
+          {"text": "hello.txt is written.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn"],
+    "requests": 2,
+    "commits": 1,
+    "files": {"hello.txt": "hello from S08"},
+    "tool_runs": {"call_S08_1": 1}
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "id": "S14",
+  "title": "BYOK strict endpoint: 400 on reasoning, reasoning_effort or stream_options",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {
+    "kind": "openai_compat",
+    "model": "llama-3.3-70b-instruct",
+    "reasoning": {"effort": "low"},
+    "compat": {"reasoning_param": "none", "stream_usage": false}
+  },
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "strict": {"reject_params": ["reasoning", "reasoning_effort", "stream_options"]},
+  "driver": [{"user": "What is in the working copy?"}],
+  "exchanges": [
+    {
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [{"id": "call_S14_1", "name": "list_files", "arguments": {"path": "."}}]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 700, "completion_tokens": 20}}
+        ]
+      }
+    },
+    {
+      "expect": {"last_role": "tool", "messages_len": 4, "tool_result_contains": {"call_S14_1": ""}},
+      "respond": {
+        "stream": [
+          {"text": "The working copy is empty.", "chunks": 2},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 760, "completion_tokens": 8}}
+        ]
+      }
+    }
+  ],
+  "expect": {"stops": ["end_turn"], "requests": 2, "commits": 1}
+}

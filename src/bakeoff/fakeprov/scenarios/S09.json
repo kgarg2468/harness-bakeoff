@@ -1,0 +1,53 @@
+{
+  "id": "S09",
+  "title": "429 with retry-after: 1, then OK; variant: sse_error mid-stream, then OK",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [{"user": "Say hi."}, {"user": "Say hi again."}],
+  "exchanges": [
+    {
+      "note": "OpenRouter rate limit. The retry must wait at least 1 s.",
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {"status": 429, "headers": {"retry-after": "1"}}
+    },
+    {
+      "note": "The same request again.",
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {"text": "Hi!", "chunks": 1},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "An error chunk after HTTP 200 (finish_reason error). No tool ran yet, so retry.",
+      "expect": {"last_role": "user", "messages_len": 4},
+      "respond": {
+        "stream": [
+          {"text": "Hi ag"},
+          {
+            "sse_error": {"code": 502, "message": "Provider disconnected unexpectedly"},
+            "delay_ms": 20
+          }
+        ]
+      }
+    },
+    {
+      "note": "The same request again; the partial text is dropped.",
+      "expect": {"last_role": "user", "messages_len": 4},
+      "respond": {
+        "stream": [
+          {"text": "Hi again!", "chunks": 2},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {"stops": ["end_turn", "end_turn"], "requests": 4, "commits": 2, "text_contains": "Hi again!"}
+}
