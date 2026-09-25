@@ -580,7 +580,7 @@ async def test_byok_thinking_reaches_the_wire_for_a_non_openai_model(loop):
     assert not rejected & set(strict_body)
     assert openrouter_style["reasoning"] == {"effort": "low"}
     assert "reasoning_effort" not in openrouter_style
-    # Why CompatProvider exists: the stock provider's name-based profile has no thinking here.
+    # Why the `profile=` argument is needed: the name-based profile has no thinking here.
     stock = OpenAIChatModel(
         "qwen3-coder", provider=OpenAIProvider(base_url=srv.base_url, api_key="k")
     )

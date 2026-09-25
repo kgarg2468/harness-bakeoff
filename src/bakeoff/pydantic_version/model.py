@@ -2,9 +2,8 @@
 
 OpenRouter uses `OpenRouterModel` + `OpenRouterProvider`, as the docs recommend, so
 `reasoning_details` and the billed `cost` are parsed. A BYOK OpenAI-compatible endpoint uses
-`OpenAIChatModel` with `CompatProvider`, which turns our endpoint compat flags into the profile
-and settings options pydantic-ai already has. A model is built once per endpoint and shared by
-every thread; the per-thread part (`session_id`) is a run setting.
+`OpenAIChatModel` with a `profile=` built from our endpoint compat flags. A model is built once
+per endpoint and shared by every thread; the per-thread part (`session_id`) is a run setting.
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ from typing import Any
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient, omit
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.models.openrouter import OpenRouterModel, OpenRouterModelSettings
-from pydantic_ai.profiles import ModelProfile, merge_profile
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
@@ -24,23 +22,6 @@ from pydantic_ai.settings import ModelSettings
 from bakeoff.shared.contract import ModelConfig
 
 EventHooks = dict[str, list[Callable[[Any], Awaitable[None]]]]
-
-
-class CompatProvider(OpenAIProvider):
-    """An OpenAI-compatible (BYOK) endpoint whose profile follows our compat flags.
-
-    pydantic-ai picks the profile from the model name, and a custom base URL does not change
-    that. A non-OpenAI name therefore gets a profile without thinking support and the unified
-    `thinking` setting is dropped silently. Endpoint quirks belong in `Provider.model_profile()`
-    (the library's own rule), so this provider layers the flags over the name-based profile.
-    """
-
-    def __init__(self, *, openai_client: AsyncOpenAI, profile: OpenAIModelProfile) -> None:
-        super().__init__(openai_client=openai_client)
-        self._compat_profile = profile
-
-    def model_profile(self, model_name: str) -> ModelProfile | None:  # type: ignore[override]
-        return merge_profile(super().model_profile(model_name), self._compat_profile)
 
 
 def build_model(cfg: ModelConfig, event_hooks: EventHooks) -> OpenAIChatModel:
@@ -63,10 +44,14 @@ def build_model(cfg: ModelConfig, event_hooks: EventHooks) -> OpenAIChatModel:
             provider=OpenRouterProvider(openai_client=client),
             settings=OpenRouterModelSettings(**base, **_openrouter_settings(cfg)),
         )
+    # pydantic-ai picks the profile from the model name, and a custom base URL does not change
+    # that, so a non-OpenAI name loses thinking support. The documented `profile=` argument is
+    # merged over the name-based profile.
     profile, settings = _compat(cfg)
     return OpenAIChatModel(
         cfg.model,
-        provider=CompatProvider(openai_client=client, profile=profile),
+        provider=OpenAIProvider(openai_client=client),
+        profile=profile,
         settings=OpenAIChatModelSettings(**base, **settings),
     )
 
