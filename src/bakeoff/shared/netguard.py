@@ -36,11 +36,10 @@ def install(allow_hosts: tuple[str, ...] = ()) -> None:
     _allowed_hosts.update(allow_hosts)
     if _installed:
         return
-    _installed = True
     real_connect = socket.socket.connect
     real_connect_ex = socket.socket.connect_ex
     real_sendto = socket.socket.sendto
-    real_sendmsg = socket.socket.sendmsg
+    real_sendmsg = getattr(socket.socket, "sendmsg", None)  # absent on Windows
 
     def connect(self: socket.socket, address: object) -> None:
         if not _is_allowed(address):
@@ -62,9 +61,11 @@ def install(allow_hosts: tuple[str, ...] = ()) -> None:
         # sendmsg(buffers[, ancdata[, flags[, address]]])
         if len(args) >= 3 and args[2] is not None and not _is_allowed(args[2]):
             raise NetworkBlocked(f"non-loopback datagram blocked: {args[2]!r}")
-        return real_sendmsg(self, buffers, *args)  # type: ignore[arg-type]
+        return real_sendmsg(self, buffers, *args)  # type: ignore[misc]
 
     socket.socket.connect = connect  # type: ignore[method-assign]
     socket.socket.connect_ex = connect_ex  # type: ignore[method-assign]
     socket.socket.sendto = sendto  # type: ignore[method-assign]
-    socket.socket.sendmsg = sendmsg  # type: ignore[method-assign]
+    if real_sendmsg is not None:
+        socket.socket.sendmsg = sendmsg  # type: ignore[method-assign]
+    _installed = True

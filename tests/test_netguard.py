@@ -33,8 +33,9 @@ def test_external_datagram_is_blocked():
             s.sendto(b"x", ("1.1.1.1", 53))
         with pytest.raises(NetworkBlocked):
             s.sendto(b"x", 0, ("1.1.1.1", 53))
-        with pytest.raises(NetworkBlocked):
-            s.sendmsg([b"x"], [], 0, ("1.1.1.1", 53))
+        if hasattr(s, "sendmsg"):  # absent on Windows
+            with pytest.raises(NetworkBlocked):
+                s.sendmsg([b"x"], [], 0, ("1.1.1.1", 53))
     finally:
         s.close()
 
