@@ -136,12 +136,14 @@ class _Turn:
         between it and the runner would cost each streamed chunk another suspend/resume."""
         watcher = asyncio.ensure_future(self._watch())
         history, limits = self.turn.history, self.turn.limits
+        # Incomplete items (cancelled or truncated output) are never replayed: they are no answer.
+        last = next((_role(it) for it in reversed(history) if it.status == "complete"), None)
         try:
             if pending := self._pending():  # approval or crash resume
                 async for event in self._tools(pending):
                     yield event
-            elif history and history[-1].message.get("role") == "assistant":
-                yield self._end("end_turn")  # crashed after the final answer: nothing left to do
+            elif last == "assistant":
+                yield self._end("end_turn")  # resumed after the final answer: nothing left to do
             while not self.ended:  # one step: a model request, then its tool calls
                 if self.cancel.is_set():
                     yield self._end("cancelled")

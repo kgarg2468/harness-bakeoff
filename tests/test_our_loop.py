@@ -883,6 +883,20 @@ async def test_truncated_output_is_kept_but_never_run() -> None:
     assert len(server.bodies) == 1
 
 
+@pytest.mark.parametrize(
+    "usage",
+    [{"step": 1, "cost_usd": 0.01, "cost_source": "provider"}, None],
+    ids=["truncated", "cancelled"],
+)
+async def test_crash_after_an_incomplete_answer_asks_again(usage: dict[str, Any] | None) -> None:
+    cut = Item("a1", "t1", {"role": "assistant", "content": "Writing"}, "incomplete", usage=usage)
+    server = Server(reply("Done."))
+    events = await run(server.loop(), [user("go"), cut], StubTools(), resume=Resume("crash"))
+    assert of(events, "request.start") == [{"step": 2, "attempt": 1}]  # not end_turn
+    assert server.messages(0) == [{"role": "system", "content": SYSTEM}, user("go").message]
+    assert items(events)[0].message["content"] == "Done." and events[-1].data["stop"] == "end_turn"
+
+
 async def test_compaction_item_resets_the_prefix() -> None:
     summary = {"role": "user", "content": "[harness] Conversation summary: built a pipe."}
     history = [
