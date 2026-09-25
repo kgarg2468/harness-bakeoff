@@ -1,5 +1,5 @@
 # Ported from Pi (MIT): packages/ai/src/api/openai-completions.ts @ 5fd446ca1843682e8da3fec4ceb71c42f56fbace
-# Changes: Python; four compat flags with defaults by ModelConfig.kind; reasoning_details merged by (index, type).
+# Changes: Python; four compat flags with defaults by ModelConfig.kind; reasoning_details also merged by index.
 """Per-endpoint request quirks, reasoning_details merging and usage parsing.
 
 Not ported from Pi (this harness does not need them): provider/URL auto-detection, `store`,
@@ -31,6 +31,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     },
 }
 _CONCAT = ("text", "summary", "data")
+_RUNS = ("reasoning.text", "reasoning.summary")  # without an index, these continue the last entry
 
 
 def flags(model: ModelConfig) -> dict[str, Any]:
@@ -76,16 +77,24 @@ def static_body(
 
 
 def merge_detail(details: list[dict[str, Any]], fragment: dict[str, Any]) -> None:
-    """Fold one streamed reasoning_details fragment into `details`.
+    """Fold one streamed reasoning_details fragment into `details`, keeping stream order.
 
-    Fragments with the same (index, type) form one entry: text, summary and data concatenate,
-    and for every other field the first non-null value wins. Unknown fields are kept verbatim.
+    A fragment with an `index` joins the entry with the same (index, type). Without one, a text
+    or summary fragment continues the last entry if that has the same type (as Pi does), and
+    anything else starts a new entry, so separately signed or encrypted blocks stay apart.
+    Joining concatenates text, summary and data; for every other field the first non-null value
+    wins. Unknown fields are kept verbatim.
     """
-    key = (fragment.get("index"), fragment.get("type"))
-    for entry in details:
-        if (entry.get("index"), entry.get("type")) == key:
-            break
+    index, kind = fragment.get("index"), fragment.get("type")
+    if index is not None:
+        entry = next(
+            (e for e in details if e.get("index") == index and e.get("type") == kind), None
+        )
+    elif details and kind in _RUNS and details[-1].get("type") == kind:
+        entry = details[-1]
     else:
+        entry = None
+    if entry is None:
         details.append(dict(fragment))
         return
     for name, value in fragment.items():

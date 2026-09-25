@@ -80,6 +80,24 @@ def test_merge_detail_by_index_and_type() -> None:
     ]
 
 
+def test_merge_detail_without_index_keeps_order_and_blocks_apart() -> None:
+    details: list[dict[str, object]] = []
+    for fragment in [
+        {"type": "reasoning.text", "text": "A", "signature": "s1"},
+        {"type": "reasoning.encrypted", "data": "E1", "id": "tool_call_1"},
+        {"type": "reasoning.encrypted", "data": "E2", "id": "tool_call_2"},
+        {"type": "reasoning.text", "text": "B"},
+        {"type": "reasoning.text", "text": "C", "signature": "s2"},
+    ]:
+        merge_detail(details, fragment)
+    assert details == [
+        {"type": "reasoning.text", "text": "A", "signature": "s1"},
+        {"type": "reasoning.encrypted", "data": "E1", "id": "tool_call_1"},
+        {"type": "reasoning.encrypted", "data": "E2", "id": "tool_call_2"},
+        {"type": "reasoning.text", "text": "BC", "signature": "s2"},
+    ]
+
+
 def test_usage_fields_fallbacks() -> None:
     assert usage_fields({"prompt_tokens": 9, "prompt_cache_hit_tokens": 4}) == {
         "input_tokens": 9,
@@ -107,6 +125,21 @@ def test_classify_by_status_and_message() -> None:
         "http", "HTTP 400: This endpoint's maximum context length is 8192 tokens", 400
     )
     assert overflow.kind == "context_overflow" and not overflow.retryable
+
+
+def test_status_codes_match_only_as_whole_words() -> None:
+    assert classify("stream", "HTTP 502 from upstream").retryable
+    assert classify("stream", "error 429").retryable
+    assert not classify("stream", "tool call call_5029 has invalid arguments").retryable
+    assert not classify("stream", "Invalid request: max_tokens must be <= 128500").retryable
+
+
+def test_per_minute_quota_is_a_throttle() -> None:
+    per_minute = (
+        "HTTP 429: Provider returned error\nQuota exceeded for quota metric requests_per_minute"
+    )
+    assert classify("http", per_minute, 429).retryable
+    assert not classify("http", "HTTP 429: Quota exceeded for this month", 429).retryable
 
 
 def test_retry_after_forms_and_cap() -> None:

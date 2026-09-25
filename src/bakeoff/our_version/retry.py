@@ -1,9 +1,13 @@
 # Ported from Pi (MIT): packages/ai/src/utils/{retry.ts,provider-retry.ts,overflow.ts} @ 5fd446ca1843682e8da3fec4ceb71c42f56fbace
-# Changes: Python; one ProviderError (kind, retryable, wait); Node/websocket-only patterns dropped; retry loop in loop.py.
+# Changes: Python; one ProviderError (kind, retryable, wait); status codes as whole words; retry loop in loop.py.
 """Which provider errors to retry, how long to wait, and context-overflow detection.
 
 Not ported: silent and length-stop overflow detection (needs the model's context window),
-Cerebras' body-less 400/413, and Pi's agent-level retry callbacks.
+Cerebras' body-less 400/413, Pi's agent-level retry callbacks, OpenCode Zen's plan-limit names
+(not an endpoint this harness targets), and patterns for errors this client never sees:
+Node/undici/Bun socket and DNS messages, websocket closes and SDK stream-end messages (httpx
+transport errors are classified by type in provider.py). As in Pi, a server-requested delay
+over the cap fails the request instead of retrying.
 """
 
 from __future__ import annotations
@@ -25,13 +29,9 @@ def _any(*patterns: str) -> re.Pattern[str]:
 
 # Quota, budget and billing exhaustion: not transient, even when sent as HTTP 429.
 _NON_RETRYABLE = _any(
-    "GoUsageLimitError",
-    "FreeUsageLimitError",
-    "Monthly usage limit reached",
-    "available balance",
     "insufficient_quota",
     "out of budget",
-    "quota exceeded",
+    r"quota exceeded(?!.*per.?minute)",  # a per-minute quota (Google via OpenRouter) is a throttle
     "billing",
 )
 # Transient failures, for errors without an HTTP status (mid-stream errors, transport).
@@ -40,7 +40,7 @@ _RETRYABLE = _any(
     "currently experiencing high demand",
     r"rate.?limit",
     "too many requests",
-    *("429", "500", "502", "503", "504", "520", "524"),
+    r"\b(?:429|500|502|503|504|520|524)\b",  # whole words: not inside ids or token counts
     r"service.?unavailable",
     r"server.?error",
     r"internal.?error",
@@ -50,15 +50,10 @@ _RETRYABLE = _any(
     r"connection.?error",
     r"connection.?refused",
     r"connection.?lost",
-    "other side closed",
-    "fetch failed",
     r"upstream.?connect",
     "reset before headers",
-    "socket hang up",
-    "socket connection was closed",
     "timed? out",
     "timeout",
-    "terminated",
     "ended without",
     "you can retry your request",
     "try your request again",
