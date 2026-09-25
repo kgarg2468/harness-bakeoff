@@ -50,7 +50,9 @@ class ToolHostImpl:
         self, workdir: Path, rules: dict, emit: Callable[[Event], None], engine: Engine
     ) -> None:
         permissions.validate_rules(rules)
-        self._ctx = ToolContext(workdir=workdir.resolve(), engine=engine)
+        self._ctx = ToolContext(
+            workdir=workdir.resolve(), engine=engine, unattended=not permissions.asks(rules)
+        )
         self._rules = rules
         self._emit = emit
         self.run_counts: dict[str, int] = {}

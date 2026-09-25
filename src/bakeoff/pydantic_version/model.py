@@ -9,7 +9,7 @@ per endpoint and shared by every thread; the per-thread part (`session_id`) is a
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, get_args
 
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient, omit
 
@@ -21,7 +21,7 @@ from pydantic_ai.models.openrouter import OpenRouterModel, OpenRouterModelSettin
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
-from pydantic_ai.settings import ModelSettings
+from pydantic_ai.settings import ModelSettings, ThinkingEffort
 
 from bakeoff.shared.contract import ModelConfig
 
@@ -99,8 +99,15 @@ def _compat(cfg: ModelConfig) -> tuple[OpenAIModelProfile, OpenAIChatModelSettin
     if flags.get("developer_role"):
         profile["openai_system_prompt_role"] = "developer"
     if cfg.reasoning and reasoning_param == "reasoning_effort":
-        profile["supports_thinking"] = True
-        settings["thinking"] = cfg.reasoning.get("effort", True)
+        effort = cfg.reasoning.get("effort", True)
+        if isinstance(effort, bool) or effort in get_args(ThinkingEffort):
+            profile["supports_thinking"] = True
+            settings["thinking"] = effort
+        else:
+            # Values the unified `thinking` setting has no level for ("none" turns reasoning
+            # off, which some models need before they accept tools; "max") go straight through
+            # the documented OpenAI-specific setting.
+            settings["openai_reasoning_effort"] = effort
     elif cfg.reasoning and reasoning_param == "openrouter":
         extra_body["reasoning"] = cfg.reasoning  # OpenAIChatModel has no setting for this shape
     if flags.get("stream_usage") is False:
