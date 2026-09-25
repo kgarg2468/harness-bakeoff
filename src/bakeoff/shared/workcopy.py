@@ -10,7 +10,9 @@ from pathlib import Path
 
 # Fixed identity, no signing, and none of the user's global ignore or attributes files: git
 # reads those from ~/.config/git even when there is no global config file. Hooks and fsmonitor
-# are off so nothing the model writes into the working copy can make git run a command.
+# are off so nothing the model writes into the working copy can make git run a command. No
+# automatic gc or maintenance: it may detach and keep running (with the thread's lock, which git
+# inherits) after the command that started it has returned.
 GIT_CONFIG = (
     "-c",
     "user.name=bakeoff",
@@ -26,6 +28,10 @@ GIT_CONFIG = (
     "core.hooksPath=/dev/null",
     "-c",
     "core.fsmonitor=false",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "maintenance.auto=false",
 )
 
 
@@ -46,11 +52,16 @@ def _failed(root: Path, args: tuple[str, ...], stderr: bytes) -> RuntimeError:
 
 
 class WorkCopy:
-    """A git repository at `root` on branch `main`, starting with an empty commit."""
+    """A git repository at `root` on branch `main`, starting with an empty commit.
 
-    def __init__(self, root: Path) -> None:
+    `lock_fd` is the descriptor of the thread's lock (see `runner._try_lock`). Every git process
+    inherits it, so the lock lasts until the last of them exits, even if the caller dies first.
+    """
+
+    def __init__(self, root: Path, lock_fd: int | None = None) -> None:
         self.root = root.absolute()
         self._env = git_env(self.root)
+        self._pass_fds = () if lock_fd is None else (lock_fd,)
 
     async def _git(self, *args: str) -> str:
         proc = await asyncio.create_subprocess_exec(
@@ -62,6 +73,7 @@ class WorkCopy:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            pass_fds=self._pass_fds,
         )
         try:
             out, err = await proc.communicate()
@@ -129,7 +141,8 @@ class WorkCopy:
 
         Removes a stale index lock and moves HEAD back to `sha` (None: the initial commit) if
         commits landed after it that no turn recorded. Their changes stay staged, so the next
-        commit includes them. Call it only when no other git process can be using the repo.
+        commit includes them. Call it only while holding the thread's lock: git processes inherit
+        it, so then none of them can still be running.
         """
         (self.root / ".git" / "index.lock").unlink(missing_ok=True)
         target = sha or (await self._git("rev-list", "--max-parents=0", "HEAD")).split()[0]

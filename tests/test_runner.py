@@ -6,9 +6,17 @@ from typing import ClassVar
 
 import pytest
 
+from bakeoff.shared import workcopy
 from bakeoff.shared.contract import Event, Item, ModelConfig, Resume, ToolCall, ToolResult
 from bakeoff.shared.invariants import check_commits, check_seq, check_tool_results
-from bakeoff.shared.runner import NdjsonMirror, Runner, ThreadBusy, _exclusive
+from bakeoff.shared.runner import (
+    NdjsonMirror,
+    Runner,
+    ThreadBusy,
+    _exclusive,
+    _try_lock,
+    _unlock,
+)
 from bakeoff.shared.sessionlog import SessionLog
 from bakeoff.shared.workcopy import GIT_CONFIG, WorkCopy, git_env
 
@@ -879,6 +887,7 @@ async def test_concurrent_crash_resumes_cannot_both_run(runner, log, tid):
         runner.turn(FakeLoop(slow_finish), tid, model=MODEL, resume=Resume(kind="crash"))
     )
     await asyncio.sleep(0.05)
+    runner.lock_wait_s = 0.05  # a resume waits this long for the lock, then gives up
     with pytest.raises(ThreadBusy):
         await runner.turn(FakeLoop(slow_finish), tid, model=MODEL, resume=Resume(kind="crash"))
     release.set()
@@ -886,4 +895,58 @@ async def test_concurrent_crash_resumes_cannot_both_run(runner, log, tid):
     assert [(t["kind"], t["status"]) for t in log.turns(tid)] == [
         ("user", "running"),
         ("crash", "done"),
+    ]
+
+
+async def test_git_keeps_the_thread_lock_after_its_caller_is_gone(runner, tid, monkeypatch):
+    """A worker killed while git runs: its git inherited the thread's lock, so a crash resume
+    cannot get in (and clean up after git) until that git has exited."""
+    # Hooks on for this test only: a slow pre-commit hook keeps git busy.
+    config = tuple(workcopy.GIT_CONFIG)
+    i = config.index("core.hooksPath=/dev/null")
+    monkeypatch.setattr(workcopy, "GIT_CONFIG", config[: i - 1] + config[i + 1 :])
+    wd = runner.workdir(tid)
+    hook = wd / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\ntouch started\nsleep 0.3\n")
+    hook.chmod(0o755)
+    lock_path = runner._lock_path(tid)
+    fd = _try_lock(lock_path)
+    commit = asyncio.create_task(WorkCopy(wd, fd).commit("turn 1: end_turn"))
+    for _ in range(500):
+        if (wd / "started").exists():
+            break
+        await asyncio.sleep(0.01)
+    _unlock(fd)  # what the kernel does when the worker dies
+    with pytest.raises(ThreadBusy):
+        _try_lock(lock_path)
+    await commit
+    _unlock(_try_lock(lock_path))  # free once git has exited
+
+
+async def test_a_resume_waits_for_the_thread_lock(runner, log, tid):
+    """An approval started as soon as the paused turn.end is seen may find the worker still
+    finishing that turn: it waits for the lock. A new user message does not."""
+
+    async def ask(turn, tools, cancel):
+        call = write_call(turn, "a.txt")
+        yield item(turn, "a", assistant(call))
+        yield Event("turn.end", {"stop": "paused", "steps": 1, "pending": [call.id]})
+
+    async def approve(turn, tools, cancel):
+        (spec,) = turn.history[-1].message["tool_calls"]
+        call = ToolCall(spec["id"], spec["function"]["name"], spec["function"]["arguments"])
+        yield tool_item(turn, await tools.run(call))
+        yield Event("turn.end", {"stop": "end_turn", "steps": 1})
+
+    paused = await runner.turn(FakeLoop(ask), tid, model=MODEL, user_text="write a.txt")
+    held = _try_lock(runner._lock_path(tid))  # e.g. the worker, still finishing the paused turn
+    with pytest.raises(ThreadBusy):
+        await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="no wait")
+    asyncio.get_running_loop().call_later(0.1, _unlock, held)
+    resume = Resume(kind="approval", decisions={paused["pending"][0]: "allow"})
+    summary = await runner.turn(FakeLoop(approve), tid, model=MODEL, resume=resume)
+    assert summary["stop"] == "end_turn"
+    assert [(t["kind"], t["status"]) for t in log.turns(tid)] == [
+        ("user", "paused"),
+        ("approval", "done"),
     ]

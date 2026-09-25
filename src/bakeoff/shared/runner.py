@@ -37,6 +37,7 @@ MakeTools = Callable[[Path, dict[str, Any], Callable[[Event], None]], ToolHost]
 
 _BATCH = 64  # non-item events buffered before a flush
 _CANCEL_POLL_S = 0.05
+_LOCK_POLL_S = 0.02
 _STATUS = {"end_turn": "done", "max_steps": "done", "budget": "done", "cancelled": "cancelled"}
 _DEFAULT_LIMITS = Limits()
 _THREAD_ID = re.compile(r"[\w-]+")
@@ -57,28 +58,59 @@ except ImportError:  # Windows: no advisory locks; the log's running-turn check 
 
 
 class ThreadBusy(RuntimeError):
-    """Another live process is running a turn (or a revert) on this thread."""
+    """Another turn, revert or compaction of this thread holds its lock (maybe in another
+    process)."""
+
+
+def _try_lock(lock_path: Path) -> int | None:
+    """Take the thread's OS advisory lock without waiting and return its descriptor (None where
+    the OS has no advisory locks). Raises ThreadBusy if another descriptor holds it.
+
+    The kernel drops the lock when the last descriptor of it closes. Every git process of the
+    thread inherits the descriptor (see `WorkCopy`), so a worker that dies (e.g. SIGKILL) keeps
+    the lock until its last git process exits. A crash resume can take it after that, and two
+    live processes (e.g. two concurrent crash resumes) can never both hold it.
+    """
+    if fcntl is None:
+        return None
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException as exc:
+        os.close(fd)
+        if isinstance(exc, BlockingIOError):
+            raise ThreadBusy(
+                f"thread {lock_path.stem} is busy: a turn, revert or compaction holds its lock"
+            ) from None
+        raise
+    return fd
+
+
+def _unlock(fd: int | None) -> None:
+    if fd is not None:
+        os.close(fd)  # the lock stays while a git process still has its inherited copy
 
 
 @contextmanager
-def _exclusive(lock_path: Path) -> Iterator[None]:
-    """Hold an OS advisory lock on `lock_path` for the duration of a turn.
-
-    The kernel drops the lock when its process dies, so a crash resume can always take it,
-    while two live processes (e.g. two concurrent crash resumes) can never both hold it.
-    """
-    if fcntl is None:
-        yield
-        return
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+def _exclusive(lock_path: Path) -> Iterator[int | None]:
+    """Hold the thread's lock (see `_try_lock`) for the block; yields its descriptor."""
+    fd = _try_lock(lock_path)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ThreadBusy(f"thread is busy in another process: {lock_path.stem}") from None
-        yield
+        yield fd
     finally:
-        os.close(fd)  # closing the descriptor releases the lock
+        _unlock(fd)
+
+
+async def _wait_lock(lock_path: Path, wait_s: float) -> int | None:
+    """`_try_lock`, retried for up to `wait_s` seconds."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            return _try_lock(lock_path)
+        except ThreadBusy:
+            if time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(_LOCK_POLL_S)
 
 
 @contextmanager
@@ -182,7 +214,13 @@ class NdjsonMirror:
 
 
 class Runner:
-    """Runs turns of any `Loop` against the session log and one git working copy per thread."""
+    """Runs turns of any `Loop` against the session log and one git working copy per thread.
+
+    Each turn and revert holds the thread's OS lock (see `_try_lock`) while it runs.
+    A resume (approval or crash) waits up to `lock_wait_s` seconds for it: it follows the end of
+    the turn before it, whose worker, or that worker's last git process, may still hold it.
+    Anything else raises ThreadBusy at once.
+    """
 
     def __init__(
         self,
@@ -190,11 +228,13 @@ class Runner:
         wc_root: Path,
         make_tools: MakeTools,
         sink: Sink | None = None,
+        lock_wait_s: float = 5.0,
     ) -> None:
         self.log = log
         self.wc_root = wc_root
         self.make_tools = make_tools
         self.sink = sink
+        self.lock_wait_s = lock_wait_s
 
     def workdir(self, thread_id: str) -> Path:
         """The thread's git working copy."""
@@ -248,10 +288,23 @@ class Runner:
         thread = self._thread(thread_id)
         if loop.name != thread["impl"]:
             raise ValueError(f"thread {thread_id} belongs to {thread['impl']!r}, not {loop.name!r}")
-        with _exclusive(self._lock_path(thread_id)):
+        wait_s = self.lock_wait_s if resume is not None else 0.0
+        lock_fd = await _wait_lock(self._lock_path(thread_id), wait_s)
+        try:
             return await self._turn(
-                loop, thread, thread_id, model, user_text, resume, limits, cancel, watch_cancel
+                loop,
+                thread,
+                thread_id,
+                model,
+                user_text,
+                resume,
+                limits,
+                cancel,
+                watch_cancel,
+                lock_fd,
             )
+        finally:
+            _unlock(lock_fd)
 
     async def _turn(
         self,
@@ -264,11 +317,12 @@ class Runner:
         limits: Limits,
         cancel: asyncio.Event | None,
         watch_cancel: bool,
+        lock_fd: int | None,
     ) -> dict[str, Any]:
         kind = resume.kind if resume else "user"
         row = self.log.start_turn(thread_id, kind)  # raises if a turn is running (unless crash)
         turn_id = row["id"]
-        wc = WorkCopy(self.workdir(thread_id))
+        wc = WorkCopy(self.workdir(thread_id), lock_fd)
         pub = _Publisher(self.log, self.sink, thread_id, turn_id, thread["impl"])
         cancel = cancel or asyncio.Event()
         watcher = (
@@ -369,7 +423,7 @@ class Runner:
             raise ValueError(f"turn {turn_id} of thread {thread_id} has no commit to revert")
         # Held until the revert is fully recorded: while its row says "running", a crash resume
         # that got the lock would take git's revert commit for one that no turn recorded.
-        with _exclusive(self._lock_path(thread_id)):
+        with _exclusive(self._lock_path(thread_id)) as lock_fd:
             last = self._git_turns(thread_id)[-1]  # there is one: the target
             if last["status"] in _REVERT_WAITS and not last["commit_sha"]:
                 raise RuntimeError(
@@ -377,7 +431,8 @@ class Runner:
                 )
             row = self.log.start_turn(thread_id, "revert")
             try:
-                sha, files = await WorkCopy(self.workdir(thread_id)).revert(target["commit_sha"])
+                wc = WorkCopy(self.workdir(thread_id), lock_fd)
+                sha, files = await wc.revert(target["commit_sha"])
             except Exception:
                 self.log.discard_turn(row["id"])  # it recorded nothing yet
                 raise
