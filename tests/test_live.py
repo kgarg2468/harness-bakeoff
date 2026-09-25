@@ -187,8 +187,9 @@ def test_live_api_responses_sets_the_kind_and_passes_reasoning_through(
     tmp_path: Path, impl: str, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """`--api responses` makes the thread's endpoint kind openai_responses, and `--reasoning
-    xhigh` reaches its model config as the effort. (The run's outcome is the loop's business:
-    it passes once the loop speaks the Responses API.)"""
+    xhigh` reaches its model config as the effort, with a summary (the API streams none unless
+    asked). (The run's outcome is the loop's business: it passes once the loop speaks the
+    Responses API.)"""
     out = tmp_path / "out"
     with FakeProvider(wire_dir=tmp_path / "wire") as provider:
         endpoint = f"http://127.0.0.1:{provider.port}/s/R01/r1/{{impl}}/v1"
@@ -203,7 +204,7 @@ def test_live_api_responses_sets_the_kind_and_passes_reasoning_through(
         log.close()
     assert (model["kind"], model["reasoning"], model["temperature"]) == (
         "openai_responses",
-        {"effort": "xhigh"},
+        {"effort": "xhigh", "summary": "auto"},
         None,
     )
     assert model["base_url"] == endpoint.replace("{impl}", impl)
@@ -239,9 +240,13 @@ def test_api_picks_the_endpoint_kind(capsys: pytest.CaptureFixture[str]) -> None
     )
     assert (config.kind, config.reasoning, config.base_url) == (
         "openai_responses",
-        {"effort": "xhigh"},
+        {"effort": "xhigh", "summary": "auto"},
         live.OPENAI_BASE_URL,
     )
+    # Effort "none" has nothing to sum up; chat completions have no summary.
+    for kind, effort in (("openai_responses", "none"), ("openai_compat", "xhigh")):
+        config = live.LiveModel(model="gpt-6-luna", kind=kind, reasoning=effort).config("our")
+        assert config.reasoning == {"effort": effort}
 
 
 async def test_chat_asks_before_writing(tmp_path: Path) -> None:
