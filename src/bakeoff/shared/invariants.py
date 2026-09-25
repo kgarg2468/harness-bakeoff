@@ -20,7 +20,6 @@ from bakeoff.shared.workcopy import GIT_CONFIG, git_env
 
 _REASONING_KEYS = ("type", "text", "signature", "data", "format", "index")
 _SYSTEM_ROLES = ("system", "developer")
-_COMMITTED = ("done", "error", "cancelled")
 _QUOTE, _BACKSLASH, _COLON, _COMMA = b'"'[0], b"\\"[0], b":"[0], b","[0]
 _OPEN, _CLOSE = b"[{", b"]}"
 
@@ -305,10 +304,14 @@ def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
     """I7: one commit per completed turn, in order, and HEAD is the last turn's commit.
 
     Completed = done, error or cancelled. Compaction turns change no files and have no
-    commit; paused turns are committed by the turn that resumes them.
+    commit; paused turns are committed by the turn that resumes them. An "error" turn without
+    a commit failed to commit, and the next turn's commit includes its changes.
     """
     turns = [
-        t for t in log.turns(thread_id) if t["status"] in _COMMITTED and t["kind"] != "compact"
+        t
+        for t in log.turns(thread_id)
+        if t["kind"] != "compact"
+        and (t["status"] in ("done", "cancelled") or (t["status"] == "error" and t["commit_sha"]))
     ]
     expected = [t["commit_sha"] for t in turns]
     wc_path = wc_path.absolute()

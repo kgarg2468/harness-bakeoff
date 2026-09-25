@@ -223,7 +223,8 @@ class Runner:
         Returns `{"turn_id", "stop", "pending", "commit"}`. A loop exception ends the turn with
         stop="error" instead of raising. `asyncio.CancelledError` propagates and leaves the turn
         "running", like a crash; resume it with `Resume(kind="crash")`. If the commit fails,
-        the turn is recorded as "error" without a commit and the git error is raised.
+        the turn is recorded as "error" without a commit and the git error is raised; the next
+        turn's commit then includes its changes.
         """
         if (user_text is None) == (resume is None):
             raise ValueError("pass exactly one of user_text and resume")
@@ -259,8 +260,7 @@ class Runner:
             else None
         )
         try:
-            if kind == "crash":
-                await wc.recover(self._last_commit(thread_id))
+            await self._reconcile(wc, thread_id, turn_id)
             start: dict[str, Any] = {"turn_id": turn_id}
             if resume is not None:
                 start["resume"] = asdict(resume)
@@ -393,9 +393,19 @@ class Runner:
             raise KeyError(f"unknown thread {thread_id}")
         return thread
 
-    def _last_commit(self, thread_id: str) -> str | None:
-        shas = [t["commit_sha"] for t in self.log.turns(thread_id) if t["commit_sha"]]
-        return shas[-1] if shas else None
+    def _git_turns(self, thread_id: str) -> list[dict[str, Any]]:
+        """The thread's turns that use the working copy (all but compactions), in order."""
+        return [t for t in self.log.turns(thread_id) if t["kind"] != "compact"]
+
+    async def _reconcile(self, wc: WorkCopy, thread_id: str, turn_id: str) -> None:
+        """Before turn `turn_id` uses git: if the turn before it died ("running") or failed to
+        commit ("error" without a sha), git may hold a commit that no turn recorded or a stale
+        lock. Move HEAD back to the last recorded commit; the changes after it stay staged, so
+        this turn's commit includes them."""
+        turns = [t for t in self._git_turns(thread_id) if t["id"] != turn_id]
+        if turns and turns[-1]["status"] in ("running", "error") and not turns[-1]["commit_sha"]:
+            shas = [t["commit_sha"] for t in turns if t["commit_sha"]]
+            await wc.recover(shas[-1] if shas else None)
 
     async def _watch_cancel(self, thread_id: str, since_us: int, cancel: asyncio.Event) -> None:
         # Polls because the request may come from another process (`bakeoff cancel`).

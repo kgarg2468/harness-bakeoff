@@ -318,6 +318,18 @@ async def test_commits_ok(log, tmp_path):
     assert check.info["turns"] == check.info["commits"] == 4
 
 
+async def test_an_error_turn_that_failed_to_commit_is_not_a_committed_turn(log, tmp_path):
+    wc = WorkCopy(tmp_path / "wc")
+    await wc.init()
+    await committed_turn(log, wc)
+    failed = log.start_turn("th", "user")
+    log.set_turn_status(failed["id"], "error", stop="end_turn")  # its commit failed
+    await committed_turn(log, wc)  # the next turn's commit includes its changes
+    check = check_commits(log, "th", wc.root)
+    assert check.ok, check.detail
+    assert check.info["turns"] == check.info["commits"] == 2
+
+
 async def test_extra_commit_fails(log, tmp_path):
     wc = WorkCopy(tmp_path / "wc")
     await wc.init()

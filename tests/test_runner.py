@@ -9,7 +9,7 @@ from bakeoff.shared.contract import Event, Item, ModelConfig, Resume, ToolCall, 
 from bakeoff.shared.invariants import check_commits, check_seq, check_tool_results
 from bakeoff.shared.runner import NdjsonMirror, Runner
 from bakeoff.shared.sessionlog import SessionLog
-from bakeoff.shared.workcopy import GIT_CONFIG, git_env
+from bakeoff.shared.workcopy import GIT_CONFIG, WorkCopy, git_env
 
 MODEL = ModelConfig(base_url="http://127.0.0.1:9/v1", model="fake/model", api_key="sk-secret")
 RULES = {"*": "allow", "write_file": {"*.pipe": "allow", "*": "ask"}}
@@ -460,10 +460,35 @@ async def test_commit_failure_ends_the_turn_without_blocking_the_thread(runner, 
     turn = log.last_turn(tid)
     assert (turn["status"], turn["stop"], turn["commit_sha"]) == ("error", "end_turn", None)
     assert types(log, tid)[-1] == "turn.end"
-    lock.unlink()
+    # The next turn cleans up after git (the stale lock) and commits both turns' changes.
     summary = await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")
     assert summary["stop"] == "end_turn"
     assert log.events(tid)[-1]["data"]["files"] == ["a.pipe", "b.pipe"]
+    check = check_commits(log, tid, runner.workdir(tid))
+    assert check.ok, check.detail
+
+
+async def test_a_commit_git_made_but_no_turn_recorded_is_undone_by_the_next_turn(
+    runner, log, tid, monkeypatch
+):
+    real = WorkCopy._head_change
+
+    async def fails_once(self):  # git committed, then reading the new commit failed
+        monkeypatch.setattr(WorkCopy, "_head_change", real)
+        raise RuntimeError("git diff-tree failed")
+
+    monkeypatch.setattr(WorkCopy, "_head_change", fails_once)
+    with pytest.raises(RuntimeError, match="diff-tree"):
+        await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
+    wd = runner.workdir(tid)
+    assert git(wd, "rev-list", "--count", "HEAD") == "2"  # init + a commit no turn recorded
+    assert (log.last_turn(tid)["status"], log.last_turn(tid)["commit_sha"]) == ("error", None)
+
+    await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")
+    assert git(wd, "rev-list", "--count", "HEAD") == "2"  # init + turn 2, built on init
+    assert log.events(tid)[-1]["data"]["files"] == ["a.pipe", "b.pipe"]
+    check = check_commits(log, tid, wd)
+    assert check.ok, check.detail
 
 
 async def test_crash_resume_cleans_up_after_git(runner, log, tid):
