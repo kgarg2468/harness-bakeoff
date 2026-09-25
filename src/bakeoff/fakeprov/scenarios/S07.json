@@ -78,6 +78,7 @@
     "requests": 3,
     "commits": 3,
     "tool_runs": {"call_S07_1": 1},
-    "text_contains": "tool_pipe outputs"
+    "text_contains": "tool_pipe outputs",
+    "cancel_within_ms": 200
   }
 }

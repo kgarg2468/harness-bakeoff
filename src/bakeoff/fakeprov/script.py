@@ -217,6 +217,10 @@ _FINAL_EXPECT = _obj(
         "cost_usd": {"type": "number", "minimum": 0},
         "usage": _obj({"input_tokens": _INT0, "output_tokens": _INT0, "cached_tokens": _INT0}),
         "cost_source": {"enum": ["provider", "estimate", "none"]},
+        # Calls whose tools must all be running at one moment (parallel tools, S03).
+        "tools_overlap": {"type": "array", "items": _STR, "minItems": 2, "uniqueItems": True},
+        # Every turn the driver cancels (`cancel_after_ms`) ends this soon after the cancel.
+        "cancel_within_ms": {"type": "number", "minimum": 0},
     },
     "stops",
 )
@@ -318,6 +322,7 @@ def _check_semantics(name: str, data: dict[str, Any]) -> None:
         fail("$.exchanges", f"tool call ids must be unique: {duplicates}")
 
     referenced = set(data["expect"].get("tool_runs", {}))
+    referenced |= set(data["expect"].get("tools_overlap", []))
     for exchange in data["exchanges"]:
         referenced |= set(exchange.get("expect", {}).get("tool_result_contains", {}))
     steps = data["driver"]
@@ -340,6 +345,8 @@ def _check_semantics(name: str, data: dict[str, Any]) -> None:
         fail("$.expect", f"unknown tool call ids: {unknown}")
     if len(data["expect"]["stops"]) != turns:
         fail("$.expect.stops", f"lists {len(data['expect']['stops'])} stops for {turns} turns")
+    if "cancel_within_ms" in data["expect"] and not any("cancel_after_ms" in s for s in steps):
+        fail("$.expect.cancel_within_ms", "no driver step has cancel_after_ms")
 
 
 # --- answering ------------------------------------------------------------------------------

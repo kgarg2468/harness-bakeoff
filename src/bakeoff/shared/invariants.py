@@ -252,20 +252,28 @@ _I2_PROBLEMS = (
     "reran",  # more than one tool.start for a call id
     "unknown_runs",  # a tool that can have side effects ran for a call id in no assistant message
     "late_runs",  # a tool started after the loop's turn.end (kept in the turn row's `late`)
+    "unfinished",  # a tool still running at its turn's turn.end (contract rule 6: no orphans)
+    "unrun_results",  # a result no tool run produced, though nobody denied or cut short the call
 )
+# A turn that stops early may answer calls it never ran: a cancel cuts them short, and the step
+# cap or budget leaves the last step's calls unrun (their results could never be sent).
+_EARLY_STOPS = ("cancelled", "max_steps", "budget", "error")
 
 
 def check_tool_results(
     items: Sequence[Item], events: Sequence[dict[str, Any]], turns: Sequence[dict[str, Any]]
 ) -> Check:
     """I2: every tool call has exactly one result, right after its call; every run belongs
-    to a call in history, and no call runs twice.
+    to a call in history, no call runs twice, and every run ends before its turn does.
 
     Runs are the `tool.start` events plus those the turn rows (`SessionLog.turns`) keep in
-    `late`: tools that started after their loop's `turn.end`.
+    `late`: tools that started after their loop's `turn.end`. A result must come from a run
+    (`ToolHost.run`), unless the user denied the call (`Resume.decisions`, recorded in
+    `turn.start`) or the result's turn stopped early (`_EARLY_STOPS`).
     """
     calls: Counter[Any] = Counter()
     results: Counter[Any] = Counter()
+    result_turns: dict[Any, Any] = {}  # call id -> the turn of its (last) result
     out_of_place: list[Any] = []
     latest: list[Any] = []  # the calls that the next result may answer
     for item in items:
@@ -273,6 +281,7 @@ def check_tool_results(
         if role == "tool":
             call_id = item.message.get("tool_call_id")
             results[call_id] += 1
+            result_turns[call_id] = item.turn_id
             if call_id not in latest:
                 out_of_place.append(call_id)
         else:  # any other item ends the results that answer the assistant message before it
@@ -289,6 +298,14 @@ def check_tool_results(
         if x["type"] == "tool.start"
     ]
     starts.update(late)
+    stops = {e.get("turn"): e["data"].get("stop") for e in events if e["type"] == "turn.end"}
+    denied = {
+        call_id
+        for e in events
+        if e["type"] == "turn.start"
+        for call_id, decision in ((e["data"].get("resume") or {}).get("decisions") or {}).items()
+        if decision == "deny"
+    }
     info = {
         "calls": sum(calls.values()),
         "results": sum(results.values()),
@@ -303,10 +320,33 @@ def check_tool_results(
         # response then failed or was cut off. Harmless, so reported but not a problem.
         "speculative_runs": [c for c in starts if c not in calls and c in read_only],
         "late_runs": late,
+        "unfinished": _unfinished(events, stops),
+        "unrun_results": [
+            c
+            for c, turn in result_turns.items()
+            if c in calls
+            and starts[c] == 0
+            and c not in denied
+            and stops.get(turn) not in _EARLY_STOPS
+        ],
     }
     problems = [f"{k}: {info[k]}" for k in _I2_PROBLEMS if info[k]]
     detail = "; ".join(problems) or f"{info['calls']} calls, each with exactly one result"
     return Check("I2", not problems, detail, info)
+
+
+def _unfinished(events: Sequence[dict[str, Any]], stops: dict[Any, Any]) -> list[Any]:
+    """Calls whose tool was still running when its turn's `turn.end` was stamped: its
+    `tool.end` came later (in the turn row's `late`) or never. A turn without `turn.end` (its
+    process died) has no end to compare with."""
+    open_runs: Counter[tuple[Any, Any]] = Counter()
+    for e in events:
+        key = (e.get("turn"), e["data"].get("call_id"))
+        if e["type"] == "tool.start":
+            open_runs[key] += 1
+        elif e["type"] == "tool.end" and open_runs[key] > 0:
+            open_runs[key] -= 1
+    return [call for (turn, call), n in open_runs.items() if n > 0 and turn in stops]
 
 
 def check_seq(events: Sequence[dict[str, Any]], items: Sequence[Item]) -> Check:

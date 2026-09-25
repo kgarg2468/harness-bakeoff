@@ -210,6 +210,10 @@ def test_measure_real_repo() -> None:
     assert ours["total"]["code"] == ours["original"]["code"] + sum(
         c["code"] for c in ours["ported"].values()
     )
-    assert ours["imports_outside"] == [] and report["shared"]["imports_outside"] == []
+    assert ours["imports_outside"] == []
+    # shared/scenario.py, the scenario driver, uses the fake provider and the loop registry;
+    # nothing in shared/ imports a loop's code.
+    outside = {name.split(".")[1] for name in report["shared"]["imports_outside"]}
+    assert outside <= {"fakeprov", "loops"}, report["shared"]["imports_outside"]
     table = loc.table(report)
     assert "our_version" in table and "shared (baseline)" in table and "ported from" in table

@@ -312,6 +312,49 @@ def test_a_tool_started_after_turn_end_counts_as_a_run():
     assert (check.info["missing"], check.info["late_runs"]) == (["c1"], ["c1"])
 
 
+def turn_events(turn, *types, stop="end_turn", resume=None):
+    """Events of one turn: turn.start, then `types` (tool events are about c1), then turn.end."""
+    start = {"turn_id": turn} | ({"resume": resume} if resume else {})
+    return [
+        {"turn": turn, "type": "turn.start", "data": start},
+        *({"turn": turn, "type": t, "data": {"call_id": "c1", "name": "x"}} for t in types),
+        {"turn": turn, "type": "turn.end", "data": {"stop": stop, "steps": 1}},
+    ]
+
+
+def test_a_run_must_end_before_its_turn_ends():
+    done = turn_events("t.0", "tool.start", "tool.end")
+    assert check_tool_results(items(USER, CALL, RESULT), done, []).ok
+    # The tool.end came after turn.end (it is in the turn row's `late`), or never.
+    running = turn_events("t.0", "tool.start")
+    check = check_tool_results(items(USER, CALL, RESULT), running, [])
+    assert not check.ok and check.info["unfinished"] == ["c1"]
+    assert check.detail == "unfinished: ['c1']"
+    # A turn without turn.end died with its process: nothing ran on after it.
+    crashed = running[:-1]
+    assert check_tool_results(items(USER, CALL, RESULT), crashed, []).ok
+
+
+@pytest.mark.parametrize(
+    ("stop", "resume", "ok"),
+    [
+        ("end_turn", None, False),  # e.g. a loop that invents results instead of running tools
+        ("paused", None, False),
+        ("end_turn", {"kind": "approval", "decisions": {"c1": "deny"}}, True),
+        ("end_turn", {"kind": "approval", "decisions": {"c1": "allow"}}, False),
+        ("cancelled", None, True),  # cut short by the cancel
+        ("max_steps", None, True),  # the last step's calls never run
+        ("budget", None, True),
+        ("error", None, True),
+    ],
+)
+def test_a_result_needs_a_run_unless_denied_or_cut_short(stop, resume, ok):
+    events = turn_events("t.0", stop=stop, resume=resume)
+    check = check_tool_results(items(USER, CALL, RESULT), events, [])
+    assert check.ok is ok
+    assert check.info["unrun_results"] == ([] if ok else ["c1"])
+
+
 # I3
 
 
