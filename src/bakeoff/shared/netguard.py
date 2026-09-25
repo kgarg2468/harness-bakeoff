@@ -1,6 +1,7 @@
 """Loopback-only network guard (invariant I6).
 
-`install()` patches socket connects so any connection to a non-loopback address raises.
+`install()` patches socket connects and datagram sends so any traffic to a non-loopback
+address raises.
 Tests install it for the whole session; the CLI installs it unless `--live` is given.
 """
 
@@ -38,6 +39,8 @@ def install(allow_hosts: tuple[str, ...] = ()) -> None:
     _installed = True
     real_connect = socket.socket.connect
     real_connect_ex = socket.socket.connect_ex
+    real_sendto = socket.socket.sendto
+    real_sendmsg = socket.socket.sendmsg
 
     def connect(self: socket.socket, address: object) -> None:
         if not _is_allowed(address):
@@ -49,5 +52,19 @@ def install(allow_hosts: tuple[str, ...] = ()) -> None:
             raise NetworkBlocked(f"non-loopback connection blocked: {address!r}")
         return real_connect_ex(self, address)  # type: ignore[arg-type]
 
+    def sendto(self: socket.socket, data: bytes, *args: object) -> int:
+        # sendto(data, address) or sendto(data, flags, address)
+        if args and not _is_allowed(args[-1]):
+            raise NetworkBlocked(f"non-loopback datagram blocked: {args[-1]!r}")
+        return real_sendto(self, data, *args)  # type: ignore[arg-type]
+
+    def sendmsg(self: socket.socket, buffers: object, *args: object) -> int:
+        # sendmsg(buffers[, ancdata[, flags[, address]]])
+        if len(args) >= 3 and args[2] is not None and not _is_allowed(args[2]):
+            raise NetworkBlocked(f"non-loopback datagram blocked: {args[2]!r}")
+        return real_sendmsg(self, buffers, *args)  # type: ignore[arg-type]
+
     socket.socket.connect = connect  # type: ignore[method-assign]
     socket.socket.connect_ex = connect_ex  # type: ignore[method-assign]
+    socket.socket.sendto = sendto  # type: ignore[method-assign]
+    socket.socket.sendmsg = sendmsg  # type: ignore[method-assign]

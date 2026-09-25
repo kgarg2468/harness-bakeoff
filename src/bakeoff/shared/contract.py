@@ -25,7 +25,9 @@ Rules every Loop must follow (tests enforce them, see DESIGN.md):
    A crash resume has no decisions, so pending calls go through `check()` again.
 6. When `cancel` is set, stop within 200 ms, leave no orphan tool calls, and
    end with `turn.end` stop="cancelled".
-7. The last event of every turn is `turn.end`.
+7. The last event a loop emits in every turn is `turn.end`. After it, the runner
+   may add exactly one `commit` event (completed turns only), so consumers treat
+   `commit` as "turn fully done" and `turn.end` as "the loop is done".
 8. If history contains a compaction item (`Item.compaction`), a request carries
    only the system prompt plus the last compaction item and everything after it.
 """

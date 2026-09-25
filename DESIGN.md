@@ -59,7 +59,8 @@ cancel `asyncio.Event`. It yields `Event`s. The shared runner:
    the sink (CLI printer, ndjson mirror, tests);
 4. on `turn.end` with stop `end_turn`, `max_steps`, `budget`, `cancelled` or `error`, commits the
    working copy (`git add -A && git commit --allow-empty`), stores the sha on the turn row and
-   emits `commit`. A `paused` turn is not committed until the resumed turn finishes.
+   emits `commit` (always the final event of a completed turn, right after the loop's
+   `turn.end`). A `paused` turn is not committed until the resumed turn finishes.
 
 `ToolHost` is built by the runner with an `emit` callback, so `tool.start` and `tool.end` are
 timed identically for every loop.

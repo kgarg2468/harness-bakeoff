@@ -24,3 +24,28 @@ def test_loopback_is_allowed():
     finally:
         client.close()
         server.close()
+
+
+def test_external_datagram_is_blocked():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        with pytest.raises(NetworkBlocked):
+            s.sendto(b"x", ("1.1.1.1", 53))
+        with pytest.raises(NetworkBlocked):
+            s.sendto(b"x", 0, ("1.1.1.1", 53))
+        with pytest.raises(NetworkBlocked):
+            s.sendmsg([b"x"], [], 0, ("1.1.1.1", 53))
+    finally:
+        s.close()
+
+
+def test_loopback_datagram_is_allowed():
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.bind(("127.0.0.1", 0))
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sender.sendto(b"ping", receiver.getsockname())
+        assert receiver.recv(16) == b"ping"
+    finally:
+        sender.close()
+        receiver.close()
