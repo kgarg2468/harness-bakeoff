@@ -135,22 +135,28 @@ def classify(
 
 
 def retry_after(headers: httpx.Headers) -> float | None:
-    """Seconds the server asked us to wait (`retry-after-ms`, or `retry-after` seconds/date)."""
-    if (ms := headers.get("retry-after-ms")) is not None:
-        try:
-            return float(ms) / 1000
-        except ValueError:
-            pass
+    """Seconds the server asked us to wait (`retry-after-ms`, or `retry-after` seconds/date).
+
+    None when absent or not a finite, non-negative delay (NaN, inf, -1): then we back off.
+    """
+    if (ms := _delay(headers.get("retry-after-ms"))) is not None:
+        return ms / 1000
     if (value := headers.get("retry-after")) is None:
         return None
-    try:
-        return float(value)
-    except ValueError:
-        pass
+    if (seconds := _delay(value)) is not None:
+        return seconds
     try:
         return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
     except (TypeError, ValueError):
         return None
+
+
+def _delay(value: str | None) -> float | None:
+    try:
+        delay = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return delay if 0 <= delay < math.inf else None
 
 
 def backoff(retry_index: int) -> float:

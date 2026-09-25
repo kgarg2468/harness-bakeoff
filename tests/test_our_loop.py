@@ -418,7 +418,7 @@ async def test_approval_pauses_and_resumes_in_a_fresh_loop() -> None:
     second = Server(reply("Saved."))
     resumed = await run(second.loop(), history, tools, resume=Resume("approval", {"c1": "allow"}))
     assert tools.run_counts == {"c0": 1, "c1": 1}
-    assert resumed[-1].data == {"stop": "end_turn", "steps": 1}
+    assert resumed[-1].data == {"stop": "end_turn", "steps": 2}  # steps count the paused run too
     assert items(resumed)[0].message == {
         "role": "tool",
         "tool_call_id": "c1",
@@ -475,7 +475,7 @@ async def test_crash_resume_runs_only_missing_calls() -> None:
 
     asking = StubTools(rules={"write_file": "ask"})
     again = await run(Server().loop(), crashed_history(), asking, resume=Resume("crash"))
-    assert again[-1].data == {"stop": "paused", "steps": 0, "pending": ["c1"]}
+    assert again[-1].data == {"stop": "paused", "steps": 1, "pending": ["c1"]}
     assert asking.run_counts == {}
 
     finished = [user("hi"), Item("a1", "t1", {"role": "assistant", "content": "hello"})]
@@ -566,6 +566,19 @@ async def test_429_waits_for_retry_after() -> None:
     assert "Rate limit exceeded" in retry["reason"]
     assert [e["attempt"] for e in of(events, "request.start")] == [1, 2]
     assert events[-1].data["stop"] == "end_turn"
+
+
+async def test_malformed_retry_after_falls_back_to_backoff() -> None:
+    waits: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    limited = httpx.Response(429, headers={"retry-after": "NaN"}, json={"error": {"message": "x"}})
+    server = Server(limited, reply("ok"))
+    events = await run(server.loop(sleep=sleep), [user("hi")], StubTools())
+    assert len(waits) == 1 and 0.375 <= waits[0] <= 0.5  # backoff(0), not NaN
+    assert of(events, "error") == [] and events[-1].data["stop"] == "end_turn"
 
 
 async def test_mid_stream_error_is_retried_with_backoff() -> None:
@@ -788,6 +801,86 @@ async def test_budget_stops_before_the_next_request() -> None:
     server = Server(sse(call(0, "{}", "c0", "describe_component"), finish("tool_calls", usage)))
     events = await run(server.loop(), [user("go")], StubTools(), limits=Limits(max_cost_usd=0.001))
     assert len(server.bodies) == 1 and events[-1].data == {"stop": "budget", "steps": 1}
+
+
+async def test_unknown_cost_stops_a_budgeted_turn() -> None:
+    no_cost = {"prompt_tokens": 10, "completion_tokens": 5}  # BYOK: tokens, but no cost
+    server = Server(sse(call(0, "{}", "c0", "describe_component"), finish("tool_calls", no_cost)))
+    events = await run(server.loop(), [user("go")], StubTools(), limits=Limits(max_cost_usd=1.0))
+    assert of(events, "error") == [
+        {
+            "kind": "budget_unenforceable",
+            "message": "max_cost_usd is set but the endpoint reports no cost",
+            "retryable": False,
+        }
+    ]
+    assert len(server.bodies) == 1 and events[-1].data == {"stop": "budget", "steps": 1}
+    answer = Server(sse(delta(content="hi"), finish("stop", no_cost)))  # no further request due
+    events = await run(answer.loop(), [user("go")], StubTools(), limits=Limits(max_cost_usd=1.0))
+    assert of(events, "error") == [] and events[-1].data["stop"] == "end_turn"
+
+
+def spent_history() -> list[Item]:
+    """An older turn, then a turn that spent 1 step and $0.5 before its worker crashed."""
+    tc = {
+        "id": "c0",
+        "type": "function",
+        "function": {"name": "describe_component", "arguments": "{}"},
+    }
+    usage = {"step": 1, "cost_usd": 0.5, "cost_source": "provider"}
+    return [
+        user("old"),
+        Item("a0", "t0", {"role": "assistant", "content": "old answer"}, usage=usage),
+        user("go"),
+        Item("a1", "t1", {"role": "assistant", "content": None, "tool_calls": [tc]}, usage=usage),
+        Item("r1", "t1", {"role": "tool", "tool_call_id": "c0", "content": "ok"}),
+    ]
+
+
+async def test_resume_counts_the_steps_and_cost_already_spent() -> None:
+    crash = Resume("crash")
+    server = Server()  # any request would fail: the limits must stop the turn first
+    events = await run(server.loop(), spent_history(), StubTools(), resume=crash, limits=Limits(1))
+    assert events[-1].data == {"stop": "max_steps", "steps": 1} and server.bodies == []
+    budget = Limits(max_cost_usd=0.5)
+    events = await run(server.loop(), spent_history(), StubTools(), resume=crash, limits=budget)
+    assert events[-1].data == {"stop": "budget", "steps": 1} and server.bodies == []
+    server = Server(reply("done"))  # the older turn's step and cost do not count
+    events = await run(server.loop(), spent_history(), StubTools(), resume=crash, limits=Limits(2))
+    assert of(events, "request.start") == [{"step": 2, "attempt": 1}]
+    assert events[-1].data == {"stop": "end_turn", "steps": 2}
+
+
+async def test_truncated_output_is_kept_but_never_run() -> None:
+    tools = StubTools(delays={"describe_component": 1})
+    server = Server(
+        sse(
+            delta(content="Writing it."),
+            call(0, '{"name": "a"}', "c0", "describe_component"),  # complete: started early
+            call(1, '{"path": "a.pipe", "content": "{\\"comp', "c1", "write_file"),
+            finish("length", {"completion_tokens": 4096, "cost": 0.01}),
+            "data: [DONE]",
+        )
+    )
+    events = await run(server.loop(), [user("go")], tools)
+    (item,) = items(events)
+    assert item.status == "incomplete" and item.usage is not None
+    assert item.message == {"role": "assistant", "content": "Writing it."}  # no tool_calls
+    assert item.usage["cost_usd"] == 0.01 and of(events, "usage")[0]["cost_usd"] == 0.01
+    assert of(events, "error") == [
+        {
+            "kind": "output_truncated",
+            "message": "Output truncated at max_tokens=4096",
+            "retryable": False,
+        }
+    ]
+    assert events[-1].data == {
+        "stop": "error",
+        "steps": 1,
+        "error": "Output truncated at max_tokens=4096",
+    }
+    assert tools.run_counts["c1"] == 0 and "c0" not in tools.spans  # the early read was stopped
+    assert len(server.bodies) == 1
 
 
 async def test_compaction_item_resets_the_prefix() -> None:

@@ -154,6 +154,11 @@ def test_retry_after_forms_and_cap() -> None:
     in_30s = retry_after(httpx.Headers({"retry-after": formatdate(time() + 30, usegmt=True)}))
     assert in_30s is not None and 28 <= in_30s <= 30
     assert retry_after(httpx.Headers({"retry-after": "soon"})) is None
+    for bad in ("NaN", "inf", "-1"):  # not a finite, non-negative delay: back off instead
+        assert retry_after(httpx.Headers({"retry-after": bad})) is None
+        assert retry_after(httpx.Headers({"retry-after-ms": bad, "retry-after": "2"})) == 2.0
+    nan = classify("http", "HTTP 429: slow", 429, httpx.Headers({"retry-after": "NaN"}))
+    assert nan.retryable and nan.wait_s is None
     too_long = classify("http", "HTTP 429: wait", 429, httpx.Headers({"retry-after": "3600"}))
     assert not too_long.retryable and too_long.message.startswith(
         "Server requested 3600s retry delay"

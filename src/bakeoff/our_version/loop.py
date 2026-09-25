@@ -31,6 +31,11 @@ _MAX_THREADS = 64  # request caches kept for this many recently used threads
 _DRAIN_S = 0.05  # once the answer is complete, wait this long for the body's end (keep-alive)
 _EMPTY: dict[str, Any] = {}
 _NO_CHOICE = (_EMPTY,)
+_UNPRICED = "max_cost_usd is set but the endpoint reports no cost"
+
+
+def _role(item: Item) -> Any:
+    return item.message.get("role")
 
 
 class _Cancelled(Exception):
@@ -111,8 +116,16 @@ class _Turn:
         resume = turn.resume
         self.user = resume.decisions if resume else {}
         self.reason = (resume.reason if resume else None) or "no reason given"
-        self.steps = 0
-        self.cost = 0.0
+        # A resume continues the logical turn (all after the last user item), so the limits count
+        # the steps and cost it already spent.
+        history = turn.history
+        start = next(
+            (i + 1 for i in reversed(range(len(history))) if _role(history[i]) == "user"), 0
+        )
+        spent = [it.usage or {} for it in history[start:] if _role(it) == "assistant"]
+        self.steps = len(spent)
+        self.cost = sum(u.get("cost_usd") or 0.0 for u in spent)
+        self.unpriced = any(u.get("cost_source") == "none" for u in spent)
         self.ended = False
         self.jobs: dict[str, asyncio.Task[ToolResult]] = {}  # tool runs by call id
         self.tasks: set[asyncio.Task[Any]] = set()  # everything the cancel watcher must stop
@@ -136,6 +149,10 @@ class _Turn:
                     yield self._end("max_steps")
                 elif limits.max_cost_usd is not None and self.cost >= limits.max_cost_usd:
                     yield self._end("budget")
+                elif limits.max_cost_usd is not None and self.unpriced:
+                    # Budget policy: a response without a cost is never free; stop, don't guess.
+                    for event in self._abort("budget_unenforceable", _UNPRICED, stop="budget"):
+                        yield event
                 if self.ended:
                     break
                 self.steps += 1
@@ -199,11 +216,21 @@ class _Turn:
                     if self.cancel.is_set():
                         yield self._end("cancelled")
                         return
+                usage = {"step": self.steps, **usage_fields(stream.usage)}
+                self.cost += usage["cost_usd"]
+                self.unpriced |= usage["cost_source"] == "none"
+                if stream.finish == "length":  # cut off at max_tokens: keep the text, run no call
+                    await self._stop_jobs()
+                    cut = stream.partial() or {"role": "assistant", "content": None}
+                    yield self._item(cut, status="incomplete", usage=usage)
+                    yield Event("usage", usage)
+                    cut_at = f"Output truncated at max_tokens={self.model.max_tokens}"
+                    for event in self._abort("output_truncated", cut_at):
+                        yield event
+                    return
                 for call in stream.calls.values():
                     if not call.ready:
                         yield self._ready(call)
-                usage = {"step": self.steps, **usage_fields(stream.usage)}
-                self.cost += usage["cost_usd"]
                 yield self._item(stream.message(), usage=usage)
                 yield Event("usage", usage)
                 if calls := stream.tool_calls():
@@ -213,8 +240,8 @@ class _Turn:
                     yield self._end("end_turn")
         except Exception as exc:  # a bug must still end the turn (contract rule 7)
             await self._stop_jobs()
-            yield Event("error", {"kind": "internal", "message": repr(exc), "retryable": False})
-            yield self._end("error", error=repr(exc))
+            for event in self._abort("internal", repr(exc)):
+                yield event
         finally:
             watcher.cancel()
             for task in list(self.tasks):
@@ -270,8 +297,7 @@ class _Turn:
         # Once a tool has started, a retry could replay its call id: fail instead.
         if self.jobs or not err.retryable or attempt > self.model.max_retries:
             await self._stop_jobs()
-            error = {"kind": err.kind, "message": err.message, "retryable": err.retryable}
-            return [Event("error", error), self._end("error", error=err.message)], 0.0
+            return self._abort(err.kind, err.message, retryable=err.retryable), 0.0
         wait = backoff(attempt - 1) if err.wait_s is None else err.wait_s
         retry = {
             "attempt": attempt,
@@ -391,6 +417,14 @@ class _Turn:
         return self._item(
             {"role": "tool", "tool_call_id": result.call_id, "content": result.content}
         )
+
+    def _abort(
+        self, kind: str, message: str, *, stop: str = "error", retryable: bool = False
+    ) -> list[Event]:
+        """An `error` event, then the turn's end."""
+        error = {"kind": kind, "message": message, "retryable": retryable}
+        end = self._end(stop, error=message) if stop == "error" else self._end(stop)
+        return [Event("error", error), end]
 
     def _end(self, stop: str, **extra: Any) -> Event:
         self.ended = True

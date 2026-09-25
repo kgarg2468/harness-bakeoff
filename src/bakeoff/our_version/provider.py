@@ -143,7 +143,7 @@ class Stream:
         return msg
 
     def partial(self) -> dict[str, Any] | None:
-        """What a cancelled stream produced, without tool calls; None if nothing."""
+        """What a cut-short stream (cancel, truncation) produced, without tool calls; None if nothing."""
         if not (self.text or self.details):
             return None
         msg = self.message()
