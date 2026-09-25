@@ -516,7 +516,7 @@ class _TurnWalk:
         self.stats: dict[str, int] = replay["stats"]
         self.req: dict | None = None  # the model request being streamed
         self.by_step: dict[Any, dict] = {}  # step -> its latest request (usage arrives late)
-        self.started: dict[str, dict] = {}  # call id -> a tool run without its tool.end yet
+        self.runs: dict[str, dict] = {}  # call id -> its one tool segment (see `_run`)
         self.tools: list[dict] = []
         self.usage = {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "cost_usd": 0.0}
         self.ended, self.stop = False, None
@@ -530,8 +530,13 @@ class _TurnWalk:
                 handler(_ms(event.get("t_us")), event.get("data") or {}, is_late)
         last = max([_ms(e.get("t_us")) for e, _ in stream] + [0.0])
         self.close(last, "open" if self.ended else "killed")
-        for seg in self.started.values():  # a tool that never ended: its process died
-            self.tools.append({**seg, "t1": last, "ok": None})
+        for seg in self.runs.values():
+            starts, ends = seg.pop("starts"), seg.pop("ends")
+            if ends < starts:  # a run that never ended: its process died
+                seg["t1"], seg["ok"] = last, None
+            if starts > 1:  # the same call ran again (I2 fails): the row says so
+                seg["starts"] = starts
+            self.tools.append(seg)
         rows = _stack(self.tools)
         self.lanes["tools"].extend(sorted(self.tools, key=lambda s: (s["t0"], s["row"])))
         return {"ended": self.ended, "stop": self.stop, "rows": rows}
@@ -594,27 +599,43 @@ class _TurnWalk:
         if item.get("compaction"):
             self.lanes["git"].append({"turn": self.ti, "t": t, "kind": "compact"})
 
-    def on_tool_start(self, t: float, data: dict, is_late: bool) -> None:
+    def _run(self, t: float, data: dict, is_late: bool) -> dict:
+        """The one segment of this call in this turn, stretched to cover `t`.
+
+        Paired by call id, not by stored order: after turn.end a tool's events go to the turn
+        row's `late` list, where its tool.end can come before its tool.start. The segment spans
+        all of the call's events; `late` marks one that was not done by the loop's turn.end."""
         call = data.get("call_id")
+        seg = self.runs.get(call)
+        if seg is None:
+            seg = self.runs[call] = {"turn": self.ti, "t0": t, "t1": t, "name": data.get("name"),
+                                     "call": call, "eager": False, "late": False, "ok": None,
+                                     "starts": 0, "ends": 0}  # fmt: skip
+        seg["t0"], seg["t1"] = min(seg["t0"], t), max(seg["t1"], t)
+        seg["name"] = seg["name"] or data.get("name")
+        seg["late"] = seg["late"] or is_late
+        return seg
+
+    def on_tool_start(self, t: float, data: dict, is_late: bool) -> None:
         self.stats["tool_runs"] += 1
-        # Eager: a read-only tool started while the model still streams the message that holds
-        # its call. A call saved in an earlier turn (it runs after an approval or a crash
-        # resume) or started after the stream ended is not eager, whatever its turn.
-        eager = (
-            not is_late
-            and self.req is not None
-            and bool(data.get("read_only"))
-            and call not in self.calls.saved
-        )
-        self.stats["eager"] += eager
-        self.started[call] = {"turn": self.ti, "t0": t, "t1": t, "name": data.get("name"),
-                              "call": call, "eager": eager, "late": is_late}  # fmt: skip
+        seg = self._run(t, data, is_late)
+        if not seg["starts"]:  # a call's first start decides whether it was eager
+            # Eager: a read-only tool started while the model still streams the message that
+            # holds its call. A call saved in an earlier turn (it runs after an approval or a
+            # crash resume) or started after the stream ended is not eager, whatever its turn.
+            seg["eager"] = (
+                not is_late
+                and self.req is not None
+                and bool(data.get("read_only"))
+                and seg["call"] not in self.calls.saved
+            )
+            self.stats["eager"] += seg["eager"]
+        seg["starts"] += 1
 
     def on_tool_end(self, t: float, data: dict, is_late: bool) -> None:
-        call = data.get("call_id")
-        seg = self.started.pop(call, None) or {"turn": self.ti, "t0": t, "call": call}
-        seg.setdefault("name", data.get("name"))
-        self.tools.append({**seg, "t1": t, "ok": bool(data.get("ok"))})
+        seg = self._run(t, data, is_late)
+        seg["ends"] += 1
+        seg["ok"] = bool(data.get("ok"))
 
     def on_permission_asked(self, t: float, data: dict, is_late: bool) -> None:
         call, name = data.get("call_id"), data.get("name")

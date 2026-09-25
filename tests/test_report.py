@@ -437,6 +437,37 @@ def test_parallel_tools_are_stacked_on_separate_rows() -> None:
     assert replay["turns"][0]["rows"] == 2
 
 
+def test_each_call_is_one_tool_run_whatever_the_order_of_its_events() -> None:
+    """After turn.end, c1's tool.end was stored before its tool.start (late events): one row, from
+    its first to its last event, finished and marked late. c2 started twice and ended once: one
+    row that never finished and says it started twice."""
+    t = "T.0"
+    assistant = {"role": "assistant", "content": None,
+                 "tool_calls": [call("c1", "read_file"), call("c2", "read_file")]}  # fmt: skip
+    events = [
+        env("T", t, 1, 0, "turn.start", turn_id=t),
+        env("T", t, 2, 100, "request.start", step=1, attempt=1),
+        env("T", t, 3, 200, "item", **item(t, "a1", assistant)),
+        env("T", t, 4, 300, "tool.start", call_id="c2", name="read_file", read_only=True),
+        env("T", t, 5, 400, "tool.end", call_id="c2", name="read_file", ok=True),
+        env("T", t, 6, 450, "tool.start", call_id="c2", name="read_file", read_only=True),
+        env("T", t, 7, 540, "turn.end", stop="cancelled", steps=1),
+    ]
+    late = [
+        {"t_us": 610, "type": "tool.end", "data": {"call_id": "c1", "name": "read_file", "ok": True}},
+        {"t_us": 560, "type": "tool.start", "data": {"call_id": "c1", "name": "read_file"}},
+    ]  # fmt: skip
+    turns = [{"id": t, "thread": "T", "idx": 0, "kind": "user", "status": "cancelled",
+              "stop": "cancelled", "late": late}]  # fmt: skip
+    replay = data.build_replay(events, turns)
+    runs = {s["call"]: s for s in replay["lanes"]["tools"]}
+    assert len(replay["lanes"]["tools"]) == 2 and replay["turns"][0]["rows"] == 2
+    c1, c2 = runs["c1"], runs["c2"]
+    assert (c1["t0"], c1["t1"], c1["ok"], c1["late"]) == (0.56, 0.61, True, True)
+    assert "starts" not in c1
+    assert (c2["t0"], c2["t1"], c2["ok"], c2["late"], c2["starts"]) == (0.3, 0.61, None, False, 2)
+
+
 def test_registry_skips_loops_that_are_missing_or_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(data, "REGISTRY", (
         data.LoopInfo("our", "bakeoff.our_version:OurLoop", "B", "our loop", "teal"),
