@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from dataclasses import asdict
 from datetime import UTC, datetime
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -247,6 +249,7 @@ def out(tmp_path: Path) -> Path:
                       "cost_source": "none"}, "duration_ms": seconds * 1000, "passed": True,
             "error": None,
         })  # fmt: skip
+        write_thread(out / "live" / "L1" / impl, impl, model="gpt-test")
     return out
 
 
@@ -574,13 +577,11 @@ def test_timings_need_a_clear_margin_and_live_runs_more_than_one_sample(out: Pat
     }  # fmt: skip
     metrics["deps"]["our_version"]["import_ms"] = 800.0  # within 10% of A's 850
     write_json(out / "metrics.json", metrics)
-    live = json.loads((out / "live" / "L1" / "our" / "result.json").read_text())
     for impl in ("our", "pydantic"):  # same step count in every run: per-step values compare
         path = out / "live" / "L1" / impl / "result.json"
         write_json(path, {**json.loads(path.read_text()), "steps": 2})
     for impl, seconds in (("our", 2.6), ("pydantic", 3.3)):  # a second sample
-        write_json(out / "live" / "L2" / impl / "result.json",
-                   {**live, "run_id": "L2", "impl": impl, "steps": 2, "duration_ms": seconds * 1000})  # fmt: skip
+        add_live(out, "L2", impl, steps=2, duration_ms=seconds * 1000)
     html = make(out)
     assert "Adds less time on top of the model" not in html
     assert "the median and the slow tail do not both differ by 10%" in html
@@ -596,29 +597,22 @@ def test_timings_need_a_clear_margin_and_live_runs_more_than_one_sample(out: Pat
 def test_a_live_run_a_loop_did_not_finish_is_not_a_sample(out: Path) -> None:
     """A loop that failed at once (stop error, 0 tokens, 40 ms) must not look fast and cheap:
     that run is left out of the medians."""
-    live = json.loads((out / "live" / "L1" / "our" / "result.json").read_text())
     for impl, seconds in (("our", 2.6), ("pydantic", 3.3)):  # a second, finished sample
-        write_json(out / "live" / "L2" / impl / "result.json",
-                   {**live, "run_id": "L2", "impl": impl, "duration_ms": seconds * 1000})  # fmt: skip
-    write_json(out / "live" / "L3" / "our" / "result.json", {**live, "run_id": "L3", "impl": "our"})
-    write_json(out / "live" / "L3" / "pydantic" / "result.json",
-               {**live, "run_id": "L3", "impl": "pydantic", "stops": ["error"], "error": None,
-                "duration_ms": 40.0, "usage": {"input_tokens": 0}})  # fmt: skip
+        add_live(out, "L2", impl, duration_ms=seconds * 1000)
+    add_live(out, "L3", "our")
+    add_live(out, "L3", "pydantic", stops=["error"], error=None, duration_ms=40.0,
+             usage={"input_tokens": 0})  # fmt: skip
     html = make(out)
     assert "over 2 live runs" in html and "over 3 live runs" not in html
 
 
 def test_a_live_run_that_did_not_pass_is_not_a_sample(out: Path) -> None:
     """A run can end with end_turn and still fail (an invariant broke): it is not an answer."""
-    live = json.loads((out / "live" / "L1" / "our" / "result.json").read_text())
     for impl, seconds in (("our", 2.6), ("pydantic", 3.3)):  # a second, passed sample
-        write_json(out / "live" / "L2" / impl / "result.json",
-                   {**live, "run_id": "L2", "impl": impl, "duration_ms": seconds * 1000})  # fmt: skip
-    write_json(out / "live" / "L3" / "our" / "result.json",
-               {**live, "run_id": "L3", "impl": "our", "passed": False, "duration_ms": 40.0,
-                "invariants": {"I5": {"ok": False, "detail": "wrote to stderr"}}})  # fmt: skip
-    write_json(out / "live" / "L3" / "pydantic" / "result.json",
-               {**live, "run_id": "L3", "impl": "pydantic"})  # fmt: skip
+        add_live(out, "L2", impl, duration_ms=seconds * 1000)
+    add_live(out, "L3", "our", passed=False, duration_ms=40.0,
+             invariants={"I5": {"ok": False, "detail": "wrote to stderr"}})  # fmt: skip
+    add_live(out, "L3", "pydantic")
     html = make(out)
     assert "over 2 live runs" in html and "over 3 live runs" not in html
 
@@ -638,14 +632,27 @@ def write_live(
         "usage": {"input_tokens": 100}, "duration_ms": seconds * 1000, "passed": True,
         "error": None, "thread": f"live-{impl}", **extra,
     })  # fmt: skip
-    config = asdict(
-        ModelConfig(base_url, model, kind="openai_compat", reasoning={"effort": reasoning},
-                    max_tokens=max_tokens)
-    )  # fmt: skip
-    del config["api_key"]
+    write_thread(folder, impl, system=system, model=model, reasoning={"effort": reasoning},
+                 max_tokens=max_tokens)  # fmt: skip
+
+
+def write_thread(folder: Path, impl: str, *, system: str = "sys", **config: Any) -> None:
+    """A live run's session log: its thread row with the system prompt and the model config
+    (minus the key), as `bakeoff live` saves them."""
+    base = {"base_url": "https://api.openai.com/v1", "model": "gpt-test", "kind": "openai_compat"}
+    model = asdict(ModelConfig(**{**base, **config}))
+    del model["api_key"]
     log = SessionLog(folder / "log.sqlite")
-    log.create_thread(f"live-{impl}", impl=impl, system=system, meta={"rules": {}, "model": config})
+    log.create_thread(f"live-{impl}", impl=impl, system=system, meta={"rules": {}, "model": model})
     log.close()
+
+
+def add_live(out: Path, run_id: str, impl: str, **changes: Any) -> None:
+    """Another live run like the fixture's L1: its result.json with `changes`, and its log."""
+    l1 = out / "live" / "L1" / impl
+    result = {**json.loads((l1 / "result.json").read_text()), "run_id": run_id, **changes}
+    write_json(out / "live" / run_id / impl / "result.json", result)
+    shutil.copyfile(l1 / "log.sqlite", out / "live" / run_id / impl / "log.sqlite")
 
 
 def test_live_medians_pool_only_runs_of_one_prompt(out: Path, tmp_path: Path) -> None:
@@ -740,6 +747,28 @@ def test_live_section_says_which_runs_the_medians_leave_out(out: Path, tmp_path:
     for run_id in ("L1", "L2"):
         assert f"live run {run_id} · {setup}prompt" in text
     assert "passedno" in text and "I5 failed: wrote to stderr" in text
+
+
+def test_a_live_run_without_a_readable_log_has_unknown_settings(out: Path, tmp_path: Path) -> None:
+    """Without its session log a loop's settings are unknown: the run is in no group, and the
+    page says that (not that the loops differed), with a data note naming the file."""
+    live = tmp_path / "live"
+    for run_id in ("L1", "L2", "L3", "L4"):
+        write_live(live, run_id, "our", 2.0)
+        write_live(live, run_id, "pydantic", 3.0)
+    (live / "L3" / "pydantic" / "log.sqlite").unlink()
+    (live / "L4" / "our" / "log.sqlite").write_bytes(b"not a database")
+    text = unescape(re.sub(r"<[^>]+>", "", make(out, live=live)))
+    assert "over 2 live runs of one prompt and setup" in text
+    for run_id, who in (("L3", "A"), ("L4", "B")):
+        assert (
+            f"live run {run_id} · model settings unknown (no readable session log for {who}): "
+            "not in the medians"
+        ) in text
+    assert "the loops ran different prompts or model settings" not in text
+    unknown = "the run's model settings are unknown, so it is not in the live medians"
+    assert f"live/L3/pydantic/log.sqlite: missing; {unknown}" in text
+    assert "live/L4/our/log.sqlite: unreadable (DatabaseError: file is not a database)" in text
 
 
 def test_live_medians_pool_only_runs_of_one_system_prompt(out: Path, tmp_path: Path) -> None:

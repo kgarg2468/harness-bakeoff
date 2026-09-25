@@ -776,50 +776,55 @@ def endpoint(base_url: str | None) -> str:
     return base_url.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0].rsplit("@", 1)[-1].lower()
 
 
-def _thread_setup(log: Path, thread: Any) -> tuple[dict[str, Any], str] | None:
+def _thread_setup(log: Path, thread: Any) -> tuple[dict[str, Any], str] | str:
     """The model config and the system prompt a live thread was created with (the runner keeps
-    the config, minus the key, in the thread row's meta), or None if the log cannot tell."""
+    the config, minus the key, in the thread row's meta), or why the log cannot tell."""
     if not log.exists():
-        return None
+        return "missing"
     try:
         with _private_log(log) as db:
             rows = {r["id"]: r for r in db.execute("SELECT id, system, meta FROM threads")}
         row = rows.get(thread) or (next(iter(rows.values())) if len(rows) == 1 else None)
-        model = json.loads(row["meta"])["model"] if row else None
-    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
-        return None
+        model = json.loads(row["meta"]).get("model") if row else None
+    except (OSError, sqlite3.Error, ValueError, AttributeError) as exc:
+        return f"unreadable ({type(exc).__name__}: {exc})"
+    if row is None:
+        return f"no thread {thread!r} in it"
     if not isinstance(model, dict) or not isinstance(row["system"], str):
-        return None
+        return "its thread has no model settings"
     return model, row["system"]
 
 
-def live_settings(idir: Path, result: dict[str, Any]) -> dict[str, Any]:
-    """What a live run's answer depends on besides the loop and the prompt: the model settings
-    and the system prompt from its session log (result.json has only the model and base_url),
-    with the base_url cut to its endpoint (the per-loop path on one server is still one
-    endpoint) and the system prompt to a hash (it changes with the harness code, so runs of
-    one user prompt can still differ in it). A setting nothing records is None, so such a run
-    pools only with runs that lack it too."""
-    model, system = _thread_setup(idir / "log.sqlite", result.get("thread")) or ({}, None)
-    base_url = model.get("base_url") or result.get("base_url")
+def live_settings(idir: Path, result: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """What a live run's answer depends on besides the loop and the prompt, or None and why its
+    session log cannot tell. That is the model settings and the system prompt from the log
+    (result.json has only the model and base_url), with the base_url cut to its endpoint (the
+    per-loop path on one server is still one endpoint) and the system prompt to a hash (it
+    changes with the harness code, so runs of one user prompt can still differ in it)."""
+    setup = _thread_setup(idir / "log.sqlite", result.get("thread"))
+    if isinstance(setup, str):
+        return None, setup
+    model, system = setup
     return {
-        "endpoint": endpoint(base_url),
+        "endpoint": endpoint(model.get("base_url") or result.get("base_url")),
         **{k: model.get(k, result.get(k)) for k in _LIVE_SETTINGS},
-        "system": None if system is None else hashlib.sha256(system.encode()).hexdigest()[:12],
-    }
+        "system": hashlib.sha256(system.encode()).hexdigest()[:12],
+    }, None
 
 
 def load_live(live_dir: Path | None) -> tuple[list[dict[str, Any]], list[str]]:
     """The newest live runs (`out/live/<run_id>/<impl>/result.json`), newest first.
 
     Each run's `group` names its prompt and model settings: runs compare (and pool into medians)
-    only within a group. It is None when the run's loops differ in either."""
+    only within a group. It is None when the run's loops differ in either, or when a loop's
+    settings are unknown (its session log cannot tell): `unknown` lists those loops, since
+    runs whose settings are unknown could differ in any of them."""
     if live_dir is None or not live_dir.is_dir():
         return [], []
     runs, problems = [], []
     folders = sorted(_subdirs(live_dir), key=lambda p: natural_key(p.name), reverse=True)
     for run in folders[:MAX_LIVE_RUNS]:
-        results, setups = {}, set()
+        results, setups, unknown = {}, set(), []
         for idir in sorted(_subdirs(run), key=lambda p: impl_order(p.name)):
             data, problem = read_json(idir / "result.json")
             if problem:
@@ -828,7 +833,13 @@ def load_live(live_dir: Path | None) -> tuple[list[dict[str, Any]], list[str]]:
                 slim = {k: data.get(k) for k in _LIVE_KEYS if k in data}
                 slim["prompt"] = clip(str(data.get("prompt") or ""), CARD_LIMIT)
                 slim["final_text"] = clip(str(data.get("final_text") or ""), LIVE_LIMIT)
-                slim["settings"] = live_settings(idir, data)
+                slim["settings"], why = live_settings(idir, data)
+                if why is not None:
+                    unknown.append(idir.name)
+                    problems.append(
+                        f"live/{run.name}/{idir.name}/log.sqlite: {why}; the run's model settings "
+                        "are unknown, so it is not in the live medians"
+                    )
                 results[idir.name] = slim
                 # The full prompt: two prompts may differ only after the clipped part.
                 setup = [str(data.get("prompt") or ""), slim["settings"]]
@@ -836,9 +847,12 @@ def load_live(live_dir: Path | None) -> tuple[list[dict[str, Any]], list[str]]:
         if results:
             prompt = next((r["prompt"] for r in results.values() if r["prompt"]), "")
             group = (
-                hashlib.sha256(setups.pop().encode()).hexdigest()[:16] if len(setups) == 1 else None
+                hashlib.sha256(setups.pop().encode()).hexdigest()[:16]
+                if len(setups) == 1 and not unknown
+                else None
             )
-            runs.append({"run_id": run.name, "prompt": prompt, "results": results, "group": group})
+            runs.append({"run_id": run.name, "prompt": prompt, "results": results, "group": group,
+                         "unknown": unknown})  # fmt: skip
     return runs, problems
 
 

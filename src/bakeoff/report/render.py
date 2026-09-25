@@ -1095,7 +1095,10 @@ def live(page: Page) -> str:
             )
         # Which runs the medians in section 6 pool: those of one prompt and model setup. The
         # number is the one the claims name, so a reader can tell two similar setups apart.
-        if not run.get("group"):
+        if unknown := run.get("unknown"):
+            who = ", ".join(loop_info(i).letter for i in unknown)
+            setup = f" · model settings unknown (no readable session log for {esc(who)}): not in the medians"
+        elif not run.get("group"):
             setup = " · the loops ran different prompts or model settings: not in the medians"
         else:
             setup = f" · setup {number[run['run_id']]}: {esc(_setup(_settings(run), varying))}"
