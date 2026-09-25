@@ -1,5 +1,5 @@
 {
- "what": "The chat-completions live runs behind the README: `bakeoff live --impl our,pydantic --model gpt-6-luna --reasoning none --max-steps 20` on api.openai.com, 2026-09-25. Copied field by field from out/live/<run_id>/<loop>/result.json, and kind, reasoning and validations from its session log (no keys, no request bodies); written by scripts/snapshot_live.py.",
+ "what": "The chat-completions live runs behind the README: `bakeoff live --impl our,pydantic --model gpt-6-luna --reasoning none --max-steps 20` on api.openai.com, 2026-09-25. Copied field by field from out/live/<run_id>/<loop>/result.json, and kind, reasoning and validations from its session log (no API key, headers or request bodies; key-shaped strings redacted); written by scripts/snapshot_live.py.",
  "runs": [
   {
    "run_id": "20260925-123828-e021",

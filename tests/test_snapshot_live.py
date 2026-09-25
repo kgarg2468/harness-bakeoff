@@ -17,7 +17,10 @@ KEY = "sk-test-never-in-a-snapshot"
 REPORT = {"ok": False, "errors": ["no source"], "warnings": []}
 
 
-def write_run(live: Path, run_id: str, impl: str, *, thread: str | None = None) -> None:
+def write_run(
+    live: Path, run_id: str, impl: str, *, thread: str | None = None, prompt: str = "Build it.",
+    final_text: str = "done",
+) -> None:  # fmt: skip
     """One loop's live run: result.json, and a session log with the thread's model config (key
     removed, as the runner saves it) and a turn that calls `validate_pipeline` twice."""
     folder = live / run_id / impl
@@ -45,7 +48,7 @@ def write_run(live: Path, run_id: str, impl: str, *, thread: str | None = None) 
     (folder / "result.json").write_text(json.dumps({
         "v": 1, "run_id": run_id, "impl": impl, "model": "gpt-test",
         "base_url": "https://api.openai.com/v1", "base_url_template": "https://api.openai.com/v1",
-        "max_steps": 20, "attended": False, "prompt": "Build it.", "final_text": "done",
+        "max_steps": 20, "attended": False, "prompt": prompt, "final_text": final_text,
         "stops": ["end_turn"], "steps": 4, "requests": 4,
         "usage": {"input_tokens": 400, "cached_tokens": 100, "output_tokens": 20},
         "latency": {"ttft_ms": 812.5, "total_ms": 3000.0}, "duration_ms": 3010.0,
@@ -97,3 +100,35 @@ def test_a_run_without_loop_results_fails_and_writes_nothing(tmp_path: Path) -> 
     done = snapshot(tmp_path, "R2")
     assert done.returncode == 1 and "no loop results" in done.stderr
     assert not (tmp_path / "snap.json").exists()
+
+
+def test_a_run_id_with_no_folder_fails_with_a_message_not_a_traceback(tmp_path: Path) -> None:
+    write_run(tmp_path / "live", "R1", "our")
+    done = snapshot(tmp_path, "R1", "NOPE")
+    assert done.returncode == 1 and "no loop results in" in done.stderr and "NOPE" in done.stderr
+    assert "Traceback" not in done.stderr
+    assert not (tmp_path / "snap.json").exists()
+
+
+def test_key_shaped_strings_a_prompt_or_answer_carries_are_redacted(tmp_path: Path) -> None:
+    pasted = "sk-proj-" + "A1b2C3d4" * 4
+    token = "ghp_" + "x" * 36
+    write_run(tmp_path / "live", "R1", "our", prompt=f"Use key {pasted} to build it.",
+              final_text=f"Saved {token}; see chat.pipe.")  # fmt: skip
+    done = snapshot(tmp_path, "R1")
+    assert done.returncode == 0, done.stderr
+    assert "redacted 2 key-shaped string(s)" in done.stderr
+    text = (tmp_path / "snap.json").read_text()
+    assert pasted not in text and token not in text
+    (row,) = json.loads(text)["runs"]
+    assert row["prompt"] == "Use key [redacted] to build it."
+    assert row["final_text"] == "Saved [redacted]; see chat.pipe."
+    assert row["validations"][0] == REPORT  # nothing else changes
+
+
+def test_a_snapshot_with_nothing_key_shaped_says_nothing_about_redaction(tmp_path: Path) -> None:
+    write_run(tmp_path / "live", "R1", "our", prompt="Keep the sk-short name.")
+    done = snapshot(tmp_path, "R1")
+    assert done.returncode == 0 and "redacted" not in done.stderr
+    (row,) = json.loads((tmp_path / "snap.json").read_text())["runs"]
+    assert row["prompt"] == "Keep the sk-short name."

@@ -1,20 +1,43 @@
-"""Write a shareable snapshot of `bakeoff live` runs: each loop's key fields, one row per loop.
+"""Write a snapshot of `bakeoff live` runs to commit or share: key fields, one row per loop.
 
     uv run python scripts/snapshot_live.py OUT.json RUN_ID... [--live-dir out/live] [--what TEXT]
 
 Rows are copied from `<live-dir>/<run_id>/<loop>/result.json`, plus what only the session log
 keeps: the thread's model settings (`kind`, `reasoning`) and what each `validate_pipeline` call
-returned. No key, header or request body is ever in either, so the snapshot holds none.
+returned. The harness never records the API key, headers or request bodies, so neither holds
+them. The prompt, the final answer and the validation results are copied as written, though:
+key-shaped strings in them are redacted (and counted on stderr), but read a snapshot before you
+share it, since anything else sensitive in a prompt stays in.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
+
+# Key-shaped strings (those the CI secrets check looks for, and any other `sk-` key).
+KEY_SHAPED = re.compile(
+    r"sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}"
+)
+REDACTED = "[redacted]"
+
+
+def redact(value: Any) -> tuple[Any, int]:
+    """`value` with every key-shaped string in it replaced, and how many were."""
+    if isinstance(value, str):
+        return KEY_SHAPED.subn(REDACTED, value)
+    if isinstance(value, list):
+        pairs = [redact(v) for v in value]
+        return [v for v, _ in pairs], sum(n for _, n in pairs)
+    if isinstance(value, dict):
+        pairs = {k: redact(v) for k, v in value.items()}
+        return {k: v for k, (v, _) in pairs.items()}, sum(n for _, n in pairs.values())
+    return value, 0
 
 
 def _from_log(log: Path, thread: str | None) -> tuple[dict[str, Any], list[Any]]:
@@ -91,18 +114,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--live-dir", type=Path, default=Path("out/live"))
     ap.add_argument("--what", default="Key fields of `bakeoff live` runs.")
     args = ap.parse_args(argv)
-    rows = []
+    rows, redacted = [], 0
     for run_id in args.run_ids:
         run_dir = args.live_dir / run_id
-        loops = sorted(p for p in run_dir.iterdir() if (p / "result.json").is_file())
+        loops = (
+            sorted(p for p in run_dir.iterdir() if (p / "result.json").is_file())
+            if run_dir.is_dir()
+            else []
+        )
         if not loops:
             print(f"no loop results in {run_dir}", file=sys.stderr)
             return 1
-        rows += [row(run_dir, d) for d in loops]
+        for loop_dir in loops:
+            clean, n = redact(row(run_dir, loop_dir))
+            rows.append(clean)
+            redacted += n
+    if redacted:
+        print(f"redacted {redacted} key-shaped string(s)", file=sys.stderr)
     what = (
         f"{args.what} Copied field by field from out/live/<run_id>/<loop>/result.json, and kind,"
-        " reasoning and validations from its session log (no keys, no request bodies);"
-        " written by scripts/snapshot_live.py."
+        " reasoning and validations from its session log (no API key, headers or request bodies;"
+        " key-shaped strings redacted); written by scripts/snapshot_live.py."
     )
     args.out.write_text(
         json.dumps({"what": what, "runs": rows}, indent=1, ensure_ascii=False) + "\n"

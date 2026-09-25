@@ -269,7 +269,7 @@ out/live/<run_id>/<loop>/result.json             a live run: model, prompt, fina
 out/live/latest -> <run_id>
 ```
 
-A run id is never reused. Wire recordings (scenario runs only) hold request bodies only, never headers. `out/` is not committed; the live-run figures above are kept in [`docs/results/`](docs/results/) (see [Where these numbers come from](#results-at-a-glance)), and `uv run python scripts/snapshot_live.py OUT.json RUN_ID...` writes the same snapshot for your own runs.
+A run id is never reused. Wire recordings (scenario runs only) hold request bodies only, never headers. `out/` is not committed; the live-run figures above are kept in [`docs/results/`](docs/results/) (see [Where these numbers come from](#results-at-a-glance)), and `uv run python scripts/snapshot_live.py OUT.json RUN_ID...` writes the same snapshot for your own runs. It copies the prompt and the final answer as written, with key-shaped strings redacted, so read it before you share it.
 
 </details>
 
