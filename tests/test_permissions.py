@@ -1,3 +1,5 @@
+import itertools
+
 import pytest
 
 from bakeoff.shared.permissions import asks, evaluate, match, validate_rules
@@ -104,11 +106,33 @@ def _probe_asks(rules: dict) -> bool:
         ({"*": "allow", "write_file": {"*.pipe": "ask", "*": "allow"}}, True),
         ({"*": "allow", "write_file": {"*": "allow", "*.pipe": "ask"}}, False),
         ({"*": {"**": "allow", "docs/*": "ask"}}, False),
+        # "" matches only a call without a path, so a call with one still falls through.
+        ({"*": {"": "allow"}}, True),
+        ({"*": {"": "deny"}}, True),
+        ({"*": {"": "allow", "*": "deny"}}, False),
     ],
 )
 def test_asks_whenever_some_call_evaluates_to_ask(rules, expected):
     assert _probe_asks(rules) is expected  # the table is what `evaluate` does ...
     assert asks(rules) is expected  # ... and asks() agrees
+
+
+def test_asks_never_misses_an_ask():
+    """Every rule set over a small pool (both rule shapes, "" and catch-all globs, any order):
+    whenever some call evaluates to "ask", asks() says so. A miss marks a run unattended that
+    will still pause."""
+    decisions = ["allow", "ask", "deny"]
+    globs = ["", "*", "*.pipe"]
+    mappings = [{}] + [
+        dict(zip(order, picked, strict=True))
+        for n in (1, 2)
+        for order in itertools.permutations(globs, n)
+        for picked in itertools.product(decisions, repeat=n)
+    ]
+    options = [None, *decisions, *mappings]  # None: the key is absent
+    for star, tool in itertools.product(options, repeat=2):
+        rules = {k: v for k, v in (("*", star), ("write_file", tool)) if v is not None}
+        assert asks(rules) or not _probe_asks(rules), rules
 
 
 def test_asks_errs_toward_asking():

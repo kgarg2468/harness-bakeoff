@@ -81,6 +81,8 @@ def _reachable(rule: Any, unmatched: set[str]) -> set[str]:
     found: set[str] = set()
     for pattern, decision in (rule or {}).items():
         found.add(decision)
-        if not pattern.strip("*"):  # "*" (or "**") matches every path: later globs never run
+        # "*" (or "**") matches every path, so later globs never run. "" is not one of them: it
+        # matches only a call without a path (evaluate reads None as "").
+        if pattern and not pattern.strip("*"):
             return found
     return found | unmatched
