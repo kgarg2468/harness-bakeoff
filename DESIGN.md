@@ -250,8 +250,9 @@ that fails any other way is a plain failure.
 
 ## Invariants (checked on every scenario)
 
-- **I1 append-only**: each request's `messages` are a prefix of the next request's (semantic
-  equality; byte equality reported separately). Resets only at a compaction item.
+- **I1 append-only**: each request's `messages` (Responses API: `instructions`, then the `input`
+  items) are a prefix of the next request's (semantic equality; byte equality reported
+  separately). Resets only at a compaction item.
 - **I2** every tool call gets exactly one result; no call id runs twice (`tool.start` count);
   every run ends before its turn's `turn.end` (no orphan tools); and every result comes from a
   run, unless the user denied the call or its turn stopped early (cancelled, max_steps, budget,

@@ -5,7 +5,7 @@ import pytest
 
 from bakeoff.shared.contract import Item
 from bakeoff.shared.invariants import (
-    _raw_messages,
+    _raw_elements,
     check_commits,
     check_prefix,
     check_seq,
@@ -257,10 +257,135 @@ def test_raw_messages_scanner_is_string_aware():
         + json.dumps(tricky).encode()
         + b' ], "stream": true}'
     )
-    elements = _raw_messages(raw)
+    elements = _raw_elements(raw, b'"messages"')
     assert elements == [b'{"role": "system", "content": "s"}', json.dumps(tricky).encode()]
     assert [json.loads(e) for e in elements] == json.loads(raw)["messages"]
-    assert _raw_messages(b'{"messages": []}') == []
+    assert _raw_elements(b'{"messages": []}', b'"messages"') == []
+
+
+def test_raw_scanner_reads_a_value_that_is_not_an_array():
+    raw = b'{"instructions" : "say \\"hi\\", {x}" , "input": "hello", "n": {"a": [1]}}'
+    assert _raw_elements(raw, b'"instructions"') == [b'"say \\"hi\\", {x}"']
+    assert _raw_elements(raw, b'"input"') == [b'"hello"']
+    assert _raw_elements(raw, b'"n"') == [b'{"a": [1]}']
+    assert _raw_elements(raw, b'"missing"') == []
+
+
+# I1 on Responses API bodies: `instructions`, then the `input` items.
+
+R_USER = {"role": "user", "content": "build a pipe"}
+R_REASONING = {
+    "id": "rs_1",
+    "type": "reasoning",
+    "summary": [{"type": "summary_text", "text": "plan"}],
+    "encrypted_content": "gAAAAB-opaque",
+}
+R_CALL = {
+    "id": "fc_1",
+    "type": "function_call",
+    "status": "completed",
+    "arguments": '{"path": "a.pipe"}',
+    "call_id": "c1",
+    "name": "read_file",
+}
+R_OUTPUT = {"type": "function_call_output", "call_id": "c1", "output": "{}"}
+R_ANSWER = {
+    "id": "msg_1",
+    "type": "message",
+    "status": "completed",
+    "role": "assistant",
+    "content": [{"type": "output_text", "annotations": [], "text": "done"}],
+    "phase": "final_answer",
+}
+
+
+def responses_body(*items, instructions="sys", **dumps_kwargs):
+    data = {"model": "m", "instructions": instructions, "input": list(items), "stream": True}
+    if instructions is None:
+        del data["instructions"]
+    return json.dumps(data, **dumps_kwargs).encode()
+
+
+def test_responses_prefix_holds_with_instructions_as_the_system_prompt():
+    bodies = [
+        responses_body(R_USER),
+        responses_body(R_USER, R_REASONING, R_CALL, R_OUTPUT),
+        responses_body(R_USER, R_REASONING, R_CALL, R_OUTPUT, R_ANSWER),
+    ]
+    check = check_prefix(bodies)
+    assert check.ok, check.detail
+    assert check.info["byte_prefix"]
+    assert check.info["apis"] == ["responses"]
+    # A string input is one user message.
+    hello = {"role": "user", "content": "hi"}
+    assert check_prefix([b'{"input": "hi"}', responses_body(hello, R_ANSWER, instructions=None)]).ok
+
+
+def test_responses_semantics_compare_text_not_representation():
+    as_parts = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "build a pipe"}],
+    }
+    respaced = {**R_CALL, "id": "other", "status": None, "arguments": '{"path":"a.pipe"}'}
+    first = responses_body(R_USER, R_REASONING, R_CALL)
+    check = check_prefix([first, responses_body(as_parts, R_REASONING, respaced, R_OUTPUT)])
+    assert check.ok, check.detail
+    assert check.info["byte_mismatches"] == [{"request": 1, "message": 1}]
+
+
+@pytest.mark.parametrize(
+    ("later", "changed"),
+    [
+        ((R_USER, {**R_REASONING, "encrypted_content": None}, R_CALL), "input item 1"),
+        ((R_USER, {**R_REASONING, "summary": []}, R_CALL), "input item 1"),
+        ((R_USER, R_CALL), "input item 1"),  # the reasoning item was dropped
+        ((R_USER, R_REASONING, {**R_CALL, "call_id": "c2"}), "input item 2"),
+        ((R_USER, R_REASONING, R_CALL, R_OUTPUT), None),
+    ],
+)
+def test_responses_prefix_violations(later, changed):
+    check = check_prefix([responses_body(R_USER, R_REASONING, R_CALL), responses_body(*later)])
+    assert check.ok is (changed is None), check.detail
+    if changed:
+        assert (
+            check.detail == f"request 1 does not extend request 0: {changed} changed or was dropped"
+        )
+
+
+def test_responses_instructions_are_part_of_the_prefix():
+    before = responses_body(R_USER)
+    check = check_prefix([before, responses_body(R_USER, R_ANSWER, instructions="other")])
+    assert (
+        check.detail == "request 1 does not extend request 0: instructions changed or was dropped"
+    )
+    # A system prompt moved from `instructions` into `input` is the same conversation, though
+    # not the same bytes.
+    moved = responses_body(
+        {"role": "system", "content": "sys"}, R_USER, R_ANSWER, instructions=None
+    )
+    check = check_prefix([before, moved])
+    assert check.ok, check.detail
+    assert not check.info["byte_prefix"]
+
+
+def test_responses_reset_at_a_compaction_summary():
+    before = responses_body(R_USER, R_REASONING, R_CALL, R_OUTPUT, R_ANSWER)
+    summary_parts = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": SUMMARY["content"]}],
+    }
+    after = responses_body(summary_parts, {"role": "user", "content": "next"})
+    check = check_prefix([before, after], COMPACTION, TURNS)
+    assert (check.ok, check.info["resets"]) == (True, [1]), check.detail
+    assert not check_prefix([before, after]).ok
+
+
+def test_a_chat_request_does_not_extend_a_responses_request():
+    check = check_prefix([responses_body(R_USER), encode(SYSTEM, USER, ANSWER)])
+    assert not check.ok
+    assert check.info["apis"] == ["chat", "responses"]
 
 
 # I2

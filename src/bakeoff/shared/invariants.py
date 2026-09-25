@@ -52,9 +52,11 @@ def load_wire(directory: Path) -> list[tuple[bytes, dict[str, Any]]]:
 def check_prefix(
     bodies: Sequence[bytes], items: Sequence[Item] = (), turns: Sequence[dict[str, Any]] = ()
 ) -> Check:
-    """I1: each request's `messages` are a prefix of the next request's.
+    """I1: each request's conversation is a prefix of the next request's.
 
-    `ok` is semantic equality; byte equality of the raw message elements is reported in
+    The conversation is a chat request's `messages`, or a Responses API request's
+    `instructions` (the system prompt, if sent there) followed by its `input` items.
+    `ok` is semantic equality; byte equality of the raw elements is reported in
     `info["byte_prefix"]`. A prefix may reset only at a new compaction summary, placed right
     after the unchanged system messages (contract rule 8). Only the compaction `items` of
     the runner's "compact" turns (`turns`, as `SessionLog.turns` returns them) count as
@@ -63,18 +65,20 @@ def check_prefix(
     starts from, never back to an older one, and two compactions may share a summary text.
     """
     compact_turns = {t["id"] for t in turns if t["kind"] == "compact"}
-    summaries = [
-        _semantic(item.message)
-        for item in items
-        if item.compaction and item.turn_id in compact_turns
+    summary_messages = [
+        item.message for item in items if item.compaction and item.turn_id in compact_turns
     ]
-    requests: list[tuple[list[dict[str, Any]], list[bytes]]] = []
+    # A summary is a user message: in the Responses API the same shape is an input message.
+    summaries = {
+        "chat": [_semantic(m) for m in summary_messages],
+        "responses": [_semantic_item(m) for m in summary_messages],
+    }
+    requests: list[_Conversation] = []
     for i, body in enumerate(bodies):
         try:
-            messages = json.loads(body)["messages"]
-            requests.append(([_semantic(m) for m in messages], _raw_messages(body)))
-        except (ValueError, KeyError, TypeError, AttributeError) as exc:
-            return Check("I1", False, f"request {i}: no readable messages array ({exc})")
+            requests.append(_conversation(body))
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
+            return Check("I1", False, f"request {i}: no readable messages or input ({exc})")
     violations: list[dict[str, int]] = []
     byte_mismatches: list[dict[str, int]] = []
     resets: list[int] = []
@@ -82,27 +86,28 @@ def check_prefix(
     # start after a compaction, e.g. in a new process.
     used = -1
     if requests:
-        first = requests[0][0]
+        first = requests[0].semantic
         n = _system_count(first)
         if len(first) > n:
-            used = _next_summary(summaries, first[n], -1)
+            used = _next_summary(summaries[requests[0].api], first[n], -1)
     for i in range(1, len(requests)):
-        (prev, prev_raw), (cur, cur_raw) = requests[i - 1], requests[i]
-        kept = len(prev)  # the messages that must reach `cur` unchanged
-        j = _first_difference(prev, cur)
+        prev, cur = requests[i - 1], requests[i]
+        kept = len(prev.semantic)  # the elements that must reach `cur` unchanged
+        j = _first_difference(prev.semantic, cur.semantic)
         if j is not None:
-            k = _reset_to(prev, cur, summaries, used)
+            k = _reset_to(prev.semantic, cur.semantic, summaries[cur.api], used)
             if k < 0:
                 violations.append({"request": i, "message": j})
                 continue
             used = k
             resets.append(i)
-            kept = _system_count(prev)
-        k = _first_difference(prev_raw[:kept], cur_raw)
+            kept = _system_count(prev.semantic)
+        k = _first_difference(prev.raw[:kept], cur.raw)
         if k is not None:
             byte_mismatches.append({"request": i, "message": k})
     info = {
         "requests": len(requests),
+        "apis": sorted({r.api for r in requests}),
         "resets": resets,
         "violations": violations,
         "byte_prefix": not byte_mismatches,
@@ -112,7 +117,7 @@ def check_prefix(
         v = violations[0]
         detail = (
             f"request {v['request']} does not extend request {v['request'] - 1}:"
-            f" message {v['message']} changed or was dropped"
+            f" {requests[v['request'] - 1].label(v['message'])} changed or was dropped"
         )
     else:
         detail = (
@@ -120,6 +125,44 @@ def check_prefix(
             f" byte-identical prefix: {'yes' if not byte_mismatches else 'no'}"
         )
     return Check("I1", not violations, detail, info)
+
+
+@dataclass(slots=True, frozen=True)
+class _Conversation:
+    """One request's conversation: each element's semantic form and its raw bytes."""
+
+    api: str  # "chat" or "responses"
+    semantic: list[dict[str, Any]]
+    raw: list[bytes]
+    instructions: bool = False  # a Responses request whose first element is `instructions`
+
+    def label(self, j: int) -> str:
+        """How a detail names element `j`."""
+        if self.api == "chat":
+            return f"message {j}"
+        if self.instructions:
+            return "instructions" if j == 0 else f"input item {j - 1}"
+        return f"input item {j}"
+
+
+def _conversation(body: bytes) -> _Conversation:
+    data = json.loads(body)
+    if "messages" in data or "input" not in data:
+        return _Conversation(
+            "chat", [_semantic(m) for m in data["messages"]], _raw_elements(body, b'"messages"')
+        )
+    elements = data["input"]
+    raw = _raw_elements(body, b'"input"')
+    if isinstance(elements, str):  # the API reads a string as one user message
+        elements = [{"role": "user", "content": elements}]
+    semantic = [_semantic_item(item) for item in elements]
+    instructions = data.get("instructions")
+    if not instructions:
+        return _Conversation("responses", semantic, raw)
+    system = _semantic_item({"role": "system", "content": instructions})
+    return _Conversation(
+        "responses", [system, *semantic], [*_raw_elements(body, b'"instructions"'), *raw], True
+    )
 
 
 def _semantic(msg: dict[str, Any]) -> dict[str, Any]:
@@ -138,8 +181,57 @@ def _semantic(msg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _semantic_item(item: dict[str, Any]) -> dict[str, Any]:
+    """A Responses input item's fields that matter to the model. Text is compared as text
+    (a string or `input_text`/`output_text` parts); item ids and statuses do not count."""
+    kind = item.get("type") or ("message" if "role" in item else None)
+    match kind:
+        case "message":
+            content = _parts(item.get("content"))
+            return {
+                "type": kind,
+                "role": item.get("role"),
+                "content": content,
+                "phase": item.get("phase"),
+            }
+        case "function_call":
+            return {
+                "type": kind,
+                "call_id": item.get("call_id"),
+                "name": item.get("name"),
+                "arguments": _json(item.get("arguments")),
+            }
+        case "function_call_output":
+            return {
+                "type": kind,
+                "call_id": item.get("call_id"),
+                "output": _parts(item.get("output")),
+            }
+        case "reasoning":
+            summary = [s.get("text") for s in item.get("summary") or [] if isinstance(s, dict)]
+            return {
+                "type": kind,
+                "id": item.get("id"),
+                "summary": summary,
+                "encrypted_content": item.get("encrypted_content"),
+            }
+    return item
+
+
+def _parts(content: Any) -> Any:
+    """Text content as a list of texts, whether a string or a list of text parts."""
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [p.get("text") if isinstance(p, dict) and "text" in p else p for p in content]
+    return content
+
+
 def _arguments(call: dict[str, Any]) -> Any:
-    raw = (call.get("function") or {}).get("arguments")
+    return _json((call.get("function") or {}).get("arguments"))
+
+
+def _json(raw: Any) -> Any:
     try:
         return json.loads(raw) if isinstance(raw, str) else raw
     except ValueError:
@@ -157,7 +249,7 @@ def _first_difference(prev: Sequence[Any], cur: Sequence[Any]) -> int | None:
 def _system_count(messages: list[dict[str, Any]]) -> int:
     """How many system (or developer) messages `messages` starts with."""
     return next(
-        (i for i, m in enumerate(messages) if m["role"] not in _SYSTEM_ROLES), len(messages)
+        (i for i, m in enumerate(messages) if m.get("role") not in _SYSTEM_ROLES), len(messages)
     )
 
 
@@ -180,17 +272,21 @@ def _next_summary(summaries: list[dict[str, Any]], message: dict[str, Any], afte
     return next((k for k in range(after + 1, len(summaries)) if summaries[k] == message), -1)
 
 
-def _raw_messages(body: bytes) -> list[bytes]:
-    """The raw bytes of each element of the top-level "messages" array."""
+def _raw_elements(body: bytes, key: bytes) -> list[bytes]:
+    """The raw bytes of each element of the top-level array `key` (e.g. b'"messages"'), or of
+    its value as one element if it is not an array (a string `input` or `instructions`)."""
     depth, i = 0, 0
     while i < len(body):
         c = body[i]
         if c == _QUOTE:
             end = _string_end(body, i)
-            if depth == 1 and body[i:end] == b'"messages"':
+            if depth == 1 and body[i:end] == key:
                 j = _skip_space(body, end)
                 if body[j] == _COLON:
-                    return _array_elements(body, _skip_space(body, j + 1))
+                    j = _skip_space(body, j + 1)
+                    if body[j] == _OPEN[0]:
+                        return _array_elements(body, j)
+                    return [body[j : _value_end(body, j)].strip()]
             i = end
             continue
         if c in _OPEN:
@@ -199,6 +295,30 @@ def _raw_messages(body: bytes) -> list[bytes]:
             depth -= 1
         i += 1
     return []
+
+
+def _value_end(body: bytes, i: int) -> int:
+    """Index just past the JSON value that starts at `body[i]` (inside an object or array)."""
+    if body[i] == _QUOTE:
+        return _string_end(body, i)
+    depth = 0
+    while i < len(body):
+        c = body[i]
+        if c == _QUOTE:
+            i = _string_end(body, i)
+            continue
+        if c in _OPEN:
+            depth += 1
+        elif c in _CLOSE:
+            if depth == 0:
+                return i
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        elif c == _COMMA and depth == 0:
+            return i
+        i += 1
+    return i
 
 
 def _array_elements(body: bytes, i: int) -> list[bytes]:
