@@ -81,6 +81,15 @@ def _exclusive(lock_path: Path) -> Iterator[None]:
         os.close(fd)  # closing the descriptor releases the lock
 
 
+@contextmanager
+def _logged_failure(what: str) -> Iterator[None]:
+    """Log a failure instead of raising it, while another error is on its way up."""
+    try:
+        yield
+    except Exception:
+        logger.exception("%s failed", what)
+
+
 class _Publisher:
     """Stamps one turn's events, persists them and publishes them to the sink.
 
@@ -98,7 +107,7 @@ class _Publisher:
         self._seq = log.next_seq(thread_id)
         self._t0 = time.perf_counter_ns()
         self._batch: list[EventRow] = []
-        self._open = True  # until the loop's turn.end
+        self.ended = False  # the loop's turn.end is stamped (or the publisher is closed)
         # Tool events after the loop's turn.end, `{"t_us", "type", "data"}`; kept on the turn row.
         self.late: list[dict[str, Any]] = []
 
@@ -120,7 +129,7 @@ class _Publisher:
             self._batch.append(row)
         self._seq += 1
         if type_ == "turn.end":
-            self._open = False
+            self.ended = True
         if len(self._batch) >= _BATCH or type_ == "turn.end":
             self.flush()
         self._to_sink(row[-1])
@@ -139,7 +148,7 @@ class _Publisher:
         """The ToolHost's `emit` callback. A tool event after the loop's `turn.end` cannot
         join the stream (`commit` must follow `turn.end` directly), so it goes to `late`, which
         the runner stores on the turn row."""
-        if self._open:
+        if not self.ended:
             self.emit(event.type, event.data)
         else:
             self.late.append({"t_us": self._t_us(), "type": event.type, "data": event.data})
@@ -150,8 +159,11 @@ class _Publisher:
             self._batch.clear()
 
     def close(self) -> None:
-        self.flush()
-        self._open = False
+        """Store what is still buffered. Nothing is stored after this, even if it fails."""
+        self.ended = True
+        batch, self._batch = self._batch, []
+        if batch:
+            self._log.append_events(batch)
 
 
 class NdjsonMirror:
@@ -227,9 +239,9 @@ class Runner:
 
         Returns `{"turn_id", "stop", "pending", "commit"}`. A loop exception ends the turn with
         stop="error" instead of raising. `asyncio.CancelledError` propagates and leaves the turn
-        "running", like a crash; resume it with `Resume(kind="crash")`. If the commit fails,
-        the turn is recorded as "error" without a commit and the git error is raised; the next
-        turn's commit then includes its changes.
+        "running", like a crash; resume it with `Resume(kind="crash")`. Any other failure (git,
+        or the session log) records the turn as "error" without a commit and is raised; the
+        next turn's commit then includes its changes.
         """
         if (user_text is None) == (resume is None):
             raise ValueError("pass exactly one of user_text and resume")
@@ -264,6 +276,7 @@ class Runner:
             if watch_cancel
             else None
         )
+        stop = "error"  # until the loop's turn.end says otherwise
         try:
             await self._reconcile(wc, thread_id, turn_id)
             start: dict[str, Any] = {"turn_id": turn_id}
@@ -290,12 +303,7 @@ class Runner:
                     turn_id, "paused", stop=stop, pending=pending, late=pub.late or None
                 )
                 return {"turn_id": turn_id, "stop": stop, "pending": pending, "commit": None}
-            try:
-                sha, files = await wc.commit(f"turn {row['idx'] + 1}: {stop}")
-            except Exception:
-                # Record it, or the turn stays "running" and blocks the thread.
-                self.log.set_turn_status(turn_id, "error", stop=stop)
-                raise
+            sha, files = await wc.commit(f"turn {row['idx'] + 1}: {stop}")
             status = _STATUS.get(stop, "error")
             self.log.set_turn_status(
                 turn_id, status, stop=stop, commit_sha=sha, late=pub.late or None
@@ -303,6 +311,9 @@ class Runner:
             # Last, so a consumer that sees `commit` finds the turn row complete (rule 7).
             pub.emit("commit", {"sha": sha, "files": files})
             return {"turn_id": turn_id, "stop": stop, "pending": [], "commit": sha}
+        except Exception:  # unlike a crash (CancelledError), a failure ends the turn
+            self._record_failure(turn_id, stop, pub)
+            raise
         finally:
             if watcher is not None:
                 watcher.cancel()
@@ -334,6 +345,8 @@ class Runner:
                         end = event.data
                         break
         except Exception as exc:  # CancelledError is not an Exception: it propagates (crash)
+            if end is None and pub.ended:
+                raise  # the loop's turn.end is stamped, but the log could not store it
             if end is None:  # else it failed while closing after its turn.end: nothing to add
                 error = f"{type(exc).__name__}: {exc}"
                 pub.emit("error", {"kind": "loop", "message": error, "retryable": False})
@@ -372,10 +385,14 @@ class Runner:
             files_text = ", ".join(files) or "none"
             note = f"[harness] Reverted turn {target['idx'] + 1}; files: {files_text}"
             message = {"role": "user", "content": note}
-            pub.emit("item", {"item": Item(f"{row['id']}:revert", row["id"], message)})
-            self.log.set_turn_status(row["id"], "done", commit_sha=sha)
-            pub.emit("commit", {"sha": sha, "files": files})
-            pub.close()
+            try:
+                pub.emit("item", {"item": Item(f"{row['id']}:revert", row["id"], message)})
+                self.log.set_turn_status(row["id"], "done", commit_sha=sha)
+                pub.emit("commit", {"sha": sha, "files": files})
+                pub.close()
+            except Exception:
+                self._record_failure(row["id"], None, pub)
+                raise
         return {"turn_id": row["id"], "stop": None, "pending": [], "commit": sha}
 
     def compact(self, thread_id: str, summary: str) -> Item:
@@ -406,6 +423,16 @@ class Runner:
         if thread is None:
             raise KeyError(f"unknown thread {thread_id}")
         return thread
+
+    def _record_failure(self, turn_id: str, stop: str | None, pub: _Publisher) -> None:
+        """End a failed turn as "error" without a commit, or it would stay "running" and block
+        the thread (the next turn repairs git). Best effort: if the log fails again (e.g. it is
+        still locked), that is only logged, so the caller raises the first error; a crash
+        resume can still take the turn over."""
+        with _logged_failure(f"recording turn {turn_id} as an error"):
+            self.log.set_turn_status(turn_id, "error", stop=stop, late=pub.late or None)
+        with _logged_failure(f"storing the events of turn {turn_id}"):
+            pub.close()  # e.g. a turn.end whose flush failed
 
     def _git_turns(self, thread_id: str) -> list[dict[str, Any]]:
         """The thread's turns that use the working copy (all but compactions), in order."""

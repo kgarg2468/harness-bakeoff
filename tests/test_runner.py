@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import subprocess
 from typing import ClassVar
 
@@ -491,6 +492,37 @@ async def test_a_commit_git_made_but_no_turn_recorded_is_undone_by_the_next_turn
     assert check.ok, check.detail
 
 
+@pytest.mark.parametrize("failures", [1, 2], ids=["locked-once", "locked-twice"])
+@pytest.mark.parametrize("script", [only(), writes("a.pipe")], ids=["synthesized", "loops"])
+async def test_a_turn_end_the_log_cannot_store_does_not_block_the_thread(
+    runner, log, tid, monkeypatch, caplog, script, failures
+):
+    store, attempts = log.append_events, []
+
+    def append_events(rows):  # as if another process held the write lock past the busy timeout
+        if any(row[3] == "turn.end" for row in rows) and len(attempts) < failures:
+            attempts.append(rows)
+            raise sqlite3.OperationalError(f"database is locked ({len(attempts)})")
+        store(rows)
+
+    monkeypatch.setattr(log, "append_events", append_events)
+    with pytest.raises(sqlite3.OperationalError, match=r"locked \(1\)"):  # the first error
+        await runner.turn(FakeLoop(script), tid, model=MODEL, user_text="one")
+    turn = log.last_turn(tid)
+    assert (turn["status"], turn["commit_sha"]) == ("error", None)
+    # Stored once by the retry if the lock is gone by then; the stream has no second turn.end.
+    assert types(log, tid).count("turn.end") == (1 if failures == 1 else 0)
+    assert ("storing the events of turn" in caplog.text) == (failures == 2)
+
+    summary = await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")
+    assert summary["stop"] == "end_turn"
+    for check in (
+        check_seq(log.events(tid), log.items(tid)),
+        check_commits(log, tid, runner.workdir(tid)),
+    ):
+        assert check.ok, check.detail
+
+
 async def test_crash_resume_cleans_up_after_git(runner, log, tid):
     await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
     # The worker died while committing turn 1: git's commit landed without being recorded,
@@ -761,6 +793,28 @@ async def test_revert_waits_for_a_turn_that_failed_to_commit(runner, log, tid):
     await runner.turn(no_op, tid, model=MODEL, user_text="three")
     assert log.events(tid)[-1]["data"]["files"] == ["b.pipe"]
     await runner.revert(tid, f"{tid}.0")
+    check = check_commits(log, tid, runner.workdir(tid))
+    assert check.ok, check.detail
+
+
+async def test_a_revert_the_log_cannot_record_does_not_block_the_thread(
+    runner, log, tid, monkeypatch
+):
+    await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
+    store = log.append_item
+
+    def locked(*args):  # the revert note: as if another process held the write lock
+        monkeypatch.setattr(log, "append_item", store)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(log, "append_item", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        await runner.revert(tid, f"{tid}.0")
+    turn = log.last_turn(tid)
+    assert (turn["kind"], turn["status"], turn["commit_sha"]) == ("revert", "error", None)
+    await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")
+    assert log.events(tid)[-1]["data"]["files"] == ["a.pipe", "b.pipe"]  # the revert's change too
+    assert not (runner.workdir(tid) / "a.pipe").exists()
     check = check_commits(log, tid, runner.workdir(tid))
     assert check.ok, check.detail
 
