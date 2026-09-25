@@ -20,71 +20,86 @@ If you'd do something differently, edit this file in a PR, and A will be changed
       `stream_options` with the SDK's `omit`.*
 - [x] **Loop API**: `Agent.iter()` (or `run_stream_events()`), never `run_stream()`, which stops at the
       first final output. ([agents](https://ai.pydantic.dev/agents/))
-      *`Agent.iter()` in its own task, `node.stream()` for request nodes. `tool_call.ready` comes from
-      the model stream's `PartEndEvent`, so a resumed call is not announced twice.*
+      *`Agent.iter()` in its own task, `node.stream()` for request nodes and for tool nodes (its
+      `FunctionToolResultEvent`s, see History). `tool_call.ready` comes from the model stream's
+      `PartEndEvent`, so a resumed call is not announced twice.*
 - [x] **Tools**: our shared JSON schemas through `Tool.from_schema` → `FunctionToolset`.
       *With `strict=False`: the default lets the OpenAI schema transformer close every object, which
       would make free-form args such as `validate_pipeline.pipeline` "must be empty". A result that
       is not ok maps onto the library's three outcomes by `ToolResult.error`: `invalid_args` →
       `ModelRetry` (retry prompt), `denied` → `ToolDenied` returned from the tool (outcome
       `denied`, text verbatim, as for a user's denial), `failed` → `ToolFailed` (outcome `failed`;
-      the library sends it as `{"error": ...}` and uses no retry budget).*
+      the library sends it as `{"error": ...}` and uses no retry budget). A tool that is not
+      `read_only` is `sequential=True`: it runs alone, after the calls before it and before those
+      after it (B orders its calls the same way).*
 - [x] **Approvals**: `ApprovalRequiredToolset(approval_required_func=...)` backed by the shared
       permission rules. `output_type=[str, DeferredToolRequests]`. Resume with `message_history` +
       `DeferredToolResults` (`ToolDenied(message)` for a denial). ([deferred-tools](https://ai.pydantic.dev/deferred-tools/))
-      *Crash resume uses the same `DeferredToolResults`, answering open calls with `check()` again;
-      the library requires an answer for every open call, so any "ask" pauses before the rest run.
-      A new user message after a pause nobody answered: the open calls get the library's own
-      "interrupted" result, saved as items first (the library would send the same result on the
-      wire without it ever reaching the log).*
+      *A crash resume, or an approval that answers only some calls, uses the same
+      `DeferredToolResults`. The library needs an answer for every open call, so a call the user
+      did not answer is passed as approved and re-checked in `Hooks(before_tool_execute=...)`,
+      which the docs name as the hook to defer from: `check()` == "ask" raises `ApprovalRequired`
+      again. So the decided calls run now and only the others pause (before, a partial answer was
+      lost and the thread could never finish). Open calls that must never run get the library's
+      own "interrupted" result, saved as items: their response was cut short by a cancel, or the
+      user sent a new message instead of answering. This is decided from the history, so a crash
+      right after a cancel cannot run the cancelled call.*
 - [x] **History**: native `ModelMessagesTypeAdapter` JSON, persisted after every model response
       and tool batch (node boundaries in `iter()`), so a crash loses nothing.
       *Every item carries the native of exactly what it shows: a response, or one part of a request
       (one tool result). The library merges consecutive requests before it sends them, so the wire
-      does not change, and a crash between two result items of one batch keeps the first. Tool
-      results are persisted from the next request node, and the request is sent only after the
-      runner has handled them. A history that ends with the user's request is passed as-is, with
-      no `user_prompt`.*
+      does not change, and a crash between two result items of one batch keeps the first. A
+      sequential tool's result is saved as soon as it finishes (the tool node's
+      `FunctionToolResultEvent`, with the results of the calls before it), so a crash never runs a
+      finished write again; read-only results are saved from the next request node, in call order,
+      and the request is sent only after the runner has handled them. A history that ends with the
+      user's request is passed as-is, with no `user_prompt`. A crash resume whose history already
+      ends the turn (the final answer, or a cancelled response) sends nothing.*
 - [x] **Cancel**: `CancellationToken`.
       *The token cancels the task that drives the run, so the run gets its own task. Calls a cancel
-      leaves open get the same `interrupted` results the library would synthesize, persisted now.
-      The library replays an interrupted response as it was, so a `ProcessHistory` capability drops
-      its unsigned thinking (the signature only arrives at the end of a thinking block, and
-      endpoints that check signatures, like Anthropic, reject it); the item's native keeps it.*
+      leaves open get the same `interrupted` results the library would synthesize, persisted now
+      (or by the crash resume, if a crash came first). The library replays an interrupted
+      response as it was, so a `ProcessHistory` capability drops its unsigned thinking (the
+      signature only arrives at the end of a thinking block, and endpoints that check signatures,
+      like Anthropic, reject it); the item's native keeps it.*
 - [x] **Limits**: `UsageLimits(request_limit=max_steps)`, with `UsageLimitExceeded` mapped to `max_steps`.
       *`max_cost_usd` uses `cost_limit` and maps to `budget` (checked first, so crossing it on the
-      last step is `budget`); the response that crosses it is dropped from history by the library.
-      The request limit is only checked before the next request, so `Hooks(before_tool_execute=...)`
-      skips (`SkipToolExecution`) the calls of the response that reaches the cap: their results
-      could never be sent. Each still gets a result.*
+      last step is `budget`). The library drops the response that crosses it from history, though
+      it was streamed and billed; A keeps it and closes its calls, so the next turn sees the
+      answer. The request limit is only checked before the next request, so
+      `Hooks(before_tool_execute=...)` skips (`SkipToolExecution`) the calls of the response that
+      reaches the cap: their results could never be sent. Each still gets a result. A resume
+      continues the turn: `usage=RunUsage(...)` from the responses since the user's message (the
+      same `usage=` the stream retry uses), so the step count and the budget carry over, as in B.*
 - [x] **Cost**: OpenRouter's billed cost from `ModelResponse.provider_details["cost"]`. `RunUsage` cost is
       reported only as an estimate.
       *An `after_model_request` hook sets the billed cost as the response cost, so `RunUsage` and
       `cost_limit` count what was charged, and queues the step's `usage` event; it sees every
-      response, so the one that crosses `cost_limit` (billed, then dropped) is reported too. Without
-      a billed cost: `estimate` (genai-prices) when the provider reported usage, else `none`. The
-      library drops a billed cost of exactly 0 (`if cost := usage.cost`), which then shows as an
-      estimate. Open question: fakeprov's S12b expects `none` for a BYOK `gpt-5.4-mini` endpoint,
-      where A reports genai-prices' OpenAI list price, labelled `estimate`.*
+      response, including the one that crosses `cost_limit`. Without a billed cost: `estimate`
+      (genai-prices) on OpenRouter when it reported usage, else `none`. genai-prices knows
+      OpenRouter's prices, not what a BYOK endpoint charges, so BYOK is `none`, never guessed
+      (fakeprov S12b). A billed cost of exactly 0 is `provider` 0 (library bug, below).*
 - [x] **Retries**: the OpenAI SDK's built-in retries (`max_retries`). The `[retries]` tenacity
       transport is the alternative; reviewer's choice.
       *`retry` events come from httpx event hooks on the SDK's own client class, as each retry
       starts (with the measured wait); the SDK numbers attempts only in its
-      `x-stainless-retry-count` header. A stream that fails midway is retried by code A had to add
-      (below).*
+      `x-stainless-retry-count` header. A stream that fails midway (an error event, or a dropped
+      connection) is retried by code A had to add (below).*
 - [x] **Bad tool arguments**: pydantic-ai's own idiom (`ModelRetry` / retry prompt), with `retries` set
       high enough that one bad call does not end the run. Reviewer's choice of idiom.
-      *`retries=max_steps`. Only `invalid_args` results use it. Arguments that are not valid JSON
-      never reach ToolHost: the library validates them before it calls the tool and answers with
-      its retry prompt (a pydantic error dump), so such a call has no `check()`, `run()` or
-      `tool.start`, and the model sees different text than with B.*
+      *`retries=max_steps`. Only `invalid_args` results use it. Arguments the library cannot parse
+      (not a JSON object) go on like any others through `Hooks(tool_validate_error=...)`, which
+      returns empty validated args: the call is checked, ToolHost gets the raw text and answers
+      with its own error (rule 5), and the model sees that text in the retry prompt instead of a
+      pydantic error dump.*
 - [x] **Quiet**: `PYDANTIC_AI_NO_BANNER=1`, instrumentation off (nothing may write to stdout/stderr
       inside the engine).
       *`pydantic_ai.BANNER_ENABLED = False` (the in-code switch), instrumentation is off by default,
       and two library warnings are filtered: "dropped temperature for a reasoning model" and
       `CostNotFoundWarning` (a cost limit with no known price; the usage events say `none`).*
 - [x] **Versions**: passes on 2.31.1 (fits the engine today) and on the latest release.
-      *2.31.1 + openai 2.54.0 and 2.50.0 + openai 3.19.2 (httpx2), same code.*
+      *2.31.1 + openai 2.54.0 and 2.50.0 + openai 3.19.2 (httpx2; the latest on 2026-09-25), same
+      code.*
 
 ## Code A had to add
 
@@ -92,30 +107,56 @@ The library has no mechanism for these, so A has its own code (counted like ever
 
 - **Retrying a stream that fails midway** (`_drive`, `_retry_reason`). The SDK's and tenacity's
   retries act before the body is read, and a request node's stream cannot be restarted. If a
-  stream fails with a provider error (429/5xx, a dropped connection, OpenRouter's error chunk),
-  the step runs again from the saved history with the SDK's backoff schedule, up to
-  `max_retries`; the partial response is dropped, a `retry` event is emitted, and `usage=` carries
-  the run's usage so the retry is not a new step. No tool runs before a response is complete, so
-  this is safe.
-- **Saving the calls of an unanswered pause** (`_run`, 3 lines), and **waiting for the runner
-  before each request** (`await out.join()`, 1 line; the same wait orders `tool.start`).
+  stream fails with a provider error (429/5xx, an error event, a dropped connection), the step
+  runs again from the saved history with the SDK's backoff schedule, up to `max_retries`; the
+  partial response is dropped, a `retry` event is emitted, and `usage=` carries the run's usage
+  so the retry is not a new step. No tool runs before a response is complete, so this is safe.
+  `_retry_reason` has to recognize errors the library does not wrap (below).
+- **Deciding from the history what a resume must do** (`mapping.close_abandoned`, `this_turn`,
+  `spent`, `finished`: about 25 lines, and 8 in `_run`): close calls that must never run, end a
+  turn whose end is already saved without a request, and carry the steps and cost over. The
+  library resumes a history as it is and starts its usage at zero.
+- **Keeping the response that crosses the budget** (4 lines in `_run`).
+- **Saving a sequential tool's result when it finishes** (`_Turn.tool_done`, the tool-node
+  branch in `_run` and a skip in `flush`: about 20 lines); the library adds results to history
+  only when the whole batch is done.
+- **Waiting for the runner before each request** (`await out.join()`, 1 line; the same wait
+  orders `tool.start`).
 - **Importing the SDK's chat resources at module import** (`model.py`, 1 line): the first
   `OpenAIChatModel` loads them lazily, which blocked the event loop for about 0.3 s inside the
-  first turn on openai 2.x.
+  first turn on openai 2.x. What remains of the first turn's setup (about 40 ms, 16 ms for later
+  endpoints) is building the model: the OpenAI client and its SSL context.
 
 ## Library bugs and behaviors (worked around or recorded)
 
-- **Worked around**: OpenRouter's documented mid-stream error chunk has a string `code`
+- **Worked around** (bug): OpenRouter's documented mid-stream error chunk has a string `code`
   (`"server_error"`), but pydantic-ai's `_OpenRouterError` declares `code: int`, so the error
   surfaces as a pydantic `ValidationError` instead of `ModelHTTPError` (2.31.1 and 2.50.0). A
-  recognizes it by the model's title, the only private name it refers to.
-- **Recorded**: a billed cost of exactly 0 is dropped (above).
+  recognizes it by the model's title, the only private name it refers to. On openai 3.x a
+  stream that drops on OpenRouter arrives the same way, with no error body.
+- **Worked around** (bug): OpenRouter's billed cost of exactly 0 is dropped (`if cost :=
+  usage.cost`), so a free step was an estimate and counted against `max_cost_usd`. A reads it as
+  0 when `provider_details` has `is_byok`, which comes with OpenRouter's usage accounting.
+- **Worked around**: errors the library does not wrap: on openai 2.x a connection that drops
+  mid-stream raises raw `httpx.RemoteProtocolError`, and on `OpenAIChatModel` (BYOK) an
+  `{"error": ...}` event mid-stream raises raw `openai.APIError`.
+- **Worked around**: a `cost_limit` drops the response that crosses it from history (above).
+- **Worked around**: `DeferredToolResults` needs an answer for every open call, so there is no
+  partial approval (above).
+- **Recorded**: `Agent.parallel_tool_call_execution_mode("parallel_ordered_events")` would give
+  results in call order, but on 2.31.1 it holds every result event until the whole batch is
+  done, so A keeps the default mode and orders the early-saved results itself.
+- **Recorded**: for BYOK, `cost_limit` counts genai-prices' estimate by model name (the library
+  fills it in), while the usage events say `none`.
 - **Recorded**: once any thinking is in a request, `OpenRouterModel` adds `"reasoning": ""` to
   tool-calling assistant messages that have no thinking field, which changes the bytes of messages
   already sent (byte prefix and prompt cache; the semantic prefix holds). `Item.message` does not
   carry it, since it depends on the rest of the request.
-- **Recorded**: an interrupted tool call whose arguments were cut off is replayed as
-  `{"INVALID_JSON": "..."}`, not as the streamed text.
+- **Recorded**: a tool call whose arguments are not a JSON object (cut off, or malformed) is
+  replayed as `{"INVALID_JSON": "..."}`, not as the streamed text; `Item.message` shows it so.
+- **Recorded**: `OpenAIChatModel` parses BYOK thinking streamed as `<think>` tags into a thinking
+  part and sends it back as tags in `content`, joining text pieces with a blank line;
+  `mapping._assistant` follows the same rules.
 - **Recorded**: the retry events read the SDK's `x-stainless-retry-count` request header; the
   tenacity transport would give native events but needs the `[retries]` extra.
 
