@@ -90,6 +90,9 @@ _RETRY_HEADER = "x-stainless-retry-count"
 # Backoff before retrying a failed stream: the OpenAI SDK's own schedule (0.5 s doubling, max 8 s).
 _STREAM_RETRY_BASE_S = 0.5
 _STEP_CAP_RESULT = "Not run: the turn reached its step limit."
+# The Responses stream events that end a response the library may take: complete, or out of
+# `max_output_tokens` (the library answers that itself). Not `response.failed` or `error`.
+_RESPONSE_ENDS = ("response.completed", "response.incomplete")
 
 
 class _StreamRetry(Exception):
@@ -115,6 +118,7 @@ class _Turn:
     attempt: int = 0  # of the current step
     # (status, monotonic time, reason) of the last failed attempt, until the next one starts.
     failure: tuple[int | None, float, str] | None = None
+    event: str | None = None  # the last SSE event of the current attempt's Responses stream
     emitted: dict[int, Any] = field(default_factory=dict)  # messages and result parts, by id
     items: list[Item] = field(default_factory=list)  # emitted this turn
     responses: list[tuple[int, ModelResponse]] = field(default_factory=list)  # usage not sent yet
@@ -141,6 +145,7 @@ class _Turn:
                 },
             )
         self.failure = None
+        self.event = None
         self.emit("request.start", {"step": self.steps, "attempt": self.attempt})
 
     def stream_event(self, event: ModelResponseStreamEvent) -> None:
@@ -348,10 +353,11 @@ class PydanticLoop:
                             try:
                                 async for event in stream:
                                     state.stream_event(event)
-                                if state.responses_api and not stream.response.usage.has_values():
-                                    # Usage comes with `response.completed` (or `.incomplete`).
+                                if state.responses_api and state.event not in _RESPONSE_ENDS:
                                     # The library ends a stream as if it were done after an
-                                    # `error` event (which it skips) or a `response.failed`.
+                                    # `error` event (which it skips) or a `response.failed`
+                                    # (which 2.31.1 parses like `.incomplete`, usage and all),
+                                    # so the event that ended the stream decides.
                                     failed = "the stream failed before response.completed"
                                     raise ModelAPIError(model.model_name, failed)
                             except Exception as exc:
@@ -592,6 +598,26 @@ async def _on_request(request: Any) -> None:
 
 
 async def _on_response(response: Any) -> None:
-    if (turn := _TURN.get(None)) is not None and response.status_code >= 400:
+    if (turn := _TURN.get(None)) is None:
+        return
+    if response.status_code >= 400:
         status = response.status_code
         turn.failure = (status, time.monotonic(), f"HTTP {status}")
+    elif turn.responses_api:
+        # The OpenAI SDK reads the SSE stream from these (decoded) bytes.
+        read = response.aiter_bytes
+        response.aiter_bytes = lambda *args, **kw: _note_events(read(*args, **kw), turn)
+
+
+async def _note_events(chunks: AsyncIterator[bytes], turn: _Turn) -> AsyncIterator[bytes]:
+    """Pass a Responses stream's bytes on, noting each SSE event's name in `turn.event`: the
+    library gives a failed response no status (2.31.1), so only its event tells it apart."""
+    line = b""  # the start of the line the next bytes continue
+    async for chunk in chunks:
+        *lines, rest = (line + chunk).split(b"\n")
+        line = rest[:64]  # a line's field and event name are all that is read
+        for full in lines:
+            name, _, value = full.rstrip(b"\r").partition(b":")
+            if name == b"event":
+                turn.event = value.strip().decode()
+        yield chunk

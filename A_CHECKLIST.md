@@ -152,11 +152,14 @@ The library has no mechanism for these, so A has its own code (counted like ever
   only when the whole batch is done.
 - **Waiting for the runner before each request** (`await out.join()`, 1 line; the same wait
   orders `tool.start`).
-- **Retrying a Responses stream that failed** (3 lines in `_run`, and the warning filter). The
-  library ends the stream as if it were done after an `error` event (it has no handler for it)
-  or a `response.failed`, so the partial answer would be the final one. A stream that brought
-  no usage never reached `response.completed` (or `.incomplete`): A raises it as a
-  `ModelAPIError`, and the retry above takes over.
+- **Retrying a Responses stream that failed** (3 lines in `_run`, `_note_events` and 4 lines in
+  `_on_response`: about 20 lines, and the warning filter). The library ends the stream as if it
+  were done after an `error` event (it has no handler for it) or a `response.failed`, so the
+  partial answer would be the final one. A notes the name of each SSE event in the bytes the
+  OpenAI SDK parses (an httpx response hook): a stream whose last event is not
+  `response.completed` (or `.incomplete`, which the library handles) is raised as a
+  `ModelAPIError`, and the retry above takes over. Usage is no sign: a `response.failed` may
+  carry it.
 - **The chat-shaped view of a Responses response** (2 lines in `mapping._assistant`, and a
   `responses_api` flag from `_Turn` through `to_openai`): `Item.message` leaves the reasoning
   items out; without this they would look like BYOK thinking fields.
@@ -191,14 +194,16 @@ The library has no mechanism for these, so A has its own code (counted like ever
   object, not for the documented flat `{"type": "error", "code", "message"}` shape.
 - **Worked around** (bug): the segment behind a streamed response knows that a Responses stream
   ended without a terminal event (state `incomplete`), but the continuation wrapper that
-  `node.stream()` returns reports every finished stream as `complete`, so A reads the missing
-  usage instead (above).
-- **Recorded**: on 2.31.1 a `response.failed` or `response.incomplete` sets no finish reason (2.50.0
-  maps them to `error` and `length`), so A tells a failed stream by its missing usage, the same
-  on both. A `response.failed` that does carry usage is taken for a finished response. So when
-  `max_output_tokens` runs out while the model reasons (OpenAI documents a reasoning-only
-  `.incomplete` output), 2.31.1 asks again with its retry prompt ("Please return text or call a
-  tool."), while 2.50.0 ends the turn with `UnexpectedModelBehavior` (token limit exceeded).
+  `node.stream()` returns reports every finished stream as `complete`, so A reads the stream's
+  last event instead (above).
+- **Worked around** (gap): on 2.31.1 a `response.failed` and a `response.incomplete` come out alike:
+  no finish reason (2.50.0 maps them to `error` and `length`), state `complete`, and their usage, so
+  nothing in the `ModelResponse` tells them apart: A reads the event that ended the stream, the same
+  on both (above). So when `max_output_tokens` runs out while the model reasons (OpenAI documents a
+  reasoning-only `.incomplete` output), 2.31.1 asks again with its retry prompt ("Please return text
+  or call a tool."), while 2.50.0 ends the turn with `UnexpectedModelBehavior` (token limit
+  exceeded). A failed attempt's usage is not reported (no `usage` event), even when
+  `response.failed` carries it, as for any stream that fails.
 - **Recorded**: the library merges consecutive requests before it sends them, with tool results
   and retry prompts first. A response it sends nothing for (a reasoning-only or empty one) still
   separates two requests in its history, so A saves it (Code A had to add, above).

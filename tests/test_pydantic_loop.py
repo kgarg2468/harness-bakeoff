@@ -11,6 +11,7 @@ import time
 import uuid
 import warnings
 from collections import defaultdict
+from collections.abc import AsyncIterator
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -1397,3 +1398,45 @@ async def test_responses_failed_stream_on_the_last_attempt_ends_the_turn_quietly
     assert [(i.status, i.message["content"]) for i in items(events)] == [("incomplete", "Hal")]
     assert of(events, "turn.end")[0]["stop"] == "error"
     assert (caught, capfd.readouterr()) == ([], ("", ""))
+
+
+@pytest.mark.parametrize("retries", [1, 0])
+async def test_responses_a_failed_response_with_usage_is_no_answer(loop, tmp_path, retries):
+    """Greptile #4105933151: a `response.failed` can carry usage, and 2.31.1 parses it exactly
+    like `.incomplete`. It is a failed stream all the same: retried without keeping anything of
+    it, or on the last attempt the turn's error. Its partial text is never the answer."""
+    failed = {"failed": {"message": "boom", "usage": {"input_tokens": 20, "output_tokens": 3}}}
+    exchanges = [
+        {"respond": {"stream": [{"text": "Hal", "done": False}, failed]}},
+        {"expect": {"input_len": 1}, "respond": {"stream": [{"text": "Hello!"}, COMPLETED]}},
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        cfg = responses_config(srv, max_retries=retries)
+        events = await run(loop, turn([user("hi")], cfg), StubTools())
+
+    assert len(sent(tmp_path)) == 1 + retries
+    if retries:
+        assert of(events, "retry")[0]["reason"] == "the stream failed before response.completed"
+        assert [i.message["content"] for i in items(events)] == ["Hello!"]
+        assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+    else:
+        assert [(i.status, i.message["content"]) for i in items(events)] == [("incomplete", "Hal")]
+        assert of(events, "turn.end")[0]["stop"] == "error"
+
+
+async def test_the_event_that_ends_a_responses_stream_is_read_across_chunks():
+    """`_note_events` reads SSE event names wherever the bytes are cut, past long data lines,
+    and passes the bytes on unchanged."""
+    delta = b'data: {"delta": "' + b"x" * 300 + b'"}\n\n'
+    body = (
+        b"event: response.output_text.delta\n" + delta + b"event: response.failed\r\ndata: {}\n\n"
+    )
+    for size in (1, 5, 64, 100, len(body)):
+
+        async def chunks(size: int = size) -> AsyncIterator[bytes]:
+            for start in range(0, len(body), size):
+                yield body[start : start + size]
+
+        state = loop_module._Turn("t", StubTools(), 1, set(), set(), responses_api=True)
+        passed = [chunk async for chunk in loop_module._note_events(chunks(), state)]
+        assert (b"".join(passed), state.event) == (body, "response.failed")
