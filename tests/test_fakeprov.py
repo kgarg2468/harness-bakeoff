@@ -415,7 +415,23 @@ def test_scenario_file_is_valid_and_consistent(path: Path):
             "$.exchanges[0].respond.stream[0]: sse_error and stall must be last",
         ),
         (lambda s: s["expect"]["stops"].append("end_turn"), "$.expect.stops: lists 2 stops for 1"),
+        (
+            lambda s: s["exchanges"].extend([CALLS_F, CALLS_F]),
+            "$.exchanges: tool call ids must be unique: ['call_1']",
+        ),
+        (
+            lambda s: s["driver"].append({"crash_after": "tool.end"}),
+            "$.driver[1]: crash_after must be followed by a user step",
+        ),
         (lambda s: s["driver"].insert(0, {"crash_after": "boom"}), "$.driver[0].crash_after"),
+        (
+            lambda s: s["driver"].insert(0, {"crash_after": "turn.end", "call_id": "call_1"}),
+            "$.driver[0].call_id: turn.end events name no tool call",
+        ),
+        (
+            lambda s: s["driver"].insert(0, {"crash_after": "item", "call_id": "call_x"}),
+            "$.expect: unknown tool call ids: ['call_x']",
+        ),
         (lambda s: s.update(id="Other"), "$.id: 'Other' must match the file name"),
         (
             lambda s: s["expect"].update(tool_runs={"call_x": 1}),

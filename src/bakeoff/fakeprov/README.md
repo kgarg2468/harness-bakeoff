@@ -71,10 +71,21 @@ a file (JSON schema plus cross-checks) and raises `ScenarioError` naming the exa
 |---|---|
 | `{"user": str, "cancel_after_ms"?: int}` | run a turn with this user message; set `cancel` that many ms after the turn starts |
 | `{"approve": {"allow"?: [ids] \| "all", "deny"?: [ids], "reason"?: str}, "new_process": bool}` | answer the pending `permission.asked` calls and resume (`Resume(kind="approval")`), in a fresh process if `new_process` |
-| `{"crash_after": "<event type>"}` | run the **next** user step in a subprocess and SIGKILL it after the first event of this type |
+| `{"crash_after": "<event type>", "call_id"?: str}` | run the **next** user step in a child process that SIGKILLs itself when its runner publishes the first event of this type; with `call_id`, the first one about that call (see below) |
 | `{"resume": "crash"}` | resume the killed turn (`Resume(kind="crash")`) |
 | `{"revert": n}` | `Runner.revert()` the thread's n-th turn (1-based, creation order) |
 | `{"compact": str}` | `Runner.compact()` with this summary |
+
+**Crash points.** The child kills itself (`os.kill(os.getpid(), signal.SIGKILL)`) inside the
+runner's sink, synchronously, so the crash point is exact and never races the child's next
+request. The runner publishes an `item` event only after it has saved the item (together with
+the events buffered before it), and the loop cannot run again before the sink returns.
+`call_id` narrows `tool_call.ready`, `permission.asked`, `tool.start` and `tool.end` to events
+whose `data.call_id` matches, and `item` to the tool result whose `message.tool_call_id`
+matches. So `{"crash_after": "item", "call_id": "call_S08_1"}` dies once that call's result is
+durable and before the next model request. `tool.end` is too early for that: `ToolHost` emits
+it inside `run()`, before the loop has the result, so a crash there loses the result and the
+crash resume rightly runs the tool again.
 
 ### Exchanges
 
@@ -125,9 +136,9 @@ Responses are deterministic: identical for every run and impl.
 
 | Key | Passes when |
 |---|---|
-| `stops` (required) | the stop of each turn the driver runs to its end, in order: `user` (unless crashed), `approve` and `resume` steps. `revert`/`compact` run no turn. The loader checks the count |
+| `stops` (required) | the stop of each loop turn the driver runs to its end, in order: `user` (unless crashed), `approve` and `resume` steps. The runner's own `revert`/`compact` turns run no loop and have no stop, so they are not listed. The loader checks the count |
 | `files` | `{path: substring}`: the file exists in the working copy and contains it; `{path: null}`: absent |
-| `tool_runs` | `{call_id: n}`: the tool for that call started n times (`tool.start`) over the whole scenario, all processes included |
+| `tool_runs` | `{call_id: n}`: `tool.start` events for that call over the whole scenario, all processes included. `ToolHost` emits one per `run()`, so a deny rule or bad arguments count too; no scenario lists such a call |
 | `commits` | number of git commits the scenario's turns and reverts created |
 | `requests` | number of chat requests recorded for the cursor |
 | `text_contains` | the last assistant text of the last turn contains it |
@@ -148,7 +159,7 @@ because results come from the shared tools and `MockEngine`.
 | S05 | one batch: `validate_pipeline` (allow) + `write_file` (ask); pause; approve in a new process |
 | S06 | deny with a reason; the reason reaches the model as the tool result |
 | S07 | cancel during a stall (unsigned reasoning in flight), cancel during a 2 s tool; strict `reject_unsigned_reasoning` |
-| S08 | SIGKILL after `tool.end`; crash resume must not re-run the tool |
+| S08 | SIGKILL once the `write_file` result is saved (after `tool.end`, before the next request); crash resume must not re-run the tool |
 | S09 | 429 with `retry-after: 1`, then OK; next turn: `sse_error` mid-stream, then OK |
 | S10a | `reasoning_details` round-trip: split text, metadata-only signature, encrypted detail |
 | S10b | as S10a, plus an unknown field on a fragment (informational) |

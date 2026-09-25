@@ -162,7 +162,9 @@ _STEPS = {
         },
         "approve",
     ),
-    "crash_after": _obj({"crash_after": {"enum": [*LOOP_EVENTS, *SHARED_EVENTS]}}, "crash_after"),
+    "crash_after": _obj(
+        {"crash_after": {"enum": [*LOOP_EVENTS, *SHARED_EVENTS]}, "call_id": _STR}, "crash_after"
+    ),
     "resume": _obj({"resume": {"const": "crash"}}, "resume"),
     "revert": _obj({"revert": _INT1}, "revert"),
     "compact": _obj({"compact": _STR}, "compact"),
@@ -170,6 +172,8 @@ _STEPS = {
 
 # Top-level keys every scenario has; each becomes a `Scenario` field of the same name.
 _REQUIRED = tuple("id title system model rules limits engine driver exchanges expect".split())
+# Event types a `crash_after` step can narrow down to one tool call (see fakeprov/README.md).
+_CALL_EVENTS = ("tool_call.ready", "permission.asked", "tool.start", "tool.end", "item")
 _DECISION = {"enum": ["allow", "ask", "deny"]}
 _STYLE = {"enum": ["openrouter", "openai"]}
 _STRICT = _obj({"reject_params": _STRS, "reject_unsigned_reasoning": _BOOL})
@@ -312,6 +316,10 @@ def _check_semantics(name: str, data: dict[str, Any]) -> None:
             turns += 1
         if "crash_after" in step and (i + 1 == len(steps) or "user" not in steps[i + 1]):
             fail(f"$.driver[{i}]", "crash_after must be followed by a user step")
+        if "call_id" in step:
+            referenced.add(step["call_id"])
+            if step["crash_after"] not in _CALL_EVENTS:
+                fail(f"$.driver[{i}].call_id", f"{step['crash_after']} events name no tool call")
         if approve := step.get("approve"):
             allowed = approve.get("allow", [])
             referenced |= set(approve.get("deny", []))

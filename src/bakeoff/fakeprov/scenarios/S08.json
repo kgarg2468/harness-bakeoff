@@ -1,19 +1,19 @@
 {
   "id": "S08",
-  "title": "Crash after tool.end, before the next request; resume without re-running the tool",
+  "title": "Crash once the tool result is saved, before the next request; resume without re-running the tool",
   "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
   "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
   "rules": {"*": "allow"},
   "limits": {"max_steps": 12},
   "engine": {"delay_ms": 0},
   "driver": [
-    {"crash_after": "tool.end"},
+    {"crash_after": "item", "call_id": "call_S08_1"},
     {"user": "Write hello.txt containing 'hello from S08', then confirm."},
     {"resume": "crash"}
   ],
   "exchanges": [
     {
-      "note": "The worker is SIGKILLed right after this call's tool.end.",
+      "note": "The worker SIGKILLs itself once call_S08_1's result item is saved: after tool.end, before request 2.",
       "expect": {"last_role": "user", "messages_len": 2},
       "respond": {
         "stream": [
