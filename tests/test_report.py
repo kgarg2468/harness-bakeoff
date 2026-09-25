@@ -625,7 +625,7 @@ def test_a_live_run_that_did_not_pass_is_not_a_sample(out: Path) -> None:
 
 def write_live(
     live: Path, run_id: str, impl: str, seconds: float, *, prompt: str = "What is RocketRide?",
-    model: str = "gpt-test", reasoning: str = "low", system: str = "sys",
+    model: str = "gpt-test", reasoning: str = "low", system: str = "sys", max_tokens: int = 4096,
 ) -> None:  # fmt: skip
     """One loop's live run: result.json, and the session log's thread row with the system prompt
     and the model config (minus the key), as `bakeoff live` saves them."""
@@ -638,8 +638,9 @@ def write_live(
         "error": None, "thread": f"live-{impl}",
     })  # fmt: skip
     config = asdict(
-        ModelConfig(base_url, model, kind="openai_compat", reasoning={"effort": reasoning})
-    )
+        ModelConfig(base_url, model, kind="openai_compat", reasoning={"effort": reasoning},
+                    max_tokens=max_tokens)
+    )  # fmt: skip
     del config["api_key"]
     log = SessionLog(folder / "log.sqlite")
     log.create_thread(f"live-{impl}", impl=impl, system=system, meta={"rules": {}, "model": config})
@@ -661,11 +662,11 @@ def test_live_medians_pool_only_runs_of_one_prompt(out: Path, tmp_path: Path) ->
     setup = "gpt-test, reasoning low, api.openai.com"
     assert (
         "Less time per step: median B 2.55 s vs A 3.35 s over 2 live runs of one prompt and "
-        f"setup (“What is RocketRide?”; {setup};"
+        f"setup (setup 2: “What is RocketRide?”; {setup};"
     ) in text
     assert (
         "Less time per step: median B 9.10 s vs A 3.05 s over 2 live runs of one prompt and "
-        f"setup (“Build a chat pipeline.”; {setup};"
+        f"setup (setup 1: “Build a chat pipeline.”; {setup};"
     ) in text
 
 
@@ -686,6 +687,37 @@ def test_live_medians_pool_only_runs_of_one_model_setup(out: Path, tmp_path: Pat
     assert "gpt-test, reasoning high, api.openai.com" in text
     # The live section says which run is not compared, and why.
     assert "the loops ran different prompts or model settings: not in the medians" in text
+
+
+def test_live_groups_never_read_the_same(out: Path, tmp_path: Path) -> None:
+    """Two groups whose prompts share the quoted start, or whose settings differ outside the
+    model, reasoning and endpoint, still read differently: each has a number (in section 5 and
+    in its claims), names the settings that differ, and quotes up to where the prompts part."""
+    stem = "Build a RocketRide pipeline that answers questions from a chat, with a vector store "
+    live = tmp_path / "live"
+    for run_id, prompt, max_tokens, ours in (
+        ("L1", stem + "and a reranker.", 4096, 1.0), ("L2", stem + "and a reranker.", 4096, 1.1),
+        ("L3", stem + "and no reranker.", 4096, 2.0), ("L4", stem + "and no reranker.", 4096, 2.1),
+        ("L5", stem + "and a reranker.", 512, 3.0), ("L6", stem + "and a reranker.", 512, 3.1),
+    ):  # fmt: skip
+        write_live(live, run_id, "our", ours, prompt=prompt, max_tokens=max_tokens)
+        write_live(live, run_id, "pydantic", 5.0, prompt=prompt, max_tokens=max_tokens)
+    text = re.sub(r"<[^>]+>", "", make(out, live=live))
+    setup = "gpt-test, reasoning low, api.openai.com, max_tokens"
+    quote = (
+        "“Build a RocketRide pipeline that answers questions from a chat, with a vector store and "
+    )
+    # Newest first among groups of one size: L5/L6, then L3/L4, then L1/L2.
+    for n, seconds, ending, max_tokens in (
+        (1, "3.05 s", "a reranker.”", 512), (2, "2.05 s", "no reranker.”", 4096),
+        (3, "1.05 s", "a reranker.”", 4096),
+    ):  # fmt: skip
+        assert (
+            f"median B {seconds} vs A 5.00 s over 2 live runs of one prompt and setup "
+            f"(setup {n}: {quote}{ending}; {setup} {max_tokens};"
+        ) in text
+    for run_id, n, max_tokens in (("L6", 1, 512), ("L4", 2, 4096), ("L1", 3, 4096)):
+        assert f"live run {run_id} · setup {n}: {setup} {max_tokens}prompt" in text
 
 
 def test_live_medians_pool_only_runs_of_one_system_prompt(out: Path, tmp_path: Path) -> None:

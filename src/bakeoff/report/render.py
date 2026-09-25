@@ -10,7 +10,8 @@ from __future__ import annotations
 import html
 import itertools
 import json
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
@@ -1037,6 +1038,9 @@ def live(page: Page) -> str:
     if not page.live:
         return intro + _empty("No live runs yet.", "bakeoff live")
     out = [intro]
+    groups = _live_groups(page)
+    varying = _varying(groups)
+    number = {run["run_id"]: k for k, group in enumerate(groups, 1) for run in group}
     for run in page.live:
         results = run["results"]
         cols = []
@@ -1078,9 +1082,10 @@ def live(page: Page) -> str:
                 f'<dl class="stats">{dl}</dl>{error}<div class="answer"><div class="k">final answer</div>'
                 f"{_expandable(r.get('final_text') or '', 700)}</div></div>"
             )
-        # Which runs the medians in section 6 pool: those of one prompt and model setup.
+        # Which runs the medians in section 6 pool: those of one prompt and model setup. The
+        # number is the one the claims name, so a reader can tell two similar setups apart.
         setup = (
-            f" · {esc(_setup(run))}"
+            f" · setup {number[run['run_id']]}: {esc(_setup(_settings(run), varying))}"
             if run.get("group")
             else " · the loops ran different prompts or model settings: not in the medians"
         )
@@ -1340,32 +1345,80 @@ def _answered(result: dict[str, Any] | None) -> bool:
     return bool(stops) and stops[-1] == "end_turn"
 
 
-def _setup(run: dict[str, Any]) -> str:
-    """ "gpt-6-luna, reasoning low, api.openai.com": the model settings of a live run's group."""
-    settings = next(iter(run["results"].values())).get("settings") or {}
-    reasoning = settings.get("reasoning")
-    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
-    parts = [settings.get("model") or "unknown model", effort and f"reasoning {effort}"]
-    return ", ".join(str(p) for p in (*parts, settings.get("endpoint")) if p)
-
-
-def _live_claims(page: Page) -> list[Claim]:
-    """Live claims per group of runs with one prompt and model setup (see `data.load_live`),
-    largest group first: medians over runs of different prompts or models compare nothing."""
+def _live_groups(page: Page) -> list[list[dict[str, Any]]]:
+    """The live runs by prompt and model setup (see `data.load_live`), largest group first;
+    "setup N" on the page is the Nth. Runs whose loops differ are in none."""
     groups: dict[str, list[dict[str, Any]]] = {}
     for run in page.live:
         if run.get("group"):
             groups.setdefault(run["group"], []).append(run)
     # Stable sort: among groups of one size, the newest first (page.live is newest first).
-    ordered = sorted(groups.values(), key=len, reverse=True)
-    return [claim for runs in ordered for claim in _group_claims(page, runs)]
+    return sorted(groups.values(), key=len, reverse=True)
 
 
-def _group_claims(page: Page, group: list[dict[str, Any]]) -> list[Claim]:
+def _settings(run: dict[str, Any]) -> dict[str, Any]:
+    """A grouped live run's model settings (all its loops share them)."""
+    return next(iter(run["results"].values())).get("settings") or {}
+
+
+def _varying(groups: list[list[dict[str, Any]]]) -> set[str]:
+    """The settings that differ between the live groups: each group names them, so two groups
+    never read the same."""
+    values: dict[str, set[str]] = {}
+    for group in groups:
+        for key, value in _settings(group[0]).items():
+            values.setdefault(key, set()).add(json.dumps(value, sort_keys=True))
+    return {key for key, seen in values.items() if len(seen) > 1}
+
+
+def _setting(value: Any) -> str:
+    if value is None:
+        return "unset"
+    return value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+
+
+def _setup(settings: dict[str, Any], varying: set[str]) -> str:
+    """ "gpt-6-luna, reasoning low, api.openai.com": a live group's model, reasoning and
+    endpoint, plus every setting in `varying` (those that differ between the groups)."""
+    reasoning = settings.get("reasoning")
+    if isinstance(reasoning, dict) and set(reasoning) == {"effort"}:
+        reasoning = reasoning["effort"]
+    parts = [settings.get("model") or "unknown model"]
+    if reasoning is not None or "reasoning" in varying:
+        parts.append(f"reasoning {_setting(reasoning)}")
+    parts.append(settings.get("endpoint") or ("unknown endpoint" if "endpoint" in varying else ""))
+    for key in sorted(varying - {"model", "reasoning", "endpoint"}):
+        # The system prompt is a hash: it is long, and only whether it changed matters here.
+        name = "system prompt #" if key == "system" else f"{key} "
+        parts.append(f"{name}{_setting(settings.get(key))}")
+    return ", ".join(str(p) for p in parts if p)
+
+
+def _quote(prompt: str, others: Iterable[str]) -> str:
+    """A live prompt's start, quoted: 60 characters, or 20 past where it parts from another
+    group's prompt, so two groups never quote the same text."""
+    n = max([60, *(len(os.path.commonprefix([prompt, o])) + 20 for o in others if o != prompt)])
+    return f"“{prompt[:n]}…”" if len(prompt) > n else f"“{prompt}”"
+
+
+def _live_claims(page: Page) -> list[Claim]:
+    """Live claims per group of runs with one prompt and model setup, largest group first:
+    medians over runs of different prompts or models compare nothing. Each claim names its
+    setup the way section 5 labels the runs it pools."""
+    groups = _live_groups(page)
+    varying, prompts = _varying(groups), [group[0]["prompt"] for group in groups]
+    claims = []
+    for k, group in enumerate(groups, 1):
+        quoted, setup = _quote(group[0]["prompt"], prompts), _setup(_settings(group[0]), varying)
+        claims += _group_claims(page, group, esc(f"setup {k}: {quoted}; {setup}"))
+    return claims
+
+
+def _group_claims(page: Page, group: list[dict[str, Any]], setup: str) -> list[Claim]:
     """Latency and input tokens over the group's runs every live loop answered: medians, and a
     win only with enough samples and a clear margin. A run counts only if every loop finished it
     (passed, last stop end_turn, no error): a loop that failed at once would otherwise look fast
-    and cheap."""
+    and cheap. `setup` (HTML) names the group."""
     loops = [i for i in page.loops if any(i in run["results"] for run in group)]
     samples = [
         run["results"] for run in group if all(_answered(run["results"].get(i)) for i in loops)
@@ -1373,9 +1426,6 @@ def _group_claims(page: Page, group: list[dict[str, Any]]) -> list[Claim]:
     if len(loops) < 2 or not samples:
         return []
     n = len(samples)
-    prompt = group[0]["prompt"]
-    quoted = f"“{prompt[:60]}…”" if len(prompt) > 60 else f"“{prompt}”"
-    setup = f"{esc(quoted)}; {esc(_setup(group[0]))}"
     runs = f"{n} live run{'s' * (n != 1)} of one prompt and setup"
     # The model decides how many steps a task takes, and that swamps any loop difference in the
     # whole-answer time. So compare per step, and show the step counts as context.
