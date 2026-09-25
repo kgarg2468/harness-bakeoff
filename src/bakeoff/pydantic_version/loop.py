@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from typing import Any
 
+import httpx
+import openai
 import pydantic_ai
 from pydantic import ValidationError
 from pydantic_ai import (
@@ -72,6 +74,13 @@ from bakeoff.shared.contract import (
     ToolSpec,
     TurnInput,
 )
+
+try:  # the HTTP library of the OpenAI SDK in use: httpx (openai 2.x) or httpx2 (3.x)
+    import httpx2
+
+    _DROPPED: tuple[type[Exception], ...] = (httpx.TransportError, httpx2.TransportError)
+except ImportError:
+    _DROPPED = (httpx.TransportError,)
 
 # The OpenAI SDK retries inside one call and numbers the attempts only in this request header.
 _RETRY_HEADER = "x-stainless-retry-count"
@@ -434,16 +443,22 @@ def _pause(state: _Turn, calls: list[ToolCallPart]) -> dict[str, Any]:
 
 def _retry_reason(exc: BaseException | None) -> str | None:
     """Why a provider error may pass on a new attempt, or None: a 429 or 5xx, a dropped
-    connection, or OpenRouter's mid-stream error chunk. That chunk's code is a string, which
-    pydantic-ai's `_OpenRouterError` model rejects, so it arrives as that model's ValidationError
-    (a library bug, A_CHECKLIST)."""
+    connection, or an error event mid-stream. pydantic-ai wraps only some of these, so the
+    others arrive as they were raised (library behaviors, A_CHECKLIST)."""
     if isinstance(exc, ModelHTTPError):
         status = exc.status_code
         return f"HTTP {status}" if status == 429 or status >= 500 else None
     if isinstance(exc, ModelAPIError):
         return exc.message
+    if isinstance(exc, openai.APIError):  # an OpenAI-style error event mid-stream (BYOK)
+        return f"stream error: {exc.message}"
+    if isinstance(exc, _DROPPED):  # the connection dropped mid-stream (openai 2.x)
+        return f"connection error: {type(exc).__name__}"
     if isinstance(exc, ValidationError) and exc.title == "_OpenRouterError":
-        return f"OpenRouter error chunk: {exc.errors()[0].get('input')}"
+        # OpenRouter's error chunk, whose string `code` the library's model rejects, or no error
+        # body at all: a stream that dropped (openai 3.x).
+        error = exc.errors()[0]
+        return f"OpenRouter error chunk: {error['input']}" if error["loc"] else "connection error"
     return None
 
 

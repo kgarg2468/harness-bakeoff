@@ -796,3 +796,35 @@ async def test_byok_thinking_in_think_tags_is_shown_as_it_is_sent(loop):
         "content": "<think>\nplan it\n</think>\n\nThe answer.",
     }
     assert srv.requests[1]["messages"][2] == answer.message
+
+
+@pytest.mark.parametrize(
+    ("kind", "failure", "reason"),
+    [
+        ("openrouter", "drop", "connection error"),
+        ("openai_compat", "drop", "connection error"),
+        ("openai_compat", "error_event", "stream error: internal server error"),
+    ],
+)
+async def test_a_dropped_stream_or_an_error_event_is_retried(
+    loop, monkeypatch, kind, failure, reason
+):
+    """pydantic-ai lets these through unwrapped: a connection cut mid-body (openai 2.x: raw httpx;
+    3.x on OpenRouter: the error model's ValidationError) and a BYOK `{"error": ...}` event
+    (raw `openai.APIError`). Both are provider failures, so the step is retried."""
+    monkeypatch.setattr(loop_module, "_STREAM_RETRY_BASE_S", 0.01)
+    if failure == "drop":
+        failing = Reply(text("Hi ag"), drop=True)
+    else:
+        event = {"error": {"message": "Internal server error", "type": "server_error"}}
+        failing = Reply([*text("Hi ag"), event])
+    with SSEServer(failing, Reply([*text("Hi again!"), done()])) as srv:
+        name = "anthropic/claude-test" if kind == "openrouter" else "qwen3-coder"
+        model = config(srv, kind=kind, model=name, max_retries=2)
+        events = await run(loop, turn([user("hi")], model), StubTools())
+
+    assert len(srv.bodies) == 2
+    [retry] = of(events, "retry")
+    assert retry["reason"].lower().startswith(reason)  # 3.x wraps some: "Connection error."
+    assert [i.message["content"] for i in items(events)] == ["Hi again!"]
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]

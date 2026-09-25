@@ -27,6 +27,7 @@ class Reply:
     headers: dict[str, str] = field(default_factory=dict)
     body: dict[str, Any] | None = None  # sent as a plain JSON body instead of a stream
     stall: bool = False  # after the chunks, keep the connection open until the server stops
+    drop: bool = False  # after the chunks, close the connection before the promised body ends
 
 
 def chunk(
@@ -150,6 +151,8 @@ def _handler(server: SSEServer) -> type[BaseHTTPRequestHandler]:
             self.send_response(200)
             for key, value in {"Content-Type": "text/event-stream", **reply.headers}.items():
                 self.send_header(key, value)
+            if reply.drop:  # a body length the stream never reaches: the client sees a cut
+                self.send_header("Content-Length", "1000000")
             self.send_header("Connection", "close")
             self.end_headers()
             try:
@@ -162,6 +165,9 @@ def _handler(server: SSEServer) -> type[BaseHTTPRequestHandler]:
                     self.wfile.flush()
                 if reply.stall:
                     server._stop.wait()
+                    return
+                if reply.drop:
+                    self.close_connection = True
                     return
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
