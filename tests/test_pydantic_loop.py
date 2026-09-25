@@ -950,6 +950,27 @@ async def test_a_crash_after_a_cancel_never_runs_the_cancelled_call(loop):
     assert len(srv.bodies) == 1  # no request after the resume
 
 
+async def test_a_crash_after_a_stream_that_failed_for_good_ends_with_an_error(loop):
+    """A stream that fails on its last attempt ends the run with its error; the response it cut
+    short is saved, its call closed. After a crash once that response is saved, the resume ends
+    with an error too, not as a cancel (its saved finish reason says a failure cut it), and
+    runs and sends nothing."""
+    tools = StubTools()
+    call = tool_call(0, "w1", "write_file", '{"path": "a", "content": "x"}')
+    with SSEServer(Reply([*text("Writing it."), *call], drop=True)) as srv:
+        first = await run(loop, turn([user("write a")], config(srv)), tools)
+        cut = items(first)[0]
+        history = [user("write a"), cut]  # SIGKILL before the closing item was saved
+        resumed = await run(loop, turn(history, config(srv), resume=Resume("crash")), tools)
+
+    assert of(first, "turn.end")[0]["stop"] == "error"
+    assert of(resumed, "turn.end")[0]["stop"] == "error"
+    assert of(resumed, "turn.end")[0]["error"] == f"UnexpectedModelBehavior: {loop_module._ENDED}"
+    assert [i.message["tool_call_id"] for i in items(resumed)] == ["w1"]
+    assert (tools.runs, len(srv.bodies)) == ([], 1)
+    assert (cut.status, cut.native["finish_reason"]) == ("incomplete", "error")
+
+
 async def test_a_crash_after_the_final_answer_sends_nothing_more(loop):
     tools = StubTools()
     replies = [Reply([*tool_call(0, "c1", "read_file", '{"path": "a"}'), done("tool_calls")])]
@@ -1422,6 +1443,39 @@ async def test_responses_a_failed_response_with_usage_is_no_answer(loop, tmp_pat
     else:
         assert [(i.status, i.message["content"]) for i in items(events)] == [("incomplete", "Hal")]
         assert of(events, "turn.end")[0]["stop"] == "error"
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [
+        {"failed": {"message": "boom", "usage": {"input_tokens": 20, "output_tokens": 3}}},
+        {"error": {"message": "boom"}},
+    ],
+    ids=["failed-with-usage", "error-event"],
+)
+async def test_a_crash_after_a_responses_stream_that_failed_for_good_ends_with_an_error(
+    loop, tmp_path, ending
+):
+    """A failed Responses stream on the last attempt ends the run (r1) with its error. A crash
+    once the response it cut short is saved (run r2) ends the resumed turn with an error too,
+    not as a cancel, and sends nothing."""
+    cut = {"respond": {"stream": [{"text": "Hal", "done": False}, ending]}}
+    with responses_server(tmp_path, cut, cut) as srv:
+        whole = await run(loop, turn([user("hi")], responses_config(srv)), StubTools())
+        cfg = responses_config(srv, run="r2")
+        history = [user("hi")]
+        stream = loop.run_turn(turn(history, cfg), StubTools(), asyncio.Event())
+        async with contextlib.aclosing(stream):
+            async for event in stream:
+                if event.type == "item":
+                    history.append(items([event])[0])
+                    break  # SIGKILL once the response is saved
+        resumed = await run(loop, turn(history, cfg, resume=Resume("crash")), StubTools())
+
+    assert of(whole, "turn.end")[0]["stop"] == "error"
+    assert of(resumed, "turn.end")[0]["stop"] == "error"
+    assert (len(sent(tmp_path)), len(sent(tmp_path, "r2"))) == (1, 1)
+    assert [(i.status, i.native["finish_reason"]) for i in history[1:]] == [("incomplete", "error")]
 
 
 async def test_the_event_that_ends_a_responses_stream_is_read_across_chunks():

@@ -174,20 +174,19 @@ def spent(history: list[ModelMessage]) -> RunUsage:
 
 
 def finished(history: list[ModelMessage], max_cost_usd: float | None = None) -> str | None:
-    """How the turn ended if its end is already saved (a crash came after it), as the original
-    run reported it: "cancelled" after a response cut short (a cancel, or a failed stream that
-    ended the turn). After a last response without calls that ends the turn: "budget" if the
-    turn's cost crossed `max_cost_usd` (the library checks the cost as it adds a response,
-    before it reads it), else "end_turn" after the final answer, or "error" after no answer
-    that the library raises on instead of asking again: out of output tokens (finish reason
+    """How the turn ended if its end is already saved (a crash came after it), as the original run
+    reported it. After a response cut short: "error" if a failure cut it (the loop saves it with
+    finish reason "error"), else "cancelled". After a last response without calls that ends the
+    turn: "budget" if the turn's cost crossed `max_cost_usd` (the library checks the cost as it adds
+    a response, before it reads it), else "end_turn" after the final answer, or "error" after no
+    answer that the library raises on instead of asking again: out of output tokens (finish reason
     "length", say a reasoning-only `.incomplete` on 2.50.0), or blank and stopped by a content
     filter. None if the turn goes on: any other response without text (say, reasoning only on
-    2.31.1, which gives `.incomplete` no finish reason) is no answer, and the library asks
-    again."""
+    2.31.1, which gives `.incomplete` no finish reason) is no answer, and the library asks again."""
     turn = this_turn(history)
     response = next((m for m in reversed(turn) if isinstance(m, ModelResponse)), None)
     if response is not None and response.state == "interrupted":
-        return "cancelled"
+        return "error" if response.finish_reason == "error" else "cancelled"
     if response is None or turn[-1] is not response or response.tool_calls:
         return None
     # 2.50.0's rule: blank is no parts or only empty text parts. 2.31.1 differs only on empty

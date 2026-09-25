@@ -91,9 +91,9 @@ _RETRY_HEADER = "x-stainless-retry-count"
 # Backoff before retrying a failed stream: the OpenAI SDK's own schedule (0.5 s doubling, max 8 s).
 _STREAM_RETRY_BASE_S = 0.5
 _STEP_CAP_RESULT = "Not run: the turn reached its step limit."
-# A crash resume's error when the saved last response already ended the turn with the library's
-# token limit (or content filter) error, whose text is not saved.
-_NO_ANSWER = "the model stopped before it answered (token limit or content filter)"
+# A crash resume's error when the saved last response already ended the turn with an error, whose
+# text is not saved: a failed response, or the library's token limit (or content filter) error.
+_ENDED = "the turn had already ended with an error: the response failed or held no answer"
 # The Responses stream events that end a response the library may take: complete, or out of
 # `max_output_tokens` (the library answers that itself). Not `response.failed` or `error`.
 _RESPONSE_ENDS = ("response.completed", "response.incomplete")
@@ -313,7 +313,7 @@ class PydanticLoop:
             if turn.resume is not None and (stop := mapping.finished(history, limit)):
                 # A crash came after the turn's end was saved: end it as the run did.
                 if stop == "error":
-                    raise UnexpectedModelBehavior(_NO_ANSWER)
+                    raise UnexpectedModelBehavior(_ENDED)
                 return {"stop": stop}
         deferred = None
         if pending := mapping.pending_calls(history):
@@ -389,7 +389,13 @@ class PydanticLoop:
             # history is complete only once the run has unwound, in the RunCancelled snapshot.
             ended = exc if isinstance(exc, RunCancelled) else run
             if ended is not None:
-                state.flush(ended.new_messages())
+                messages = ended.new_messages()
+                for message in messages if ended is run else []:
+                    # A failure, not a cancel, cut this response short: its saved finish reason
+                    # says so, and a crash resume ends with an error too (`mapping.finished`).
+                    if isinstance(message, ModelResponse) and message.state == "interrupted":
+                        message.finish_reason = "error"
+                state.flush(messages)
                 saved = mapping.to_history([*turn.history, *state.items])
                 state.flush(mapping.close_pending(saved))
             raise
