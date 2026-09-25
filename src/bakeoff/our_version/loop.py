@@ -348,12 +348,13 @@ class _Turn:
             async for event in self._tools(calls):
                 yield event
             return
-        # A cancel can land after the answer is complete (e.g. while draining the body's end):
-        # the user stopped the turn, so it must not be reported as a step limit.
-        cancelled = self.cancel.is_set()
+        # A cancel can land at any point here, even while these results are being published
+        # (each yield hands control to the runner): the user stopped the turn, so it must not
+        # be reported as a step limit. Read the flag afresh for every result and for the end.
         for call in calls:
-            yield self._result(ToolResult(call.id, False, CANCELLED if cancelled else _STEP_CAP))
-        yield self._end("cancelled" if cancelled else "max_steps")
+            text = CANCELLED if self.cancel.is_set() else _STEP_CAP
+            yield self._result(ToolResult(call.id, False, text))
+        yield self._end("cancelled" if self.cancel.is_set() else "max_steps")
 
     async def _tools(self, calls: list[ToolCall]) -> AsyncIterator[Event]:
         """Run the calls and append one result per call, in call order.

@@ -807,6 +807,26 @@ async def test_max_steps_stops_after_exactly_n_requests() -> None:
     }
 
 
+async def test_cancel_while_step_cap_results_publish_ends_cancelled() -> None:
+    """Greptile #4104366317: the user cancels while the capped step's results are being
+    published. The results after that say cancelled and the turn ends cancelled, not max_steps."""
+    calls = [call(0, "{}", "c0", "describe_component"), call(1, "{}", "c1", "describe_component")]
+    server = Server(sse(*calls, finish("tool_calls")))
+    cancel = asyncio.Event()
+    events = []
+    gen = server.loop().run_turn(
+        turn([user("go")], limits=Limits(max_steps=1)), StubTools(), cancel
+    )
+    async for event in gen:
+        events.append(event)
+        if event.type == "item" and event.data["item"].message.get("tool_call_id") == "c0":
+            cancel.set()  # between the first and second result
+    results = [i.message["content"] for i in items(events) if i.message["role"] == "tool"]
+    assert results[0] == "Not run: the turn reached its step limit"
+    assert results[1] == "Cancelled by user"
+    assert events[-1].data["stop"] == "cancelled"
+
+
 async def cancel_while_draining(
     *chunks: dict[str, Any] | str, tools: StubTools | None = None, **kw: Any
 ) -> list[Event]:
