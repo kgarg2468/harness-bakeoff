@@ -179,3 +179,22 @@ def test_an_in_process_loop_crash_is_recorded_not_raised(monkeypatch):
         bench.Config(turns=1, warmup=0, chunks=10), ["our_version"], isolate=False
     )
     assert report["loops"]["our_version"] == {"error": "FileNotFoundError: wire/003.json"}
+
+
+def test_provider_stop_uses_terminate_on_windows(monkeypatch):
+    from bakeoff.metrics import bench
+
+    calls = []
+
+    class Proc:
+        def terminate(self):
+            calls.append("terminate")
+
+        def send_signal(self, sig):
+            calls.append(f"signal {sig}")
+
+    monkeypatch.setattr(bench.sys, "platform", "win32")
+    bench._stop(Proc())
+    monkeypatch.setattr(bench.sys, "platform", "linux")
+    bench._stop(Proc())
+    assert calls == ["terminate", f"signal {bench.signal.SIGINT}"]

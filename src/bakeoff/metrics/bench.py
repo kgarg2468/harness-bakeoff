@@ -264,6 +264,15 @@ def child_env() -> dict[str, str]:
     return os.environ | {"PYTHONPATH": os.pathsep.join(path)}
 
 
+def _stop(proc: subprocess.Popen[str]) -> None:
+    """Ask the fake provider to exit: SIGINT (its main() stops the server cleanly on Ctrl-C)
+    where signals exist; Windows has no SIGINT for Popen, so it is terminated instead."""
+    if sys.platform == "win32":
+        proc.terminate()
+    else:
+        proc.send_signal(signal.SIGINT)
+
+
 @contextlib.contextmanager
 def fake_provider(scenarios: Path, wire: Path) -> Iterator[int]:
     """Serve `scenarios` with `python -m bakeoff.fakeprov` in a child process; yield its port."""
@@ -277,7 +286,7 @@ def fake_provider(scenarios: Path, wire: Path) -> Iterator[int]:
             raise BenchError(f"the fake provider did not start: {line!r}")
         yield int(match[1])
     finally:
-        proc.send_signal(signal.SIGINT)  # its main() stops the server cleanly on Ctrl-C
+        _stop(proc)
         try:
             proc.wait(10)
         except subprocess.TimeoutExpired:
