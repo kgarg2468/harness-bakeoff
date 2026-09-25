@@ -590,6 +590,15 @@ def test_scenario_file_is_valid_and_consistent(path: Path):
             lambda s: s["expect"].update(tool_runs={"call_x": 1}),
             "$.expect: unknown tool call ids: ['call_x']",
         ),
+        (
+            lambda s: s["expect"].update(tools_overlap=["call_x", "call_y"]),
+            "$.expect: unknown tool call ids: ['call_x', 'call_y']",
+        ),
+        (lambda s: s["expect"].update(tools_overlap=["call_x"]), "$.expect.tools_overlap"),
+        (
+            lambda s: s["expect"].update(cancel_within_ms=200),
+            "$.expect.cancel_within_ms: no driver step has cancel_after_ms",
+        ),
     ],
 )
 def test_invalid_scenarios_have_clear_errors(tmp_path: Path, change, error: str):

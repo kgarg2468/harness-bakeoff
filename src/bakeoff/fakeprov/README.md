@@ -153,6 +153,8 @@ Responses are deterministic: identical for every run and impl.
 | `cost_usd` | the sum of provider-reported costs over all usage events (compare with a 1e-9 tolerance) |
 | `usage` | `{input_tokens, output_tokens, cached_tokens}`: the totals over all usage events |
 | `cost_source` | every usage event's `cost_source` equals it: `provider` (billed cost from the provider), `estimate` (a price table) or `none` (no cost available, never guessed) |
+| `tools_overlap` | `[call_id, ...]` (at least 2): the tools of these calls ran at the same time. Each ran once, in one turn, and the last `tool.start` comes before the first `tool.end` (event `t_us`) |
+| `cancel_within_ms` | every turn the driver cancels (`cancel_after_ms`) has its `turn.end` at most this many ms after the driver set `cancel`. The driver notes when it set it; `t_us` in the log gives the rest. A turn that ends before its cancel fires passes this key; `stops` judges it |
 
 Tool call ids are `call_<scenario>_<n>`, unique per scenario; the loader rejects references
 to ids that no exchange scripts. Content checks on tool results stay loose (substrings),

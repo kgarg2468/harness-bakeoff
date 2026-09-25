@@ -66,6 +66,7 @@
     "stops": ["end_turn"],
     "requests": 2,
     "commits": 1,
-    "tool_runs": {"call_S03_1": 1, "call_S03_2": 1, "call_S03_3": 1}
+    "tool_runs": {"call_S03_1": 1, "call_S03_2": 1, "call_S03_3": 1},
+    "tools_overlap": ["call_S03_1", "call_S03_2", "call_S03_3"]
   }
 }
