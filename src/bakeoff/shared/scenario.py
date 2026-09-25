@@ -512,7 +512,8 @@ async def run_scenario(
         # counts too, also while the driver waits for a child process. The driver itself
         # prints nothing here, and children write to their own pipes.
         with capture_output() as captured:
-            error = await _drive_and_close(run, loop_factory or loops.load(impl))
+            factory = loop_factory or (lambda: loops.load(impl)())  # a load error is the error
+            error = await _drive_and_close(run, factory)
     finally:
         run.stdout.insert(0, captured.stdout)
         run.stderr.insert(0, captured.stderr)

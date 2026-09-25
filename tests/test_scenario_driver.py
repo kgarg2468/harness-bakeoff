@@ -491,6 +491,20 @@ def result_cancels(detail: str) -> list[tuple[str, float]]:
     return [(turn, float(ms.removesuffix(" ms"))) for turn, ms in (p.split(": ") for p in pairs)]
 
 
+async def test_a_loop_that_cannot_load_is_the_error(
+    real_provider: FakeProvider, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry = replace(loops.REGISTRY["our"], target="bakeoff.our_version:NoSuchLoop")
+    monkeypatch.setitem(loops.REGISTRY, "our", entry)
+    result = await run_scenario(
+        "S01", "our", out=tmp_path / "out", run_id="r1", provider=real_provider
+    )
+    assert not result["passed"]
+    assert (
+        result["error"] == "LoopUnavailable: our: bakeoff.our_version:NoSuchLoop is not built yet"
+    )
+
+
 async def test_a_loop_that_leaks_cancelled_error_fails_only_its_scenario(
     real_provider: FakeProvider, tmp_path: Path
 ) -> None:
