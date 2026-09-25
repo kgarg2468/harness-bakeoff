@@ -380,13 +380,15 @@ class LiveThread:
         self.impl, self.dir, self.term = impl, directory, term
         self.must_answer = must_answer
         self.model = model.config(impl)
+        self.base_url_template = model.base_url
         self.limits = Limits(max_steps=max_steps)
+        self.attended = _attended(rules)
         self.loop = loop or loops.load(impl)()
         self.ws = Workspace(directory / "log.sqlite", sinks=[Printer(term)])
         try:
             self.thread_id = self.ws.runner.new_thread(
                 impl=self.loop.name,
-                system=system_prompt(attended=_attended(rules)),
+                system=system_prompt(attended=self.attended),
                 rules=rules,
                 model=self.model,
                 thread_id=f"live-{impl}",
@@ -471,7 +473,18 @@ class LiveThread:
         err = "".join(c.stderr for c in self.captured)
         checks = check_invariants(self.ws.log, self.thread_id, obs, out, err, wire=False)
         events = self.ws.log.events(self.thread_id)
-        return empty_result(self.impl, self.model, run_id, prompt, duration_ms, error) | {
+        base = empty_result(
+            self.impl,
+            self.model,
+            run_id,
+            prompt,
+            duration_ms,
+            error,
+            max_steps=self.limits.max_steps,
+            attended=self.attended,
+            base_url_template=self.base_url_template,
+        )
+        return base | {
             "final_text": obs.last_text,
             "stops": obs.stops,
             "invariants": {
@@ -522,7 +535,16 @@ class LiveThread:
 
 
 def empty_result(
-    impl: str, model: ModelConfig, run_id: str, prompt: str, duration_ms: float, error: str | None
+    impl: str,
+    model: ModelConfig,
+    run_id: str,
+    prompt: str,
+    duration_ms: float,
+    error: str | None,
+    *,
+    max_steps: int,
+    attended: bool,
+    base_url_template: str,
 ) -> dict[str, Any]:
     """A live result.json with nothing observed: the base of every result, and all that a run
     whose thread could not be set up leaves."""
@@ -532,6 +554,13 @@ def empty_result(
         "impl": impl,
         "model": model.model,
         "base_url": model.base_url,
+        # What the run's behaviour depends on that its session log does not keep: the step cap
+        # (limits go to each turn, never to the log) and whether a person answers approvals.
+        "max_steps": max_steps,
+        "attended": attended,
+        # --base-url before "{impl}" became the loop's name: the report compares the loops of
+        # one run by this, so it never has to guess which path segment was substituted.
+        "base_url_template": base_url_template,
         "prompt": prompt,
         "final_text": "",
         "stops": [],
@@ -558,13 +587,26 @@ async def _finish(
     prompt: str,
     started: float,
     error: str | None,
+    *,
+    rules: dict[str, Any],
+    max_steps: int,
 ) -> dict[str, Any]:
     """`thread.finish(...)`; or, if the thread could not be set up (the loop, the log or the
     working copy failed), a result.json with the error: the run directory may exist already,
     and it blocks its run id, so it must say why it has nothing else."""
     if thread is not None:
         return await thread.finish(run_id, prompt, started, error)
-    result = empty_result(impl, model.config(impl), run_id, prompt, _ms_since(started), error)
+    result = empty_result(
+        impl,
+        model.config(impl),
+        run_id,
+        prompt,
+        _ms_since(started),
+        error,
+        max_steps=max_steps,
+        attended=_attended(rules),
+        base_url_template=model.base_url,
+    )
     write_json(directory / "result.json", result)
     return result
 
@@ -624,7 +666,18 @@ async def run_live(
             raise
         finally:
             results.append(
-                await _finish(thread, impl, directory, model, run_id, prompt, started, error)
+                await _finish(
+                    thread,
+                    impl,
+                    directory,
+                    model,
+                    run_id,
+                    prompt,
+                    started,
+                    error,
+                    rules=rules,
+                    max_steps=max_steps,
+                )
             )
             point_latest(out / "live", run_id)
     return results
@@ -717,7 +770,18 @@ async def chat(
         error = f"interrupted ({type(exc).__name__})"
         raise
     finally:
-        result = await _finish(thread, impl, directory, model, run_id, "(chat)", started, error)
+        result = await _finish(
+            thread,
+            impl,
+            directory,
+            model,
+            run_id,
+            "(chat)",
+            started,
+            error,
+            rules=ASK_RULES,
+            max_steps=max_steps,
+        )
         point_latest(out / "live", run_id)
     return result
 

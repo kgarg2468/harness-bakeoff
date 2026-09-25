@@ -131,6 +131,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cancel", help="ask the worker running a thread's turn to cancel it")
     _thread_args(p)
 
+    # `report` keeps its own argument parser (bakeoff.report.build); see main().
+    sub.add_parser("report", help="build the comparison page (out/report.html)", add_help=False)
     p = sub.add_parser("fakeprov", help="serve the fake model server on 127.0.0.1")
     p.add_argument("--port", type=int, default=8787)
     p.add_argument("--wire-dir", type=Path, default=Path("out/wire"))
@@ -140,6 +142,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point of `bakeoff` and `python -m bakeoff.cli`."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["report"]:  # its options live in the report package
+        from bakeoff.report import build
+
+        return build.main(argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
