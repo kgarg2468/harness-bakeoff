@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -527,16 +528,22 @@ def test_timings_need_a_clear_margin_and_live_runs_more_than_one_sample(out: Pat
     metrics["deps"]["our_version"]["import_ms"] = 800.0  # within 10% of A's 850
     write_json(out / "metrics.json", metrics)
     live = json.loads((out / "live" / "L1" / "our" / "result.json").read_text())
+    for impl in ("our", "pydantic"):  # same step count in every run: per-step values compare
+        path = out / "live" / "L1" / impl / "result.json"
+        write_json(path, {**json.loads(path.read_text()), "steps": 2})
     for impl, seconds in (("our", 2.6), ("pydantic", 3.3)):  # a second sample
         write_json(out / "live" / "L2" / impl / "result.json",
-                   {**live, "run_id": "L2", "impl": impl, "duration_ms": seconds * 1000})  # fmt: skip
+                   {**live, "run_id": "L2", "impl": impl, "steps": 2, "duration_ms": seconds * 1000})  # fmt: skip
     html = make(out)
     assert "Adds less time on top of the model" not in html
     assert "the median and the slow tail do not both differ by 10%" in html
     assert "Starts faster in a fresh process" not in html and "850.0 ms, within 10%" in html
-    # Two live runs, B about 25% faster in both: now a win, stated as a median.
-    assert "Answered faster: median B 2.55 s vs A" in html and "over 2 live runs" in html
-    assert "median B 1,234 vs A 1,234 over 2 live runs, within 10%" in html  # equal tokens
+    # Two live runs, same steps, B about 25% faster in both: a per-step win, stated as a median,
+    # with the model's step counts as context.
+    assert "Less time per step: median B" in html and "over 2 live runs" in html
+    assert "steps per answer: median B" in html and "chosen by the model" in html
+    text = re.sub(r"<[^>]+>", "", html)  # the label is a glossary term (a tooltip span)
+    assert "Input tokens per step: median B" in text and "within 10%" in text  # equal tokens
 
 
 def test_a_live_run_a_loop_did_not_finish_is_not_a_sample(out: Path) -> None:

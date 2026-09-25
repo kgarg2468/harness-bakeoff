@@ -1321,6 +1321,11 @@ def _claims(page: Page) -> list[Claim]:
     return claims
 
 
+def _per_step(result: dict[str, Any], value: Any) -> float | None:
+    steps = result.get("steps")
+    return value / steps if isinstance(value, (int, float)) and steps else None
+
+
 def _answered(result: dict[str, Any] | None) -> bool:
     """The loop finished the live run: its last turn ended with end_turn and nothing failed."""
     if not result or result.get("error"):
@@ -1342,27 +1347,36 @@ def _live_claims(page: Page) -> list[Claim]:
         return []
     n = len(samples)
     runs = f"{n} live run{'s' * (n != 1)}"
-    latency = {i: _median([r[i].get("duration_ms") for r in samples]) for i in loops}
-    tokens = {
-        i: _median([(r[i].get("usage") or {}).get("input_tokens") for r in samples]) for i in loops
+    # The model decides how many steps a task takes, and that swamps any loop difference in the
+    # whole-answer time. So compare per step, and show the step counts as context.
+    steps = {i: _median([r[i].get("steps") for r in samples]) for i in loops}
+    latency = {
+        i: _median([_per_step(r[i], r[i].get("duration_ms")) for r in samples]) for i in loops
     }
+    tokens = {
+        i: _median(
+            [_per_step(r[i], (r[i].get("usage") or {}).get("input_tokens")) for r in samples]
+        )
+        for i in loops
+    }
+    context = f"steps per answer: median {_vs(steps, fmt_int)}, chosen by the model"
     if n < MIN_LIVE_SAMPLES:
         shown = (
-            f"{term('latency', 'Answer time')} {_vs(latency, fmt_ms)}; "
-            f"{term('tokens', 'input tokens')} {_vs(tokens, fmt_int)}"
+            f"{term('latency', 'Time')} per step {_vs(latency, fmt_ms)}; "
+            f"{term('tokens', 'input tokens')} per step {_vs(tokens, fmt_int)}"
         )
         why = "the order of runs and the provider's prompt cache swing it"
         return [Claim(None, f"{shown}: one live run, too few to call ({why}).", "#live")]
     claims = []
     for values, win, name, fmt in (
-        (latency, "Answered faster", term("latency", "Answer time"), fmt_ms),
-        (tokens, "Sent fewer input tokens", term("tokens", "Input tokens"), fmt_int),
+        (latency, "Less time per step", term("latency", "Time per step"), fmt_ms),
+        (tokens, "Fewer input tokens per step", term("tokens", "Input tokens per step"), fmt_int),
     ):
-        shown = f"median {_vs(values, fmt)} over {runs}"
+        shown = f"median {_vs(values, fmt)} over {runs} ({context})"
         if (winner := _better(values, margin=TIMING_MARGIN)) is not None:
             claims.append(Claim(winner, f"{win}: {shown}.", "#live"))
         else:
-            claims.append(Claim(None, f"{name}: {shown}, within {TIMING_MARGIN:.0%}.", "#live"))
+            claims.append(Claim(None, f"{name}: {shown}; within {TIMING_MARGIN:.0%}.", "#live"))
     return claims
 
 
