@@ -154,14 +154,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _usable(names: list[str]) -> list[str]:
-    """The loops that import here; says which requested ones are skipped and why."""
-    usable = []
+    """The loops that import here. One that is not built or installed yet is skipped (with a
+    note); one that exists but fails to import is an error, because skipping it would let the
+    command succeed without the comparison it was asked for."""
+    usable, broken = [], []
     for name in names:
         try:
             loops.load(name)
             usable.append(name)
         except loops.LoopUnavailable as exc:
+            if not exc.missing:
+                broken.append(str(exc))
+                continue
             print(f"skipping {exc}", file=sys.stderr)
+    if broken:
+        raise RuntimeError(f"broken loop {'; '.join(broken)} (fix it, or leave it out of --impl)")
     return usable
 
 

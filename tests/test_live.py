@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -465,6 +466,30 @@ def test_cli_scenario_prints_the_matrix(tmp_path: Path, capsys: pytest.CaptureFi
     assert printed.out.splitlines()[:3] == ["scenario  our", "S01       pass", "S13       pass"]
     assert "S01   our       pass" in printed.err
     assert json.loads((tmp_path / "runs" / "c1" / "summary.json").read_text())["run_id"] == "c1"
+
+
+def test_a_broken_loop_fails_the_command_and_a_missing_one_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A loop that exists but does not import must not silently drop out of the comparison."""
+    (tmp_path / "broken_loop.py").write_text("raise ImportError('pydantic_ai renamed Agent')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    broken = replace(loops.REGISTRY["pydantic"], target="broken_loop:PydanticLoop")
+    monkeypatch.setitem(loops.REGISTRY, "pydantic", broken)
+    monkeypatch.setitem(loops.REGISTRY, "probe", loops.LoopEntry("probe", "not_built:Loop", ()))
+    out = tmp_path / "out"
+    assert main(["scenario", "S01", "--impl", "our,pydantic", "--out", str(out)]) == 1
+    err = capsys.readouterr().err
+    assert "error: broken loop pydantic: ImportError: pydantic_ai renamed Agent" in err
+    argv = ["live", "--impl", "our,pydantic", "--prompt", "p", "--out", str(out)]
+    assert main([*argv, "--base-url", "http://127.0.0.1:9/v1"]) == 1
+    assert "error: broken loop pydantic" in capsys.readouterr().err
+    assert not out.exists()  # refused before anything ran
+    # A loop that is not built yet is only skipped.
+    argv = ["scenario", "S01", "--impl", "our,probe", "--out", str(out), "--run-id", "m1"]
+    assert main(argv) == 0
+    assert "skipping probe: not installed" in capsys.readouterr().err
+    assert list(json.loads((out / "runs" / "m1" / "summary.json").read_text())["loops"]) == ["our"]
 
 
 def test_cli_worker_errors_are_reported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

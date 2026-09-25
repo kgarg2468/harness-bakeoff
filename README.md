@@ -32,7 +32,8 @@ uv run bakeoff scenario --all --impl our   # the scenario matrix, with a one-lin
 ## CLI
 
 Scenarios run offline against the fake model server (`fakeprov`), with the real runner, session
-log, git working copy and tools. Loops that are not built yet are skipped.
+log, git working copy and tools. Loops that are not built yet are skipped; a loop that exists
+but fails to import is an error (exit 1), so it never drops out of a comparison unnoticed.
 
 ```bash
 bakeoff scenario S01 S05 --impl our,pydantic   # or --all; --out out (default), --run-id ID
