@@ -9,7 +9,8 @@ from contextlib import suppress
 from pathlib import Path
 
 # Fixed identity, no signing, and none of the user's global ignore or attributes files: git
-# reads those from ~/.config/git even when there is no global config file.
+# reads those from ~/.config/git even when there is no global config file. Hooks and fsmonitor
+# are off so nothing the model writes into the working copy can make git run a command.
 GIT_CONFIG = (
     "-c",
     "user.name=bakeoff",
@@ -21,6 +22,10 @@ GIT_CONFIG = (
     "core.excludesFile=/dev/null",
     "-c",
     "core.attributesFile=/dev/null",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
 )
 
 

@@ -191,7 +191,7 @@ async def test_user_turn(runner, log, tid, published):
         "end_turn",
         head,
     )
-    assert git(runner.workdir(tid), "log", "-1", "--format=%s") == "turn 0: end_turn"
+    assert git(runner.workdir(tid), "log", "-1", "--format=%s") == "turn 1: end_turn"
     assert [i.message["role"] for i in log.items(tid)] == ["user", "assistant", "tool"]
 
 
@@ -627,7 +627,7 @@ async def test_revert(runner, log, tid, published):
     assert not (wd / "a.pipe").exists()
     assert (wd / "b.pipe").exists()
     note = log.items(tid)[-1]
-    assert note.message == {"role": "user", "content": "[harness] Reverted turn 0; files: a.pipe"}
+    assert note.message == {"role": "user", "content": "[harness] Reverted turn 1; files: a.pipe"}
     assert note.native is None
     assert [e["type"] for e in published] == ["item", "commit"]
     assert published[1]["data"] == {"sha": head, "files": ["a.pipe"]}
@@ -639,7 +639,7 @@ async def test_revert(runner, log, tid, published):
     # The model sees the note in the next turn.
     loop = FakeLoop(writes("c.pipe"))
     await runner.turn(loop, tid, model=MODEL, user_text="three")
-    assert loop.inputs[0].history[-2].message["content"].startswith("[harness] Reverted turn 0")
+    assert loop.inputs[0].history[-2].message["content"].startswith("[harness] Reverted turn 1")
 
 
 async def test_revert_errors_record_no_turn(runner, log, tid):

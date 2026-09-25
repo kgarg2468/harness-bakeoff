@@ -237,7 +237,7 @@ class Runner:
                     logger.warning("turn %s: tool events after turn.end: %s", turn_id, pub.late)
                 return {"turn_id": turn_id, "stop": stop, "pending": pending, "commit": None}
             try:
-                sha, files = await wc.commit(f"turn {row['idx']}: {stop}")
+                sha, files = await wc.commit(f"turn {row['idx'] + 1}: {stop}")
             except Exception:
                 # Record it, or the turn stays "running" and blocks the thread.
                 self.log.set_turn_status(turn_id, "error", stop=stop)
@@ -306,7 +306,7 @@ class Runner:
             self.log.discard_turn(row["id"])  # it recorded nothing yet
             raise
         pub = _Publisher(self.log, self.sink, thread_id, row["id"], thread["impl"])
-        note = f"[harness] Reverted turn {target['idx']}; files: {', '.join(files) or 'none'}"
+        note = f"[harness] Reverted turn {target['idx'] + 1}; files: {', '.join(files) or 'none'}"
         message = {"role": "user", "content": note}
         pub.emit("item", {"item": Item(f"{row['id']}:revert", row["id"], message)})
         self.log.set_turn_status(row["id"], "done", commit_sha=sha)

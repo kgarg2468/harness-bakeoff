@@ -3,6 +3,7 @@ import subprocess
 
 import pytest
 
+from bakeoff.shared import workcopy
 from bakeoff.shared.workcopy import GIT_CONFIG, WorkCopy, git_env
 
 
@@ -94,8 +95,22 @@ async def test_revert_conflict_aborts(wc):
     assert git(wc.root, "status", "--porcelain").stdout == ""
 
 
-async def test_cancel_stops_git(wc):
+async def test_hooks_never_run(wc):
+    """Nothing written into the working copy (e.g. a hook) can make git run a command."""
+    hook = wc.root / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\ntouch hook-ran\n")
+    hook.chmod(0o755)
+    await wc.commit("turn 1")
+    assert not (wc.root / "hook-ran").exists()
+
+
+async def test_cancel_stops_git(wc, monkeypatch):
     """A cancelled commit must not land later, nor leave git's index lock behind."""
+    # Re-enable hooks for this test only: a slow pre-commit hook keeps git busy long enough
+    # to cancel it mid-commit.
+    config = tuple(workcopy.GIT_CONFIG)
+    i = config.index("core.hooksPath=/dev/null")
+    monkeypatch.setattr(workcopy, "GIT_CONFIG", config[: i - 1] + config[i + 1 :])
     hook = wc.root / ".git" / "hooks" / "pre-commit"
     hook.write_text("#!/bin/sh\ntouch started\nsleep 0.3\n")
     hook.chmod(0o755)
