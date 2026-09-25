@@ -776,31 +776,36 @@ def endpoint(base_url: str | None) -> str:
     return base_url.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0].rsplit("@", 1)[-1].lower()
 
 
-def _thread_model(log: Path, thread: Any) -> dict[str, Any] | None:
-    """The model config a live thread was created with (the runner keeps it, minus the key, in
-    the thread row's meta), or None if the log cannot tell."""
+def _thread_setup(log: Path, thread: Any) -> tuple[dict[str, Any], str] | None:
+    """The model config and the system prompt a live thread was created with (the runner keeps
+    the config, minus the key, in the thread row's meta), or None if the log cannot tell."""
     if not log.exists():
         return None
     try:
         with _private_log(log) as db:
-            metas = {r["id"]: r["meta"] for r in db.execute("SELECT id, meta FROM threads")}
-        meta = metas.get(thread) or (next(iter(metas.values())) if len(metas) == 1 else None)
-        model = json.loads(meta)["model"] if meta else None
+            rows = {r["id"]: r for r in db.execute("SELECT id, system, meta FROM threads")}
+        row = rows.get(thread) or (next(iter(rows.values())) if len(rows) == 1 else None)
+        model = json.loads(row["meta"])["model"] if row else None
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
         return None
-    return model if isinstance(model, dict) else None
+    if not isinstance(model, dict) or not isinstance(row["system"], str):
+        return None
+    return model, row["system"]
 
 
 def live_settings(idir: Path, result: dict[str, Any]) -> dict[str, Any]:
     """What a live run's answer depends on besides the loop and the prompt: the model settings
-    from its session log (result.json has only the model and base_url), with the base_url cut
-    to its endpoint (the per-loop path on one server is still one endpoint). A setting nothing
-    records is None, so such a run pools only with runs that lack it too."""
-    model = _thread_model(idir / "log.sqlite", result.get("thread")) or {}
+    and the system prompt from its session log (result.json has only the model and base_url),
+    with the base_url cut to its endpoint (the per-loop path on one server is still one
+    endpoint) and the system prompt to a hash (it changes with the harness code, so runs of
+    one user prompt can still differ in it). A setting nothing records is None, so such a run
+    pools only with runs that lack it too."""
+    model, system = _thread_setup(idir / "log.sqlite", result.get("thread")) or ({}, None)
     base_url = model.get("base_url") or result.get("base_url")
     return {
         "endpoint": endpoint(base_url),
         **{k: model.get(k, result.get(k)) for k in _LIVE_SETTINGS},
+        "system": None if system is None else hashlib.sha256(system.encode()).hexdigest()[:12],
     }
 
 

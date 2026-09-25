@@ -625,10 +625,10 @@ def test_a_live_run_that_did_not_pass_is_not_a_sample(out: Path) -> None:
 
 def write_live(
     live: Path, run_id: str, impl: str, seconds: float, *, prompt: str = "What is RocketRide?",
-    model: str = "gpt-test", reasoning: str = "low",
+    model: str = "gpt-test", reasoning: str = "low", system: str = "sys",
 ) -> None:  # fmt: skip
-    """One loop's live run: result.json, and the session log's thread row with the model config
-    (minus the key), as `bakeoff live` saves them."""
+    """One loop's live run: result.json, and the session log's thread row with the system prompt
+    and the model config (minus the key), as `bakeoff live` saves them."""
     folder = live / run_id / impl
     base_url = "https://api.openai.com/v1"
     write_json(folder / "result.json", {
@@ -642,7 +642,7 @@ def write_live(
     )
     del config["api_key"]
     log = SessionLog(folder / "log.sqlite")
-    log.create_thread(f"live-{impl}", impl=impl, system="sys", meta={"rules": {}, "model": config})
+    log.create_thread(f"live-{impl}", impl=impl, system=system, meta={"rules": {}, "model": config})
     log.close()
 
 
@@ -686,6 +686,22 @@ def test_live_medians_pool_only_runs_of_one_model_setup(out: Path, tmp_path: Pat
     assert "gpt-test, reasoning high, api.openai.com" in text
     # The live section says which run is not compared, and why.
     assert "the loops ran different prompts or model settings: not in the medians" in text
+
+
+def test_live_medians_pool_only_runs_of_one_system_prompt(out: Path, tmp_path: Path) -> None:
+    """The system prompt changes with the harness code, not with the command line: runs of one
+    user prompt and model config made before and after such a change are two groups."""
+    live = tmp_path / "live"
+    for run_id, system, ours, theirs in (
+        ("L1", "sys v1", 0.5, 3.0), ("L2", "sys v1", 0.6, 3.1),
+        ("L3", "sys v2", 3.0, 2.5), ("L4", "sys v2", 3.1, 2.6),
+    ):  # fmt: skip
+        write_live(live, run_id, "our", ours, system=system)
+        write_live(live, run_id, "pydantic", theirs, system=system)
+    text = re.sub(r"<[^>]+>", "", make(out, live=live))
+    assert "over 4 live runs" not in text
+    assert "Less time per step: median B 550.0 ms vs A 3.05 s over 2 live runs" in text
+    assert "Less time per step: median B 3.05 s vs A 2.55 s over 2 live runs" in text
 
 
 def test_metrics_errors_are_shown_not_hidden_or_fatal(out: Path) -> None:
