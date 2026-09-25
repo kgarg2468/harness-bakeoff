@@ -60,11 +60,11 @@ class _Publisher:
         self._seq = log.next_seq(thread_id)
         self._t0 = time.perf_counter_ns()
         self._batch: list[dict[str, Any]] = []
-        self._closed = False
+        self._tools_open = True
 
     def emit(self, type_: str, data: dict[str, Any]) -> None:
-        if self._closed:  # a straggler after the turn finished (e.g. a leaked tool task)
-            return
+        if type_ == "turn.end":
+            self._tools_open = False
         t_us = (time.perf_counter_ns() - self._t0) // 1000
         env = {**self._head, "seq": self._seq, "t_us": t_us, "type": type_, "data": data}
         if type_ == "item":
@@ -81,8 +81,10 @@ class _Publisher:
             self._sink(env)
 
     def publish(self, event: Event) -> None:
-        """The `emit` callback handed to the ToolHost."""
-        self.emit(event.type, event.data)
+        """The ToolHost's `emit` callback. Events from a tool that outlives the loop's
+        `turn.end` are dropped, so `commit` always follows `turn.end` directly."""
+        if self._tools_open:
+            self.emit(event.type, event.data)
 
     def flush(self) -> None:
         if self._batch:
@@ -91,7 +93,7 @@ class _Publisher:
 
     def close(self) -> None:
         self.flush()
-        self._closed = True
+        self._tools_open = False
 
 
 class NdjsonMirror:
@@ -249,8 +251,9 @@ class Runner:
                         end = event.data
                         break
         except Exception as exc:  # CancelledError is not an Exception: it propagates (crash)
-            error = f"{type(exc).__name__}: {exc}"
-            pub.emit("error", {"kind": "loop", "message": error, "retryable": False})
+            if end is None:  # else it failed while closing after its turn.end: nothing to add
+                error = f"{type(exc).__name__}: {exc}"
+                pub.emit("error", {"kind": "loop", "message": error, "retryable": False})
         if end is None:
             end = {"stop": "error", "steps": len(steps), "error": error}
             pub.emit("turn.end", end)

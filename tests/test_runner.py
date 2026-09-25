@@ -365,21 +365,22 @@ async def test_loop_without_turn_end(runner, log, tid):
     assert log.last_turn(tid)["status"] == "error"
 
 
-async def test_nothing_after_turn_end_is_consumed(runner, log, tid):
-    closed = []
-
-    async def chatty(turn, tools, cancel):
+async def test_commit_directly_follows_turn_end(runner, log, tid, published):
+    async def sloppy(turn, tools, cancel):
         try:
             yield Event("turn.end", {"stop": "max_steps", "steps": 12})
-            yield Event("text.delta", {"text": "late"})
-        finally:
-            closed.append(True)
+            yield Event("text.delta", {"text": "never consumed"})
+        finally:  # runs when the runner closes the loop, after turn.end
+            tools.emit(Event("tool.end", {"call_id": "c9", "name": "x", "ok": True, "ms": 1}))
+            raise RuntimeError("cleanup failed")
 
-    summary = await runner.turn(FakeLoop(chatty), tid, model=MODEL, user_text="go")
+    summary = await runner.turn(FakeLoop(sloppy), tid, model=MODEL, user_text="go")
     assert summary["stop"] == "max_steps"
-    assert closed == [True]
-    assert types(log, tid)[-2:] == ["turn.end", "commit"]
+    assert types(log, tid) == ["turn.start", "item", "turn.end", "commit"]
+    assert published == log.events(tid)
     assert log.last_turn(tid)["status"] == "done"
+    StubTools.made[0].emit(Event("tool.start", {"call_id": "c9", "name": "x"}))  # too late
+    assert len(log.events(tid)) == len(published) == 4
 
 
 async def wait_for_cancel(turn, tools, cancel):
