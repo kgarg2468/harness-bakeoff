@@ -116,22 +116,23 @@ class _Turn:
                 self.emit("tool_call.ready", _call_data(call))
 
     def flush(self, messages: Iterable[ModelMessage]) -> None:
-        """Emit items for the messages not emitted yet, plus a usage event per model response."""
+        """Emit an item for each wire message not emitted yet, plus a usage event per model
+        response."""
         for message in messages:
             if id(message) in self.emitted:
                 continue
             self.emitted[id(message)] = message  # keeps the object alive, so ids stay unique
             interrupted = isinstance(message, ModelResponse) and message.state == "interrupted"
-            wire = mapping.to_openai(message)
-            for n, openai_message in enumerate(wire, 1):
-                item = Item(
-                    id=uuid.uuid4().hex,
-                    turn_id=self.turn_id,
-                    message=openai_message,
-                    status="incomplete" if interrupted else "complete",
-                    native=mapping.dump(message) if n == len(wire) else None,
-                )
-                self.emit("item", {"item": item})
+            for piece in mapping.split(message):
+                for openai_message in mapping.to_openai(piece):
+                    item = Item(
+                        id=uuid.uuid4().hex,
+                        turn_id=self.turn_id,
+                        message=openai_message,
+                        status="incomplete" if interrupted else "complete",
+                        native=mapping.dump(piece),
+                    )
+                    self.emit("item", {"item": item})
             if isinstance(message, ModelResponse):
                 self.emit("usage", _usage(message, self.steps))
 
@@ -222,9 +223,11 @@ class PydanticLoop:
                         if not Agent.is_model_request_node(node):
                             state.flush(run.new_messages())
                             continue
-                        # Tool results ride on the request node until it is sent: persist them now.
+                        # Tool results ride on the request node until it is sent: persist them now,
+                        # and send it only once the runner has handled (saved) them.
                         unsent = [] if node.is_resuming_without_prompt else [node.request]
                         state.flush([*run.new_messages(), *unsent])
+                        await state.out.join()
                         async with node.stream(run.ctx) as stream:
                             async for event in stream:
                                 state.stream_event(event)

@@ -76,7 +76,7 @@ timed identically for every loop.
 - tool result: `{"role": "tool", "tool_call_id": "...", "content": "..."}`. One item per call.
 
 `Item.native` is loop-private. `pydantic_version` stores pydantic-ai's native `ModelMessage` JSON
-there (on the last item produced from each native message) and rebuilds its history from it.
+there (each item gets the native of exactly what it shows) and rebuilds its history from it.
 Items the runner created (user messages, revert notes, compaction summaries) have `native=None`, and every
 loop must handle them. A compaction item (`Item.compaction=True`, a user message starting with
 `[harness] Conversation summary:`) replaces everything before it (contract rule 8).

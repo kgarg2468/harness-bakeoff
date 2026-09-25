@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 import uuid
@@ -198,7 +199,13 @@ async def test_tool_calls_run_with_raw_arguments_and_one_item_per_result(loop):
         '{"path":"p.pipe"}',
     ]
     assert result1.message == {"role": "tool", "tool_call_id": "c1", "content": "read_file ok"}
-    assert (result1.native, result2.native is not None) == (None, True)  # one native per message
+    # Every item carries the native of exactly what it shows: a crash between two items of the
+    # batch keeps the first one's result (see the crash test below).
+    assert [[p["tool_call_id"] for p in i.native["parts"]] for i in (result1, result2)] == [
+        ["c1"],
+        ["c2"],
+    ]
+    assert [len(i.native["parts"]) for i in (call_item, final)] == [2, 1]
     assert final.message == {"role": "assistant", "content": "done"}
     assert srv.requests[1]["messages"][2:] == [
         call_item.message,
@@ -274,6 +281,34 @@ async def test_deny_sends_the_reason_to_the_model_without_running_the_tool(loop)
     denial = {"role": "tool", "tool_call_id": "c2", "content": "Denied by user: not now"}
     assert items(events)[0].message == denial
     assert srv.requests[1]["messages"][-1] == denial
+
+
+async def test_crash_between_the_results_of_one_batch_keeps_the_saved_one(loop):
+    """Rule 4 across a crash: the worker dies right after c1's result item is saved. c1 never runs
+    again; c2 ran but its result was not saved, so the crash resume runs it again (DESIGN)."""
+    calls = tool_call(0, "c1", "write_file", '{"path": "a", "content": "x"}') + tool_call(
+        1, "c2", "read_file", '{"path": "b"}'
+    )
+    tools = StubTools()
+    with SSEServer(Reply([*calls, done("tool_calls")]), Reply([*text("done"), done()])) as srv:
+        history = [user("go")]
+        first = loop.run_turn(turn(history, config(srv)), tools, asyncio.Event())
+        async with contextlib.aclosing(first):
+            async for event in first:
+                if event.type == "item":
+                    history.append(items([event])[0])
+                    if event.data["item"].message.get("tool_call_id") == "c1":
+                        break  # SIGKILL: c1's result is saved, c2's is not
+        fresh = PydanticLoop()
+        events = await run(fresh, turn(history, config(srv), resume=Resume("crash")), tools)
+        await fresh.aclose()
+
+    runs = [c.id for c in tools.runs]
+    assert (runs.count("c1"), runs.count("c2")) == (1, 2)
+    log = history + items(events)
+    assert [i.message["tool_call_id"] for i in log if i.message["role"] == "tool"] == ["c1", "c2"]
+    assert len(srv.requests) == 2  # the killed worker never sent its next request
+    assert [m.get("tool_call_id") for m in srv.requests[1]["messages"][-2:]] == ["c1", "c2"]
 
 
 async def test_crash_resume_rechecks_open_calls(loop):

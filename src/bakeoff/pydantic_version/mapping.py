@@ -1,12 +1,15 @@
 """Translate between pydantic-ai's native messages and the harness's items.
 
-The native `ModelMessage` JSON is the source of truth for this loop's history: it rides on the
-last item made from each native message. `Item.message` is the OpenAI-shaped view of it, as
-OpenRouterModel would put it on the wire, for the session log and the report.
+The native `ModelMessage` JSON is the source of truth for this loop's history. Every item carries
+the native JSON of exactly what it shows: a model response, or one part of a request (a tool
+result or a prompt). pydantic-ai merges consecutive requests again before it sends them, so the
+split never reaches the wire, and a crash between two items of one tool batch loses nothing that
+was saved. `Item.message` is the OpenAI-shaped view, as the model puts it on the wire.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from pydantic_ai import (
@@ -31,25 +34,31 @@ def dump(message: ModelMessage) -> dict[str, Any]:
     return ModelMessagesTypeAdapter.dump_python([message], mode="json")[0]
 
 
+def split(message: ModelMessage) -> list[ModelMessage]:
+    """One native message per item: a response stays whole, a request splits into its parts."""
+    if isinstance(message, ModelResponse):
+        return [message]
+    return [replace(message, parts=[part]) for part in message.parts]
+
+
 def to_history(items: list[Item]) -> list[ModelMessage]:
     """Rebuild the native history from the last compaction item onward (contract rule 8).
 
     Items the runner wrote (user messages, revert notes, summaries) have no native and become
-    user prompts. The loop's own items without a native are tool results whose message rides on
-    a later item.
+    user prompts.
     """
     start = max((i for i, item in enumerate(items) if item.compaction), default=0)
     history: list[ModelMessage] = []
     for item in items[start:]:
         if item.native is not None:
             history.extend(ModelMessagesTypeAdapter.validate_python([item.native]))
-        elif item.message["role"] != "tool":
+        else:
             history.append(ModelRequest(parts=[UserPromptPart(item.message["content"])]))
     return history
 
 
 def to_openai(message: ModelMessage) -> list[dict[str, Any]]:
-    """The OpenAI chat messages for one native message: one per tool result, else one."""
+    """The OpenAI chat messages for one native message: one per tool result or prompt, else one."""
     if isinstance(message, ModelResponse):
         return [_assistant(message)]
     out: list[dict[str, Any]] = []
