@@ -72,13 +72,21 @@ class StubTools:
         return self.rules.get(call.name, "allow")
 
     async def run(self, call: ToolCall) -> ToolResult:
+        """Like the shared ToolHost: invalid_args, then deny rules, then the tool (which fails for
+        the path "missing")."""
         self.log.append(f"tool.start:{call.id}")
         self.runs.append(call)
         self.started.set()
         if call.name == self.slow:
             await asyncio.sleep(5)
-        if "path" not in json.loads(call.arguments):
-            return ToolResult(call.id, False, "invalid arguments: 'path' is a required property")
+        args = json.loads(call.arguments)
+        if "path" not in args:
+            invalid = "invalid arguments: 'path' is a required property"
+            return ToolResult(call.id, False, invalid, error="invalid_args")
+        if self.check(call) == "deny":
+            return ToolResult(call.id, False, f"Denied by permission rules: {call.name}", "denied")
+        if args["path"] == "missing":
+            return ToolResult(call.id, False, "No such file: missing", error="failed")
         return ToolResult(call.id, True, f"{call.name} ok")
 
 
@@ -230,6 +238,42 @@ async def test_bad_arguments_become_a_retry_prompt_and_the_turn_continues(loop):
     assert result["content"].startswith("invalid arguments: 'path' is a required property")
     assert result["content"].endswith("Fix the errors and try again.")
     assert srv.requests[1]["messages"][-1] == result
+    assert of(events, "turn.end")[0]["stop"] == "end_turn"
+
+
+async def test_denied_and_failed_calls_use_the_library_outcomes(loop):
+    """Only bad arguments become ModelRetry ("fix it and try again"). A denial is ToolDenied, the
+    text verbatim; a failure is ToolFailed, which the library wraps as {"error": ...}."""
+    calls = [
+        *tool_call(0, "c1", "read_file", "{}"),
+        *tool_call(1, "c2", "write_file", '{"path": "a", "content": "x"}'),
+        *tool_call(2, "c3", "read_file", '{"path": "missing"}'),
+    ]
+    tools = StubTools({"write_file": "deny"})
+    with SSEServer(Reply([*calls, done("tool_calls")]), Reply([*text("ok"), done()])) as srv:
+        events = await run(loop, turn([user("go")], config(srv)), tools)
+
+    results = {i.message["tool_call_id"]: i.message["content"] for i in items(events)[1:4]}
+    assert results["c1"].endswith("Fix the errors and try again.")
+    assert results["c2"] == "Denied by permission rules: write_file"
+    assert results["c3"] == '{"error":"No such file: missing"}'
+    outcomes = [i.native["parts"][0].get("outcome") for i in items(events)[1:4]]
+    assert outcomes == [None, "denied", "failed"]  # c1 is a retry prompt, which has no outcome
+    assert srv.requests[1]["messages"][-3:] == [i.message for i in items(events)[1:4]]
+    assert [c.id for c in tools.runs] == ["c1", "c2", "c3"]  # each through ToolHost.run
+
+
+async def test_arguments_that_are_not_json_never_reach_the_toolhost(loop):
+    """Recorded behavior (A_CHECKLIST): pydantic-ai validates the arguments itself before it
+    calls the tool, so the model gets the library's retry prompt and ToolHost is not called."""
+    truncated = tool_call(0, "c1", "read_file", '{"path": "a.txt"')
+    with SSEServer(Reply([*truncated, done("tool_calls")]), Reply([*text("ok"), done()])) as srv:
+        tools = StubTools()
+        events = await run(loop, turn([user("go")], config(srv)), tools)
+
+    assert tools.runs == []
+    result = items(events)[1].message
+    assert result["tool_call_id"] == "c1" and "json_invalid" in result["content"]
     assert of(events, "turn.end")[0]["stop"] == "end_turn"
 
 

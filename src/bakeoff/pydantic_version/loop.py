@@ -45,6 +45,7 @@ from pydantic_ai import (
     ToolCallPart,
     ToolDefinition,
     ToolDenied,
+    ToolFailed,
     UsageLimitExceeded,
     UsageLimits,
 )
@@ -271,14 +272,19 @@ class PydanticLoop:
 
 
 def _tool(spec: ToolSpec) -> Tool[_Turn]:
-    async def call(ctx: RunContext[_Turn], **_: Any) -> str:
+    async def call(ctx: RunContext[_Turn], **_: Any) -> str | ToolDenied:
         # The ToolHost sends tool.start straight to the runner; wait until the consumer has
         # handled everything queued before it (this call's tool_call.ready).
         await ctx.deps.out.join()
         result = await ctx.deps.tools.run(_running_call(ctx))
-        if not result.ok:
-            raise ModelRetry(result.content)  # the library's bad-argument idiom (A_CHECKLIST)
-        return result.content
+        # The library's three outcomes for a call that did not succeed (A_CHECKLIST).
+        if result.ok:
+            return result.content
+        if result.error == "invalid_args":
+            raise ModelRetry(result.content)
+        if result.error == "denied":
+            return ToolDenied(result.content)
+        raise ToolFailed(result.content)
 
     tool = Tool.from_schema(
         call,
