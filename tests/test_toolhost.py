@@ -258,5 +258,19 @@ async def test_failing_emit_never_breaks_run(tmp_path):
 
     host = build_toolhost(tmp_path, {"*": "allow"}, boom)
     result = await host.run(call("write_file", {"path": "a.txt", "content": "x"}))
-    assert result.ok and (tmp_path / "a.txt").read_text() == "x"
+    # tool.start could not be recorded, so the write must not happen (no unrecorded side effect)
+    assert not result.ok and result.error == "failed" and "could not record" in result.content
+    assert not (tmp_path / "a.txt").exists()
+    assert host.run_counts == {}
     assert [str(e) for e in host.emit_errors] == ["sink down", "sink down"]
+
+
+async def test_a_failed_end_emit_still_returns_the_result(tmp_path):
+    def fail_end(event):
+        if event.type == "tool.end":
+            raise RuntimeError("end lost")
+
+    host = build_toolhost(tmp_path, {"*": "allow"}, fail_end)
+    result = await host.run(call("write_file", {"path": "a.txt", "content": "x"}))
+    assert result.ok and (tmp_path / "a.txt").read_text() == "x"
+    assert [str(e) for e in host.emit_errors] == ["end lost"]
