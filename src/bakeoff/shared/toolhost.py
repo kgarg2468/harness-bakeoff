@@ -72,11 +72,22 @@ class ToolHostImpl:
 
     async def run(self, call: ToolCall) -> ToolResult:
         """Validate, enforce deny, execute. Never raises, except `asyncio.CancelledError`."""
-        self._safe_emit(Event("tool.start", {"call_id": call.id, "name": call.name}))
+        tool = _BY_NAME.get(call.name)
+        read_only = tool is not None and tool.spec.read_only
+        # read_only lets the I2 check tell a speculative early read (harmless) from a real
+        # side effect when a run's call never reaches history.
+        recorded = self._safe_emit(
+            Event("tool.start", {"call_id": call.id, "name": call.name, "read_only": read_only})
+        )
         start = time.perf_counter()
         ok = False
         try:
-            error, content = await self._execute(call)
+            if not recorded:
+                # No durable record that this call started: running it could repeat a side
+                # effect after a crash, so refuse (the model sees why).
+                error, content = "failed", f"{call.name} not run: could not record that it started"
+            else:
+                error, content = await self._execute(call)
             ok = error is None
             if len(content) > MAX_OUTPUT:
                 content = (
@@ -89,14 +100,16 @@ class ToolHostImpl:
                 Event("tool.end", {"call_id": call.id, "name": call.name, "ok": ok, "ms": ms})
             )
 
-    def _safe_emit(self, event: Event) -> None:
+    def _safe_emit(self, event: Event) -> bool:
         """Emit without letting a failing callback break run()'s never-raises guarantee.
 
-        Failures are kept in `emit_errors` (tests and the runner can inspect them)."""
+        Returns whether it succeeded; failures are kept in `emit_errors`."""
         try:
             self._emit(event)
         except Exception as e:
             self.emit_errors.append(e)
+            return False
+        return True
 
     async def _execute(self, call: ToolCall) -> tuple[ToolErrorKind | None, str]:
         """(error kind or None on success, content for the model)."""

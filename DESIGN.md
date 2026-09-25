@@ -54,13 +54,14 @@ cancel `asyncio.Event`. It yields `Event`s. The shared runner:
 2. emits `turn.start`, then consumes the loop's events, stamping each with
    `{v, thread, turn, impl, seq, t_us, type, data}` (`seq` has no gaps per thread; `t_us` is
    microseconds since turn start);
-3. persists `item` events immediately (one SQLite transaction per item) and other events in
-   batches (flush on item, on `turn.end`, and every 64 events), then publishes each event to
-   the sink (CLI printer, ndjson mirror, tests);
+3. persists `item` and `tool.start` events immediately (one SQLite transaction each; a
+   `tool.start` before its tool runs, so a crash cannot hide a run) and other events in
+   batches (flush on item, on `tool.start`, on `turn.end`, and every 64 events), then publishes
+   each event to the sink (CLI printer, ndjson mirror, tests);
 4. on `turn.end` with stop `end_turn`, `max_steps`, `budget`, `cancelled` or `error`, commits the
-   working copy (`git add -A && git commit --allow-empty`), stores the sha on the turn row and
-   emits `commit` (always the final event of a completed turn, right after the loop's
-   `turn.end`). A `paused` turn is not committed until the resumed turn finishes.
+   working copy (`git add -A && git commit --allow-empty`), stores the sha on the turn row
+   together with the `commit` event (one transaction), then publishes `commit` (always the final
+   event of a completed turn, right after the loop's `turn.end`). A `paused` turn is not committed until the resumed turn finishes.
 
 `ToolHost` is built by the runner with an `emit` callback, so `tool.start` and `tool.end` are
 timed identically for every loop.
@@ -87,7 +88,8 @@ loop must handle them. A compaction item (`Item.compaction=True`, a user message
   `Resume(kind="approval", decisions={call_id: "allow"|"deny"}, reason=...)`. History ends with
   the assistant message whose calls are pending (plus results for calls that already ran).
   The loop runs the allowed ones, feeds `ToolResult(ok=False, content="Denied by user: <reason>")`
-  for denied ones, and continues.
+  for denied ones, and continues. Until then the runner refuses a new user message, a
+  compaction and a revert: each would come between the pending calls and their results.
 - **Crash**: the worker process died mid-turn. The runner restarts the turn with
   `Resume(kind="crash")`. The loop continues from history. Calls that have no result are
   re-checked: `ask` pauses again, `allow` runs. A tool whose result item was already persisted
