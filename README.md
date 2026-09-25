@@ -31,17 +31,18 @@
 
 | | **A** · pydantic-ai | **B** · our loop |
 | --- | --- | --- |
-| Lines of its own code | 681 | 713 (332 ported from Pi) |
+| Lines of its own code | 778 | 869 (468 ported from Pi) |
 | Packages it installs | 35 · 35.4 MB | 12 · 3.9 MB |
-| Cold import | 1.17 s | 70.5 ms |
-| Harness overhead per turn (p50) | 379.5 ms (188.9 µs per chunk) | 12.9 ms (6.4 µs per chunk) |
-| Scenarios S01–S15 | 17 / 17 pass | 17 / 17 pass |
+| Cold import | 1.19 s | 71.4 ms |
+| Harness overhead per turn (p50) | 369.8 ms (184.1 µs per chunk) | 12.8 ms (6.4 µs per chunk) |
+| Scenarios S01–S15 and R01–R05 | 22 / 22 pass | 22 / 22 pass |
 | Fits in the engine's Python | up to 2.31.1; 2.32+ needs openai 3 | yes, at the engine's own versions |
-| Live `gpt-6-luna` runs that built and validated `chat.pipe` | 3 / 3 | 3 / 3 |
-| Live time and input tokens per step (median, within 10%) | 1.60 s · 21,433 tokens | 1.49 s · 20,475 tokens |
-| Lines added for OpenAI's Responses API (open PRs [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14), [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13)) | +46 | +140 (120 ported from Pi) |
+| Live `gpt-6-luna` runs that built and validated `chat.pipe` | 5 / 5 | 5 / 5 |
+| Live, chat completions, reasoning `none`: time and input tokens per step (median of 3; within 10%) | 1.60 s · 21,433 tokens | 1.49 s · 20,475 tokens |
+| Live, Responses API, reasoning `xhigh`: time and input tokens per step (median of 2) | 7.19 s · 25,818 tokens | 6.31 s · 24,827 tokens |
+| Lines added for OpenAI's Responses API ([#14](https://github.com/kgarg2468/harness-bakeoff/pull/14), [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13)) | +97 (+46 in the first cut) | +156, 136 of them ported from Pi (+140 in the first cut) |
 
-The last row comes with the two open PRs, not with `main`: `gpt-6-luna` takes tools together with reasoning only on `/v1/responses`, and pydantic-ai already speaks that API, so A mostly wires settings. That's a real advantage for A. Which side each number favours, and by how much, is under [Where each wins](#where-each-wins).
+`gpt-6-luna` takes tools together with reasoning only on `/v1/responses`, so both loops had to learn that API. pydantic-ai already speaks it, so A's first cut mostly wired settings: +46 lines against B's +140. Fixes found in review and by the scenarios (how a stream ends or fails, crash resume, reasoning summaries, a call cut off at the output limit) brought that to +97 against +156. That's a real advantage for A. There are only 2 Responses live runs per loop, and most of each step there is the model reasoning, so read their time per step as a hint rather than a measure of the loop. Which side each number favours, and by how much, is under [Where each wins](#where-each-wins).
 
 The full comparison is one page, `out/report.html`: a scorecard, the scenario matrix, a side-by-side replay of every scenario, a diff of what each loop sent to the model, the live runs, and where each loop wins. Build it with `bakeoff report` (see [Quick start](#quick-start)) and open it in a browser; it has no external assets.
 
@@ -49,11 +50,11 @@ The full comparison is one page, `out/report.html`: a scorecard, the scenario ma
 <summary><strong>Where these numbers come from</strong></summary>
 
 - **Lines of code:** `uv run python -m bakeoff.metrics.loc` on `main`. Code lines only (no comments, docstrings or blanks); ported files are marked at the top and counted separately.
-- **Packages, import time and overhead:** `out/metrics.json` from `python -m bakeoff.metrics.collect --deps --bench full`, at commit `8ce862e`. B has grown by 4 code lines since (cancel fixes), and a re-run on `main` gives the same picture. Each loop's dependency set is installed alone in a fresh virtual environment. The benchmark turn is a tool step of 2,000 streamed chunks plus a one-chunk answer, against the local fake server, 100 measured turns per loop; overhead is the loop's turn time minus a bare `httpx` client reading the same stream. AMD Ryzen 9 6900HS, Python 3.12.3.
-- **Scenarios:** `uv run bakeoff scenario --all --impl our,pydantic`. R01–R05 (the Responses API) are expected failures on `main` for both loops; each loop passes 22 / 22 on its PR branch.
+- **Packages, import time and overhead:** `out/metrics.json` from `python -m bakeoff.metrics.collect --deps --bench full`, at commit `b6acae3` (`main` with both Responses API PRs merged). Each loop's dependency set is installed alone in a fresh virtual environment. The benchmark turn is a tool step of 2,000 streamed chunks plus a one-chunk answer, against the local fake server, 100 measured turns per loop; overhead is the loop's turn time minus a bare `httpx` client reading the same stream. AMD Ryzen 9 6900HS, Python 3.12.3.
+- **Scenarios:** `uv run bakeoff scenario --all --impl our,pydantic`. All 22 pass for both loops, R01–R05 (the Responses API) included.
 - **Engine fit:** `./scripts/engine_fit.sh` asks uv to resolve each loop's dependencies together with the engine's pins.
-- **Live runs:** three `bakeoff live` runs per loop on 2026-09-25, `gpt-6-luna` on api.openai.com with reasoning `none`, a 20-step cap and the prompt *"Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it."* Medians per step, because the model chooses how many steps to take (7 or 8 here). Every run ended with `end_turn`, its one `validate_pipeline` call returned 0 errors and 0 warnings (on MockEngine, which carries the real RocketRide node catalog), and the invariants checked on live runs (I2, I3, I5, I7) held. Each run's key fields are kept in [`docs/results/live-2026-09-25.json`](docs/results/live-2026-09-25.json), so these figures can be checked without paying for new runs.
-- **Responses API lines:** the line tables in PRs [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13) (B: 713 → 853) and [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14) (A: 681 → 727).
+- **Live runs:** `bakeoff live` on 2026-09-25, `gpt-6-luna` on api.openai.com, a 20-step cap, unattended, and the prompt *"Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it."* Three runs per loop on chat completions with reasoning `none` (7 or 8 steps each), and two per loop on the Responses API (`--api responses`) with reasoning `xhigh` (10 to 13 steps). Medians per step, because the model chooses how many steps to take. Every run ended with `end_turn`, its one `validate_pipeline` call returned 0 errors and 0 warnings (on MockEngine, which carries the real RocketRide node catalog), and the invariants checked on live runs (I2, I3, I5, I7) held. Each run's key fields, validation result included, are kept in [`docs/results/live-2026-09-25.json`](docs/results/live-2026-09-25.json) (chat completions) and [`docs/results/live-responses-2026-09-25.json`](docs/results/live-responses-2026-09-25.json) (Responses API), written by [`scripts/snapshot_live.py`](scripts/snapshot_live.py), so these figures can be checked without paying for new runs.
+- **Responses API lines:** `bakeoff.metrics.loc` before and after each loop's PR. B: 713 → 869 ([#13](https://github.com/kgarg2468/harness-bakeoff/pull/13); 332 → 468 ported from Pi). A: 681 → 778 ([#14](https://github.com/kgarg2468/harness-bakeoff/pull/14)). The first-cut figures are the line tables in the PRs' descriptions (B 853, A 727).
 
 </details>
 
@@ -189,7 +190,7 @@ Each scenario is a JSON script: the user's turns, approvals, cancels and crashes
 | R04 | 429, then OK; next turn an error event mid-stream, then OK | waited per `Retry-After`; nothing of the failed attempt is replayed |
 | R05 | Cancel while reasoning streams | stops within 200 ms; the next turn passes the encrypted-reasoning check |
 
-R01–R05 are expected failures (`xfail`) for both loops on `main`; the loop support is in open PRs [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13) (B) and [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14) (A). A loop's expected failures are listed in [`loops.py`](src/bakeoff/loops.py) with the exact checks they fail, so a fix shows up as clearly as a regression.
+Both loops pass R01–R05: B since [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13), A since [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14). A loop's expected failures (none on `main` now) are listed in [`loops.py`](src/bakeoff/loops.py) with the exact checks they fail, so a fix shows up as clearly as a regression.
 
 </details>
 
@@ -200,24 +201,25 @@ Only what the measurements show, plus a few design properties labelled as such. 
 **B, our loop:**
 
 - **Installs less:** 12 packages (3.9 MB) against 35 (35.4 MB).
-- **Starts faster:** a cold import takes 70.5 ms against 1.17 s.
-- **Adds less on top of the model:** 12.9 ms against 379.5 ms per benchmark turn (p50; p95 18.7 ms against 401.0 ms), or 6.4 against 188.9 µs per streamed chunk.
-- **Starts tools early:** 17 read-only tool runs started while the model was still streaming, against 0, across the scenarios.
-- **Reuses connections:** 21 connections against 48 for the same 48 requests, in the 17 scenarios where both loops sent the same number of requests.
+- **Starts faster:** a cold import takes 71.4 ms against 1.19 s.
+- **Adds less on top of the model:** 12.8 ms against 369.8 ms per benchmark turn (p50; p95 18.1 ms against 379.8 ms), or 6.4 against 184.1 µs per streamed chunk. At its peak the process holds 3.3 MB more than before the loop was imported, against 67.4 MB more (import, warm-up and benchmark turns).
+- **Starts tools early:** 20 read-only tool runs started while the model was still streaming, against 0, across the 22 scenarios.
+- **Reuses connections:** 29 connections against 56 for the same 59 requests, in the 22 scenarios where both loops sent the same number of requests.
+- **Less time per step on the Responses API, over 2 runs:** median 6.31 s against 7.19 s with reasoning `xhigh` (10 and 12 steps against 12 and 13). Only 2 runs each, and the time is mostly the model's, so this is a hint, not a settled result.
 - **Fits the engine as it moves:** it needs only packages the engine already ships. A can't take pydantic-ai 2.32 or later until the engine's crewai node accepts openai 3.
 - **Nothing to work around (by design):** [`A_CHECKLIST.md`](A_CHECKLIST.md) lists the library behaviours A had to work around, such as OpenRouter's string error code and retrying a stream that fails midway.
 
 **A, pydantic-ai:**
 
-- **Less of its own code:** 681 lines against 713.
-- **New provider APIs are mostly settings:** Responses API support took +46 lines against +140 for B, 120 of them ported from Pi (open PRs [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14) and [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13)).
+- **Less of its own code:** 778 lines against 869.
+- **New provider APIs are mostly settings:** Responses API support took +97 lines against +156 for B, 136 of those ported from Pi ([#14](https://github.com/kgarg2468/harness-bakeoff/pull/14) and [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13)). The first cuts were +46 against +140.
 - **Features come with the library (by design):** retries, usage limits, approvals (deferred tools), cancellation and the message history format are pydantic-ai's, so fixes and new features arrive with upgrades.
 - **Many providers behind one interface (by design):** OpenAI, Anthropic, Gemini and more, should the engine ever need more than OpenAI-compatible endpoints.
 
 **Too close to call:**
 
-- **Scenarios:** 17 / 17 each; R01–R05 fail as expected for both on `main`.
-- **Live runs:** all 6 runs wrote `chat.pipe` and validated it with 0 errors. Time per step (median 1.49 s against 1.60 s) and input tokens per step (20,475 against 21,433) are within 10%.
+- **Scenarios:** 22 / 22 each, R01–R05 (the Responses API) included.
+- **Live runs:** all 10 runs wrote `chat.pipe` and validated it with 0 errors. On chat completions, time per step (median 1.49 s against 1.60 s) and input tokens per step (20,475 against 21,433) are within 10%. On the Responses API, input tokens per step are too (24,827 against 25,818).
 
 ## More
 
@@ -245,7 +247,7 @@ Only what the measurements show, plus a few design properties labelled as such. 
 
 - **The key:** `--env-file` first, then `OPENAI_API_KEY` in the environment, then the file named by `BAKEOFF_ENV_FILE`. It's held in memory, never printed or recorded, and goes only over https to `api.openai.com` or a host named with `--key-host` on the command line (never to a host that only a session log names). The network guard allows loopback and the endpoint's host, nothing else. Pointed at a loopback address, `live` and `chat` send a dummy key.
 - **Options both take:** `--model`, `--reasoning EFFORT`, `--max-steps`, `--max-tokens`, `--base-url` (`{impl}` becomes the loop name), `--kind` (`openai_compat`, the default, or `openrouter`) and `--api responses`.
-- **`--api responses`** uses OpenAI's Responses API instead of chat completions: `gpt-6-luna` takes function tools on chat completions only with reasoning `none`, so tools plus reasoning need it. There `--reasoning` also asks for a reasoning summary. No loop on `main` speaks it yet; that's PRs [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13) and [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14).
+- **`--api responses`** uses OpenAI's Responses API instead of chat completions: `gpt-6-luna` takes function tools on chat completions only with reasoning `none`, so tools plus reasoning need it. There `--reasoning` also asks for a reasoning summary. Both loops speak it ([#13](https://github.com/kgarg2468/harness-bakeoff/pull/13), [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14)).
 - **`live`** streams each loop's run (text inline, each tool call and result on one line), then prints tokens, time to first token, total time and steps side by side. `--interactive` asks before each write. Without it the run is unattended: the system prompt tells the model that nobody can answer the skills' approval gates, so it goes on, while checks such as validation still have to pass. A run that fails, is interrupted or can't start still writes its `result.json`, with the error.
 - **`chat`** is a REPL on one loop in which writes ask for approval. Ctrl-C during a turn cancels the turn, and at a prompt it ends the chat. It exits 1 if any turn stopped short (error, `max_steps`, budget, cancelled) or an invariant failed.
 
@@ -267,14 +269,14 @@ out/live/<run_id>/<loop>/result.json             a live run: model, prompt, fina
 out/live/latest -> <run_id>
 ```
 
-A run id is never reused. Wire recordings (scenario runs only) hold request bodies only, never headers. `out/` is not committed; the live-run figures above are kept in [`docs/results/live-2026-09-25.json`](docs/results/live-2026-09-25.json).
+A run id is never reused. Wire recordings (scenario runs only) hold request bodies only, never headers. `out/` is not committed; the live-run figures above are kept in [`docs/results/`](docs/results/) (see [Where these numbers come from](#results-at-a-glance)), and `uv run python scripts/snapshot_live.py OUT.json RUN_ID...` writes the same snapshot for your own runs. It copies the prompt and the final answer as written, with key-shaped strings redacted, so read it before you share it.
 
 </details>
 
 <details>
 <summary><strong>Status</strong></summary>
 
-Work in progress; each piece lands through a reviewed pull request. Next up: the Responses API in both loops ([#13](https://github.com/kgarg2468/harness-bakeoff/pull/13), [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14)). A third loop, `hybrid` (our loop on pydantic-ai's model layer), is registered in `loops.py` but not built yet.
+Both loops are complete: all 22 scenarios, chat completions and the Responses API, live runs on `gpt-6-luna`. Each piece landed through a reviewed pull request. A third loop, `hybrid` (our loop on pydantic-ai's model layer), is registered in `loops.py` but not built yet.
 
 </details>
 
