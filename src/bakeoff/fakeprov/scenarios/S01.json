@@ -1,0 +1,41 @@
+{
+  "id": "S01",
+  "title": "Chat: keep-alive comments, usage chunk repeats finish_reason and carries cost",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [{"user": "Say hello to the RocketRide team."}],
+  "exchanges": [
+    {
+      "note": "Two keep-alive comments, text in 4 chunks, finish, then the usage chunk.",
+      "expect": {
+        "model": "anthropic/claude-sonnet-4.5",
+        "last_role": "user",
+        "messages_len": 2,
+        "last_content_contains": "Say hello"
+      },
+      "respond": {
+        "stream": [
+          {"comment": "OPENROUTER PROCESSING"},
+          {"comment": "OPENROUTER PROCESSING", "delay_ms": 20},
+          {
+            "text": "Hello, RocketRide team! Your pipelines are ready when you are.",
+            "chunks": 4,
+            "delay_ms": 5
+          },
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 412, "completion_tokens": 14, "cost": 0.001446}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn"],
+    "requests": 1,
+    "commits": 1,
+    "text_contains": "Hello, RocketRide team! Your pipelines are ready when you are.",
+    "cost_usd": 0.001446
+  }
+}
