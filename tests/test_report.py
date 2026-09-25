@@ -352,6 +352,20 @@ def test_partial_data_degrades_per_section(out: Path, tmp_path: Path) -> None:
     assert 'class="cell pass"' in html  # the runs still show
 
 
+def test_input_problems_show_even_without_a_scenario_run(tmp_path: Path) -> None:
+    """An unreadable metrics.json or live result is a data note even when no run folder exists."""
+    (tmp_path / "metrics.json").write_text("{not json")
+    (tmp_path / "live" / "L1" / "our").mkdir(parents=True)
+    (tmp_path / "live" / "L1" / "our" / "result.json").write_text("{broken")
+    html = build.build(
+        runs=tmp_path / "runs", live=tmp_path / "live", metrics=tmp_path / "metrics.json",
+        now=NOW, discovered=[],
+    )  # fmt: skip
+    assert Page(html).problems == []
+    assert "2 data notes" in html
+    assert "live/L1/our/result.json: unreadable" in html and "metrics.json: unreadable" in html
+
+
 def test_output_is_deterministic(out: Path) -> None:
     first, second = make(out), make(out)
     assert first == second

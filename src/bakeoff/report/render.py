@@ -313,6 +313,7 @@ class Page:
     run: dict[str, Any] | None
     live: list[dict[str, Any]]
     metrics: dict[str, Any] | None
+    problems: list[str] = field(default_factory=list)  # unreadable live results, metrics.json
     cells: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)  # scn -> impl -> cell
 
     @property
@@ -431,7 +432,7 @@ def header(page: Page, generated: str) -> str:
         f'<span class="src {"on" if ok else "off"}">{"✓" if ok else "–"} {esc(name)}</span>'
         for name, ok in sources
     )
-    problems = [*((page.run or {}).get("problems") or [])]
+    problems = [*((page.run or {}).get("problems") or []), *page.problems]
     for scenario in page.scenarios:
         for impl, run in scenario["runs"].items():
             problems += [f"{scenario['id']}/{impl}: {p}" for p in run.get("problems") or []]

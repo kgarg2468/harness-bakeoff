@@ -95,12 +95,17 @@ def build(
     run = data.load_run(runs)
     live_runs, live_problems = data.load_live(live)
     metrics_data, metrics_problem = data.load_metrics(metrics)
-    if run is not None:
-        run["problems"] += [*live_problems, *([metrics_problem] if metrics_problem else [])]
     loops = page_loops(
         run, live_runs, metrics_data, data.discover() if discovered is None else discovered
     )
-    page = render.Page(loops=loops, run=run, live=live_runs, metrics=metrics_data)
+    page = render.Page(
+        loops=loops,
+        run=run,
+        live=live_runs,
+        metrics=metrics_data,
+        # Kept on the page, not the run: they must show when there is no scenario run too.
+        problems=[*live_problems, *([metrics_problem] if metrics_problem else [])],
+    )
     for scenario in page.scenarios:
         page.cells[scenario["id"]] = {
             impl: render.make_cell(page.summary, scenario["id"], impl, scenario["runs"].get(impl))
