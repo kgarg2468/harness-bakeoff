@@ -626,16 +626,17 @@ def test_a_live_run_that_did_not_pass_is_not_a_sample(out: Path) -> None:
 def write_live(
     live: Path, run_id: str, impl: str, seconds: float, *, prompt: str = "What is RocketRide?",
     model: str = "gpt-test", reasoning: str = "low", system: str = "sys", max_tokens: int = 4096,
+    **extra: Any,
 ) -> None:  # fmt: skip
-    """One loop's live run: result.json, and the session log's thread row with the system prompt
-    and the model config (minus the key), as `bakeoff live` saves them."""
+    """One loop's live run: result.json (plus `extra`), and the session log's thread row with the
+    system prompt and the model config (minus the key), as `bakeoff live` saves them."""
     folder = live / run_id / impl
     base_url = "https://api.openai.com/v1"
     write_json(folder / "result.json", {
         "v": 1, "run_id": run_id, "impl": impl, "model": model, "base_url": base_url,
         "prompt": prompt, "final_text": "ok", "stops": ["end_turn"], "steps": 1, "requests": 1,
         "usage": {"input_tokens": 100}, "duration_ms": seconds * 1000, "passed": True,
-        "error": None, "thread": f"live-{impl}",
+        "error": None, "thread": f"live-{impl}", **extra,
     })  # fmt: skip
     config = asdict(
         ModelConfig(base_url, model, kind="openai_compat", reasoning={"effort": reasoning},
@@ -718,6 +719,27 @@ def test_live_groups_never_read_the_same(out: Path, tmp_path: Path) -> None:
         ) in text
     for run_id, n, max_tokens in (("L6", 1, 512), ("L4", 2, 4096), ("L1", 3, 4096)):
         assert f"live run {run_id} · setup {n}: {setup} {max_tokens}prompt" in text
+
+
+def test_live_section_says_which_runs_the_medians_leave_out(out: Path, tmp_path: Path) -> None:
+    """A grouped run the medians skip (a loop did not pass, or did not run it) says so, with the
+    same test the medians use; each loop's column says whether it passed and what failed."""
+    live = tmp_path / "live"
+    for run_id in ("L1", "L2", "L3"):
+        write_live(live, run_id, "pydantic", 3.0)
+    write_live(live, "L1", "our", 2.0)
+    write_live(live, "L2", "our", 2.0)
+    write_live(live, "L3", "our", 0.1, passed=False,
+               invariants={"I5": {"ok": False, "detail": "wrote to stderr"}})  # fmt: skip
+    write_live(live, "L4", "our", 0.1)  # only one loop ran it
+    text = re.sub(r"<[^>]+>", "", make(out, live=live))
+    assert "over 2 live runs of one prompt and setup (setup 1:" in text
+    setup = "setup 1: gpt-test, reasoning low, api.openai.com"
+    assert f"live run L4 · {setup} · not in the medians: A has no result" in text
+    assert f"live run L3 · {setup} · not in the medians: B did not pass (I5 failed)" in text
+    for run_id in ("L1", "L2"):
+        assert f"live run {run_id} · {setup}prompt" in text
+    assert "passedno" in text and "I5 failed: wrote to stderr" in text
 
 
 def test_live_medians_pool_only_runs_of_one_system_prompt(out: Path, tmp_path: Path) -> None:

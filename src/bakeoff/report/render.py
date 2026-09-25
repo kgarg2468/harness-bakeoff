@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
-from bakeoff.report.data import WIRE_LIMIT, endpoint, impl_of_package, impl_order, loop_info
+from bakeoff.report.data import WIRE_LIMIT, clip, endpoint, impl_of_package, impl_order, loop_info
 
 REPO_URL = "https://github.com/kgarg2468/harness-bakeoff/blob/main"
 
@@ -1041,6 +1041,11 @@ def live(page: Page) -> str:
     groups = _live_groups(page)
     varying = _varying(groups)
     number = {run["run_id"]: k for k, group in enumerate(groups, 1) for run in group}
+    left_out = {
+        run["run_id"]: _left_out(run, _group_loops(page, group))
+        for group in groups
+        for run in group
+    }
     for run in page.live:
         results = run["results"]
         cols = []
@@ -1060,6 +1065,7 @@ def live(page: Page) -> str:
             stats = [
                 (term("latency"), fmt_ms(r.get("duration_ms"))),
                 *([("first token", fmt_ms(first_token))] if first_token is not None else []),
+                ("passed", {True: "yes", False: "no"}.get(r.get("passed"), "unknown")),
                 (term("step", "steps"), fmt_int(steps)),
                 *(
                     [("requests (with retries)", fmt_int(requests))]
@@ -1074,6 +1080,11 @@ def live(page: Page) -> str:
             ]
             dl = "".join(f"<div><dt>{k}</dt><dd>{v}</dd></div>" for k, v in stats)
             error = f'<p class="bad-t small">error: {esc(r["error"])}</p>' if r.get("error") else ""
+            checks = r.get("invariants") if isinstance(r.get("invariants"), dict) else {}
+            error += "".join(
+                f'<p class="bad-t small">{esc(n)} failed: {esc(clip(str(checks[n].get("detail") or ""), 300))}</p>'
+                for n in _failed_checks(r)
+            )
             stops = ", ".join(map(str, r.get("stops") or []))
             stop = f" · {term('stop', 'stop')} {esc(stops)}" if stops else ""
             cols.append(
@@ -1084,11 +1095,12 @@ def live(page: Page) -> str:
             )
         # Which runs the medians in section 6 pool: those of one prompt and model setup. The
         # number is the one the claims name, so a reader can tell two similar setups apart.
-        setup = (
-            f" · setup {number[run['run_id']]}: {esc(_setup(_settings(run), varying))}"
-            if run.get("group")
-            else " · the loops ran different prompts or model settings: not in the medians"
-        )
+        if not run.get("group"):
+            setup = " · the loops ran different prompts or model settings: not in the medians"
+        else:
+            setup = f" · setup {number[run['run_id']]}: {esc(_setup(_settings(run), varying))}"
+            if why := left_out[run["run_id"]]:  # the medians' own test: the two never disagree
+                setup += f" · not in the medians: {esc(why)}"
         out.append(
             f'<div class="fig live"><div class="small muted">live run <code>{esc(run["run_id"])}</code>{setup}</div>'
             f'<div class="prompt"><span class="k">prompt</span> {_expandable(run.get("prompt") or "", 400)}</div>'
@@ -1336,13 +1348,44 @@ def _per_step(result: dict[str, Any], value: Any) -> float | None:
     return value / steps if isinstance(value, (int, float)) and steps else None
 
 
-def _answered(result: dict[str, Any] | None) -> bool:
-    """The loop finished the live run: it passed, with no error, and its last turn ended with
-    end_turn. `passed` is required too: a run can end with end_turn while an invariant fails."""
-    if not result or result.get("error") or result.get("passed") is not True:
-        return False
+def _failed_checks(result: dict[str, Any]) -> list[str]:
+    """The invariants a live run failed, by name."""
+    checks = result.get("invariants")
+    checks = checks if isinstance(checks, dict) else {}
+    return sorted(n for n, c in checks.items() if isinstance(c, dict) and c.get("ok") is False)
+
+
+def _unanswered(result: dict[str, Any] | None) -> str | None:
+    """Why a loop did not finish a live run, or None if it did: it passed, with no error, and
+    its last turn ended with end_turn. `passed` is required too: a run can end with end_turn
+    while an invariant fails."""
+    if not result:
+        return "has no result"
+    if result.get("error"):
+        return "stopped with an error"
     stops = result.get("stops") or []
-    return bool(stops) and stops[-1] == "end_turn"
+    if stops[-1:] != ["end_turn"]:
+        return f"stopped with {stops[-1]}" if stops else "ended no turn"
+    if result.get("passed") is not True:
+        failed = _failed_checks(result)
+        return "did not pass" + (f" ({', '.join(failed)} failed)" if failed else "")
+    return None
+
+
+def _left_out(run: dict[str, Any], loops: list[str]) -> str | None:
+    """Why a grouped live run is not in its group's medians, or None if it is: every loop of the
+    group (`loops`, 2 or more) must have finished it."""
+    if len(loops) < 2:
+        return "only one loop ran this setup"
+    for impl in loops:
+        if (why := _unanswered(run["results"].get(impl))) is not None:
+            return f"{loop_info(impl).letter} {why}"
+    return None
+
+
+def _group_loops(page: Page, group: list[dict[str, Any]]) -> list[str]:
+    """The loops that ran a live group: a run counts only if every one of them finished it."""
+    return [i for i in page.loops if any(i in run["results"] for run in group)]
 
 
 def _live_groups(page: Page) -> list[list[dict[str, Any]]]:
@@ -1419,11 +1462,9 @@ def _group_claims(page: Page, group: list[dict[str, Any]], setup: str) -> list[C
     win only with enough samples and a clear margin. A run counts only if every loop finished it
     (passed, last stop end_turn, no error): a loop that failed at once would otherwise look fast
     and cheap. `setup` (HTML) names the group."""
-    loops = [i for i in page.loops if any(i in run["results"] for run in group)]
-    samples = [
-        run["results"] for run in group if all(_answered(run["results"].get(i)) for i in loops)
-    ]
-    if len(loops) < 2 or not samples:
+    loops = _group_loops(page, group)
+    samples = [run["results"] for run in group if _left_out(run, loops) is None]
+    if not samples:
         return []
     n = len(samples)
     runs = f"{n} live run{'s' * (n != 1)} of one prompt and setup"
