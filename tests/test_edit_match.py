@@ -199,3 +199,17 @@ def test_empty_candidate_span_is_never_replaced():
     # Upstream would replace "" (between every character) here; the port skips empty spans.
     with pytest.raises(NoMatch):
         replace("a\n\nb", "\t", "X", replace_all=True)
+
+
+def test_block_anchor_near_tie_is_ambiguous():
+    """Two anchored blocks that are about equally close to old_string: refuse, don't guess."""
+    content = "start\nalpha one two\nend\nstart\nalpha one tw0\nend\n"
+    with pytest.raises(MultipleMatches):
+        list(block_anchor_replacer(content, "start\nalpha one twx\nend"))
+
+
+def test_block_anchor_clear_winner_is_used():
+    content = "start\nalpha one two three\nend\nstart\nzzz qqq\nend\n"
+    assert list(block_anchor_replacer(content, "start\nalpha one two thrEE\nend")) == [
+        "start\nalpha one two three\nend"
+    ]

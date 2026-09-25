@@ -1,5 +1,6 @@
 # Ported from OpenCode (MIT): packages/opencode/src/tool/edit.ts @ 16c56fe5ecc3305028d1f0a9cff5806e51c9d480
-# Changes: the replacer chain and replace() only, in Python; empty candidate spans are skipped; bit-parallel levenshtein.
+# Changes: the replacer chain and replace() only, in Python; empty candidate spans are skipped;
+# bit-parallel levenshtein; near-tied block-anchor candidates raise MultipleMatches.
 # OpenCode credits these approaches to Cline (Apache-2.0):
 #   evals/diff-edits/diff-apply/diff-06-23-25.ts and diff-06-26-25.ts
 # and gemini-cli (Apache-2.0): packages/core/src/utils/editCorrector.ts
@@ -21,6 +22,7 @@ Replacer = Callable[[str, str], Iterator[str]]
 # Similarity thresholds for block anchor fallback matching
 SINGLE_CANDIDATE_SIMILARITY_THRESHOLD = 0.65
 MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD = 0.65
+AMBIGUITY_MARGIN = 0.15  # a runner-up this close to the best block makes the match ambiguous
 
 
 class EditError(ValueError):
@@ -150,14 +152,25 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
             yield _span(original_lines, start, end)
         return
 
-    best: tuple[int, int] | None = None
-    max_similarity = -1.0
-    for start, end in candidates:
-        similarity = _middle_similarity(original_lines, search_lines, start, end)
-        if similarity > max_similarity:
-            max_similarity, best = similarity, (start, end)
-    if best and max_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD:
-        yield _span(original_lines, *best)
+    scored = sorted(
+        (
+            (_middle_similarity(original_lines, search_lines, start, end), (start, end))
+            for start, end in candidates
+        ),
+        reverse=True,
+    )
+    if not scored or scored[0][0] < MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD:
+        return
+    # Deviation from OpenCode: two qualifying blocks that score about the same are ambiguous
+    # (OpenCode picks the higher one, which can silently edit the wrong block). A block whose
+    # middle matches exactly still wins over near misses.
+    best, runner_up = scored[0][0], scored[1][0] if len(scored) > 1 else -1.0
+    if runner_up == best or (best < 1.0 and runner_up >= best - AMBIGUITY_MARGIN):
+        raise MultipleMatches(
+            "Found several similar blocks for old_string. Provide more surrounding context to "
+            "make the match unique."
+        )
+    yield _span(original_lines, *scored[0][1])
 
 
 def _normalize_whitespace(text: str) -> str:

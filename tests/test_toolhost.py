@@ -248,3 +248,15 @@ async def test_result_error_kind(make, rules, name, args, error):
     result = await make(rules).run(call(name, args))
     assert result.error == error
     assert result.ok is (error is None)
+
+
+async def test_failing_emit_never_breaks_run(tmp_path):
+    """run() returns a result even if the event callback raises; the error is kept."""
+
+    def boom(event):
+        raise RuntimeError("sink down")
+
+    host = build_toolhost(tmp_path, {"*": "allow"}, boom)
+    result = await host.run(call("write_file", {"path": "a.txt", "content": "x"}))
+    assert result.ok and (tmp_path / "a.txt").read_text() == "x"
+    assert [str(e) for e in host.emit_errors] == ["sink down", "sink down"]

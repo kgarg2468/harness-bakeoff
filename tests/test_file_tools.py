@@ -196,3 +196,18 @@ async def test_symlinked_directory_is_listed_not_followed(wc, ctx, tmp_path):
     (outside / "secret.txt").write_text("s")
     os.symlink(outside, wc / "out")
     assert await list_files({}, ctx) == "out/"
+
+
+async def test_edit_refuses_non_utf8_file(tmp_path):
+    """edit_file writes the whole file back, so a non-UTF-8 file must be refused, not corrupted."""
+    from bakeoff.shared.contract import ToolCall
+    from bakeoff.shared.toolhost import build_toolhost
+
+    original = "caf\xe9 line\nplain line\n".encode("latin-1")
+    (tmp_path / "latin1.txt").write_bytes(original)
+    host = build_toolhost(tmp_path, {"*": "allow"}, lambda e: None)
+    args = '{"path": "latin1.txt", "old_string": "plain line", "new_string": "edited"}'
+    result = await host.run(ToolCall("c1", "edit_file", args))
+    assert not result.ok and result.error == "failed"
+    assert "not UTF-8" in result.content
+    assert (tmp_path / "latin1.txt").read_bytes() == original

@@ -12,7 +12,8 @@ from typing import Any
 
 from .base import envelope, unknown_provider_errors
 
-DEFAULT_CATALOG = Path(__file__).resolve().parents[4] / "data" / "rocketride" / "catalog.json"
+# Package data (src/bakeoff/data/), so source checkouts and installed wheels both have it.
+DEFAULT_CATALOG = Path(__file__).resolve().parents[2] / "data" / "catalog.json"
 VERSION = 2  # IServices::VERSION (engLib/store/headers/services.hpp)
 # Binder::MethodNames (engLib/store/headers/binder.hpp): every lane a connection may name.
 METHOD_NAMES = frozenset(
@@ -43,7 +44,7 @@ def _load_services(path: Path) -> dict[str, dict]:
 
 
 class MockEngine:
-    """An in-process `Engine` over `data/rocketride/catalog.json`.
+    """An in-process `Engine` over `bakeoff/data/catalog.json`.
 
     `validate` applies the engine's structural rules, the MCP tool's unknown-provider check and
     a lane check: each input lane must be one the target component accepts and one the source

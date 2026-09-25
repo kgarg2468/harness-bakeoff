@@ -1,13 +1,13 @@
 # Ported from RocketRide (MIT): nodes/test/framework/discovery.py @ a1fa4f15b5c61c51e450ffb6d24057b7edcf13d3
 # Changes: only the service*.json reader (comments, trailing commas); it parses text read via git.
-"""Regenerate `data/rocketride/` from rocketride-server's `origin/develop`.
+"""Regenerate `src/bakeoff/data/` from rocketride-server's `origin/develop`.
 
 The repository is read with `git show` / `git ls-tree` only (never checked out or modified):
 
     uv run python scripts/sync_rocketride_data.py [REPO]
 
 Writes `catalog.json` (one compact entry per node provider) and copies a few valid example
-pipelines plus all of `examples/incorrect/` into `data/rocketride/examples/`.
+pipelines plus all of `examples/incorrect/` into `src/bakeoff/data/examples/`.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Any
 
 REF = "origin/develop"
 UPSTREAM = "rocketride-org/rocketride-server"
-OUT = Path(__file__).resolve().parents[1] / "data" / "rocketride"
+OUT = Path(__file__).resolve().parents[1] / "src" / "bakeoff" / "data"
 SERVICE_FILE = re.compile(r"^nodes/src/nodes/[^/]+/services[^/]*\.json$")
 # Valid examples that pass MockEngine's rules (structure, known providers, lanes).
 VALID_EXAMPLES = (

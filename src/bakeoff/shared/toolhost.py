@@ -52,6 +52,7 @@ class ToolHostImpl:
         self._rules = rules
         self._emit = emit
         self.run_counts: dict[str, int] = {}
+        self.emit_errors: list[Exception] = []
 
     def specs(self) -> list[ToolSpec]:
         """All tools, always in the same order."""
@@ -71,7 +72,7 @@ class ToolHostImpl:
 
     async def run(self, call: ToolCall) -> ToolResult:
         """Validate, enforce deny, execute. Never raises, except `asyncio.CancelledError`."""
-        self._emit(Event("tool.start", {"call_id": call.id, "name": call.name}))
+        self._safe_emit(Event("tool.start", {"call_id": call.id, "name": call.name}))
         start = time.perf_counter()
         ok = False
         try:
@@ -84,9 +85,18 @@ class ToolHostImpl:
             return ToolResult(call_id=call.id, ok=ok, content=content, error=error)
         finally:
             ms = round((time.perf_counter() - start) * 1000, 3)
-            self._emit(
+            self._safe_emit(
                 Event("tool.end", {"call_id": call.id, "name": call.name, "ok": ok, "ms": ms})
             )
+
+    def _safe_emit(self, event: Event) -> None:
+        """Emit without letting a failing callback break run()'s never-raises guarantee.
+
+        Failures are kept in `emit_errors` (tests and the runner can inspect them)."""
+        try:
+            self._emit(event)
+        except Exception as e:
+            self.emit_errors.append(e)
 
     async def _execute(self, call: ToolCall) -> tuple[ToolErrorKind | None, str]:
         """(error kind or None on success, content for the model)."""

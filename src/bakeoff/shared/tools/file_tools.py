@@ -21,14 +21,22 @@ def _rel(ctx: ToolContext, full: Path) -> str:
 
 
 def _read(ctx: ToolContext, path: str, *, write: bool = False) -> tuple[Path, str]:
+    """The file's text. For an edit (`write=True`) the file must be valid UTF-8, because the
+    whole file is written back: replacement characters would corrupt bytes outside the edit."""
     full = resolve_path(ctx.workdir, path, write=write)
     if full.is_dir():
         raise ToolError(f"Not a file: {path} (use list_files for directories)")
     try:
         # Bytes, not read_text: keep line endings exactly as they are on disk.
-        return full, full.read_bytes().decode("utf-8", errors="replace")
+        data = full.read_bytes()
     except FileNotFoundError:
         raise ToolError(f"File not found: {path}") from None
+    try:
+        return full, data.decode("utf-8", errors="strict" if write else "replace")
+    except UnicodeDecodeError:
+        raise ToolError(
+            f"Cannot edit {path}: it is not UTF-8 text. Use write_file to replace it."
+        ) from None
 
 
 def _write(full: Path, content: str) -> int:
