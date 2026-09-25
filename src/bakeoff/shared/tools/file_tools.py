@@ -8,7 +8,7 @@ from typing import Any
 
 from bakeoff.shared.contract import ToolSpec
 
-from . import Tool, ToolContext, ToolError, resolve_path
+from . import Tool, ToolContext, ToolError, in_git, resolve_path
 from .edit_match import EditError, replace
 
 MAX_ENTRIES = 500
@@ -42,14 +42,16 @@ async def list_files(args: dict[str, Any], ctx: ToolContext) -> str:
     """Every file and directory below `path`, relative to the working copy, sorted."""
     path = args.get("path", ".")
     base = resolve_path(ctx.workdir, path)
+    if in_git(ctx.workdir, base):
+        raise ToolError(f"Cannot list {path}: .git is hidden")
     if not base.is_dir():
         raise ToolError(f"Not a directory: {path}")
     entries: list[str] = []
     for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = [d for d in dirnames if d != ".git"]
+        dirnames[:] = [d for d in dirnames if d.casefold() != ".git"]
         here = Path(dirpath)
         entries += [f"{_rel(ctx, here / d)}/" for d in dirnames]
-        entries += [_rel(ctx, here / f) for f in filenames if f != ".git"]
+        entries += [_rel(ctx, here / f) for f in filenames if f.casefold() != ".git"]
     entries.sort()
     if len(entries) > MAX_ENTRIES:
         more = len(entries) - MAX_ENTRIES

@@ -46,7 +46,18 @@ def test_paths_inside_are_resolved(wc):
     assert resolve_path(wc, ".") == wc
 
 
-@pytest.mark.parametrize("path", [".git/config", ".git", "x/../.git/hooks/pre-commit"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".git/config",
+        ".git",
+        "x/../.git/hooks/pre-commit",
+        "sub/.git/HEAD",  # a nested repository breaks `git add -A`
+        "sub/.git",  # a gitfile turns sub/ into a gitlink to another repository
+        ".GIT/config",  # the real .git on a case-insensitive file system
+        "sub/.Git",
+    ],
+)
 def test_git_is_never_writable(wc, path):
     (wc / ".git").mkdir()
     assert resolve_path(wc, path) == (wc / path).resolve()  # reading is fine
@@ -68,6 +79,22 @@ async def test_list_files_recursive_sorted_hides_git(wc, ctx):
     (wc / ".gitignore").write_text("out/")
     assert await list_files({}, ctx) == ".gitignore\na.pipe\nb/\nb/c.txt"
     assert await list_files({"path": "b"}, ctx) == "b/c.txt"
+
+
+async def test_list_files_hides_git_at_any_depth(wc, ctx):
+    (wc / "sub" / ".git").mkdir(parents=True)
+    (wc / "sub" / "a.pipe").write_text("{}")
+    (wc / "other").mkdir()
+    (wc / "other" / ".GIT").write_text("gitdir: elsewhere")
+    assert await list_files({}, ctx) == "other/\nsub/\nsub/a.pipe"
+
+
+@pytest.mark.parametrize("path", [".git", ".git/refs", "sub/.git", ".GIT"])
+async def test_list_files_refuses_to_list_git(wc, ctx, path):
+    (wc / ".git" / "refs").mkdir(parents=True)
+    (wc / "sub" / ".git").mkdir(parents=True)
+    with pytest.raises(ToolError, match=r"\.git is hidden"):
+        await list_files({"path": path}, ctx)
 
 
 async def test_list_files_caps_entries(wc, ctx):
@@ -109,10 +136,19 @@ async def test_write_onto_a_directory(wc, ctx):
         await write_file({"path": "d", "content": ""}, ctx)
 
 
-async def test_write_into_git_is_refused(wc, ctx):
+@pytest.mark.parametrize("path", [".git/config", "sub/.git/HEAD", "sub/.git", ".GIT/config"])
+async def test_write_into_git_is_refused(wc, ctx, path):
     with pytest.raises(PathError):
-        await write_file({"path": ".git/config", "content": ""}, ctx)
-    assert not (wc / ".git").exists()
+        await write_file({"path": path, "content": "gitdir: /elsewhere"}, ctx)
+    assert list(wc.iterdir()) == []
+
+
+async def test_edit_into_git_is_refused(wc, ctx):
+    (wc / "sub").mkdir()
+    (wc / "sub" / ".git").write_text("gitdir: a")
+    with pytest.raises(PathError):
+        await edit_file({"path": "sub/.git", "old_string": "a", "new_string": "b"}, ctx)
+    assert (wc / "sub" / ".git").read_text() == "gitdir: a"
 
 
 async def test_edit_file(wc, ctx):

@@ -94,6 +94,9 @@ def test_check_uses_rules_and_paths(make):
         ("list_files", {"path": ".."}),
         ("validate_pipeline", {"path": "../p.pipe"}),
         ("write_file", {"path": ".git/config", "content": "x"}),
+        ("write_file", {"path": "sub/.git/HEAD", "content": "x"}),
+        ("write_file", {"path": ".GIT/config", "content": "x"}),
+        ("edit_file", {"path": "sub/.git", "old_string": "a", "new_string": "b"}),
     ],
 )
 async def test_path_escape_is_always_denied(make, events, name, args):

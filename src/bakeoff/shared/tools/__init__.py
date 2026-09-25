@@ -38,10 +38,20 @@ class PathError(ToolError):
     """A path the tools refuse: absolute, outside the working copy, or a write into `.git`."""
 
 
+def in_git(root: Path, full: Path) -> bool:
+    """Whether `full`, a resolved path inside `root`, is a `.git` entry or inside one.
+
+    Any depth counts: a nested `.git` directory or gitfile breaks the runner's `git add -A`.
+    Case-insensitive, because `.GIT` is `.git` on case-insensitive file systems (macOS default).
+    """
+    return any(part.casefold() == ".git" for part in full.relative_to(root).parts)
+
+
 def resolve_path(root: Path, path: str, *, write: bool = False) -> Path:
     """Resolve `path` against the working copy `root` (already resolved).
 
-    Symlinks are followed, so a link pointing outside the working copy is refused too.
+    Symlinks are followed, so a link pointing outside the working copy is refused too. With
+    `write`, any `.git` path is refused as well.
     """
     if Path(path).is_absolute():
         raise PathError(f"Path must be relative to the working copy: {path}")
@@ -51,6 +61,6 @@ def resolve_path(root: Path, path: str, *, write: bool = False) -> Path:
         raise PathError(f"Invalid path {path!r}: {e}") from e
     if not full.is_relative_to(root):
         raise PathError(f"Path escapes the working copy: {path}")
-    if write and full.relative_to(root).parts[:1] == (".git",):
+    if write and in_git(root, full):
         raise PathError(f"Writing inside .git is not allowed: {path}")
     return full
