@@ -33,9 +33,11 @@ from pydantic_ai import (
     CostNotFoundWarning,
     DeferredToolRequests,
     DeferredToolResults,
+    FunctionToolResultEvent,
     ModelAPIError,
     ModelHTTPError,
     ModelMessage,
+    ModelRequest,
     ModelRequestContext,
     ModelResponse,
     ModelResponseStreamEvent,
@@ -106,14 +108,16 @@ class _Turn:
     tools: ToolHost
     max_steps: int
     decided: set[str]  # the calls the user answered in this resume
+    read_only: set[str]  # tool names
     out: asyncio.Queue[Event | None] = field(default_factory=asyncio.Queue)
     steps: int = 0
     attempt: int = 0  # of the current step
     # (status, monotonic time, reason) of the last failed attempt, until the next one starts.
     failure: tuple[int | None, float, str] | None = None
-    emitted: dict[int, ModelMessage] = field(default_factory=dict)
+    emitted: dict[int, Any] = field(default_factory=dict)  # messages and result parts, by id
     items: list[Item] = field(default_factory=list)  # emitted this turn
     responses: list[tuple[int, ModelResponse]] = field(default_factory=list)  # usage not sent yet
+    results: list[Any] = field(default_factory=list)  # the current batch's, not saved yet
 
     def emit(self, type_: str, data: dict[str, Any]) -> None:
         self.out.put_nowait(Event(type_, data))
@@ -153,14 +157,30 @@ class _Turn:
             case PartEndEvent(part=ToolCallPart() as call):
                 self.emit("tool_call.ready", _call_data(call))
 
+    def tool_done(self, response: ModelResponse, part: Any) -> None:
+        """A tool finished. A tool that changes files ran alone (`sequential`), after every call
+        before it: save its result now, with theirs, so a crash never runs it again (rule 4).
+        Other results wait for the request, which has them all in call order."""
+        self.results.append(part)
+        if part.tool_name not in self.read_only:
+            order = [call.tool_call_id for call in response.tool_calls]
+            self.results.sort(key=lambda result: order.index(result.tool_call_id))
+            self.flush([ModelRequest(parts=self.results)])
+            self.results = []
+
     def flush(self, messages: Iterable[ModelMessage]) -> None:
-        """Emit an item for each wire message not emitted yet, then the queued usage events."""
+        """Emit an item for each wire message not emitted yet, then the queued usage events.
+        A tool result saved when its tool finished is not saved again with its request."""
         for message in messages:
             if id(message) in self.emitted:
                 continue
             self.emitted[id(message)] = message  # keeps the object alive, so ids stay unique
             interrupted = isinstance(message, ModelResponse) and message.state == "interrupted"
             for piece in mapping.split(message):
+                if isinstance(piece, ModelRequest):
+                    if id(part := piece.parts[0]) in self.emitted:
+                        continue
+                    self.emitted[id(part)] = part
                 for openai_message in mapping.to_openai(piece):
                     item = Item(
                         id=uuid.uuid4().hex,
@@ -200,7 +220,8 @@ class PydanticLoop:
         self, turn: TurnInput, tools: ToolHost, cancel: asyncio.Event
     ) -> AsyncIterator[Event]:
         decided = set(turn.resume.decisions) if turn.resume else set()
-        state = _Turn(turn.turn_id, tools, turn.limits.max_steps, decided)
+        read_only = {spec.name for spec in tools.specs() if spec.read_only}
+        state = _Turn(turn.turn_id, tools, turn.limits.max_steps, decided, read_only)
         task = asyncio.create_task(self._drive(turn, state, cancel))
         try:
             while (event := await state.out.get()) is not None:
@@ -299,6 +320,14 @@ class PydanticLoop:
                 try:
                     # Persist at every node boundary, so a crash loses at most the current step.
                     async for node in run:
+                        if Agent.is_call_tools_node(node):
+                            state.flush(run.new_messages())
+                            state.results = []
+                            async with node.stream(run.ctx) as events:
+                                async for event in events:
+                                    if isinstance(event, FunctionToolResultEvent):
+                                        state.tool_done(node.model_response, event.part)
+                            continue
                         if not Agent.is_model_request_node(node):
                             state.flush(run.new_messages())
                             continue
@@ -333,7 +362,9 @@ class PydanticLoop:
             # history is complete only once the run has unwound, in the RunCancelled snapshot.
             ended = exc if isinstance(exc, RunCancelled) else run
             if ended is not None:
-                state.flush([*ended.new_messages(), *mapping.close_pending(ended.all_messages())])
+                state.flush(ended.new_messages())
+                saved = mapping.to_history([*turn.history, *state.items])
+                state.flush(mapping.close_pending(saved))
             raise
         if result is not None and isinstance(result.output, DeferredToolRequests):
             return _pause(state, result.output.approvals)
@@ -373,7 +404,7 @@ class PydanticLoop:
 def _tool(spec: ToolSpec) -> Tool[_Turn]:
     async def call(ctx: RunContext[_Turn], **_: Any) -> str | ToolDenied:
         # The ToolHost sends tool.start straight to the runner; wait until the consumer has
-        # handled everything queued before it (this call's tool_call.ready).
+        # handled everything queued before it (this call's tool_call.ready, earlier results).
         await ctx.deps.out.join()
         result = await ctx.deps.tools.run(_running_call(ctx))
         # The library's three outcomes for a call that did not succeed (A_CHECKLIST).
@@ -391,6 +422,9 @@ def _tool(spec: ToolSpec) -> Tool[_Turn]:
         description=spec.description,
         json_schema=spec.parameters,
         takes_ctx=True,
+        # A tool that changes files runs alone, after the calls before it and before those
+        # after it, so no call sees older state than the calls before it left.
+        sequential=not spec.read_only,
     )
     # The default (strict=None) lets the OpenAI schema transformer add
     # `additionalProperties: false` to every object, which turns free-form objects such as

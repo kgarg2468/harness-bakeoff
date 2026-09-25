@@ -10,6 +10,7 @@ import sys
 import time
 import uuid
 import warnings
+from collections import defaultdict
 from dataclasses import asdict
 from typing import Any
 
@@ -61,13 +62,20 @@ class StubTools:
     """ToolHost stand-in: a decision per tool name, instant results unless `slow`, and a log
     shared with the test's event consumer so ordering can be checked."""
 
-    def __init__(self, rules: dict[str, Decision] | None = None, slow: str | None = None) -> None:
+    def __init__(
+        self,
+        rules: dict[str, Decision] | None = None,
+        slow: str | None = None,
+        delays: dict[str, float] | None = None,
+    ) -> None:
         self.rules = rules or {}
         self.slow = slow
+        self.delays = delays or {}  # seconds, by call id
         self.runs: list[ToolCall] = []
         self.checked: list[str] = []
         self.log: list[str] = []
         self.started = asyncio.Event()
+        self.running: defaultdict[str, asyncio.Event] = defaultdict(asyncio.Event)  # by call id
 
     def specs(self) -> list[ToolSpec]:
         return SPECS
@@ -82,8 +90,10 @@ class StubTools:
         self.log.append(f"tool.start:{call.id}")
         self.runs.append(call)
         self.started.set()
+        self.running[call.id].set()
         if call.name == self.slow:
             await asyncio.sleep(5)
+        await asyncio.sleep(self.delays.get(call.id, 0))
         try:
             args = json.loads(call.arguments)
         except ValueError:
@@ -376,8 +386,9 @@ async def test_a_new_message_after_an_unanswered_pause_closes_its_calls(loop):
 
 
 async def test_crash_between_the_results_of_one_batch_keeps_the_saved_one(loop):
-    """Rule 4 across a crash: the worker dies right after c1's result item is saved. c1 never runs
-    again; c2 ran but its result was not saved, so the crash resume runs it again (DESIGN)."""
+    """Rule 4 across a crash: the worker dies right after c1's result item is saved. c1 (a write)
+    ran alone and its result was saved before c2 started, so c1 never runs again and c2 runs
+    once, on the crash resume."""
     calls = tool_call(0, "c1", "write_file", '{"path": "a", "content": "x"}') + tool_call(
         1, "c2", "read_file", '{"path": "b"}'
     )
@@ -396,7 +407,7 @@ async def test_crash_between_the_results_of_one_batch_keeps_the_saved_one(loop):
         await fresh.aclose()
 
     runs = [c.id for c in tools.runs]
-    assert (runs.count("c1"), runs.count("c2")) == (1, 2)
+    assert (runs.count("c1"), runs.count("c2")) == (1, 1)
     log = history + items(events)
     assert [i.message["tool_call_id"] for i in log if i.message["role"] == "tool"] == ["c1", "c2"]
     assert len(srv.requests) == 2  # the killed worker never sent its next request
@@ -1001,3 +1012,98 @@ async def test_a_crash_resume_continues_the_step_cap_and_the_budget(loop, limit)
     assert of(resumed, "request.start") == [{"step": 3, "attempt": 1}]
     stop = "max_steps" if limit == "max_steps" else "budget"
     assert of(resumed, "turn.end") == [{"stop": stop, "steps": 3}]
+
+
+def _second(call: list[Any]) -> list[Any]:
+    """A streamed call moved to tool-call index 1."""
+    return [
+        chunk({"tool_calls": [{**c["choices"][0]["delta"]["tool_calls"][0], "index": 1}]})
+        for c in call
+    ]
+
+
+@pytest.mark.parametrize("write_first", [True, False])
+async def test_a_crash_during_a_slow_tool_never_reruns_a_finished_write(loop, write_first):
+    """A batch of a write and a slow read-only call; the worker dies while the read runs. A write
+    runs alone and its result is saved as soon as it finishes, so the crash resume never runs it
+    again. (A read-only call whose result was not saved may run again; DESIGN allows that.)"""
+    write = tool_call(0, "w1", "write_file", '{"path": "a", "content": "x"}')
+    read = tool_call(0, "r1", "validate_pipeline", '{"path": "p.pipe"}')
+    first, second = (write, read) if write_first else (read, write)
+    tools = StubTools(delays={"r1": 0.3})
+    batch = Reply([*first, *_second(second), done("tool_calls")])
+    with SSEServer(batch, Reply([*text("ok"), done()])) as srv:
+        history = [user("go")]
+        stream = loop.run_turn(turn(history, config(srv)), tools, asyncio.Event())
+
+        async def consume() -> None:
+            async for event in stream:
+                if event.type == "item":
+                    history.append(items([event])[0])
+
+        worker = asyncio.create_task(consume())
+        await asyncio.wait_for(tools.running["r1"].wait(), 5)
+        worker.cancel()  # SIGKILL while the read-only call runs
+        await asyncio.gather(worker, return_exceptions=True)
+        await stream.aclose()
+        ran_before = [c.id for c in tools.runs]
+        fresh = PydanticLoop()
+        events = await run(fresh, turn(history, config(srv), resume=Resume("crash")), tools)
+        await fresh.aclose()
+
+    assert ran_before == (["w1", "r1"] if write_first else ["r1"])
+    runs = [c.id for c in tools.runs]
+    assert runs.count("w1") == 1
+    assert of(events, "turn.end")[0]["stop"] == "end_turn"
+    log = history + items(events)
+    results = [i.message["tool_call_id"] for i in log if i.message["role"] == "tool"]
+    assert results == (["w1", "r1"] if write_first else ["r1", "w1"])  # call order, as sent
+
+
+async def test_each_result_is_saved_once_in_call_order_across_batches(loop):
+    """The log shows every request as it was sent: results in call order, none twice, also when
+    a write's result is saved early and a read's waits for the request."""
+    tools = StubTools(delays={"r2": 0.05})
+    replies = [
+        Reply([*tool_call(0, "r1", "read_file", '{"path": "a"}'), done("tool_calls")]),
+        Reply(
+            [
+                *tool_call(0, "r2", "read_file", '{"path": "b"}'),
+                *_second(tool_call(0, "w1", "write_file", '{"path": "c", "content": "x"}')),
+                done("tool_calls"),
+            ]
+        ),
+        Reply([*text("ok"), done()]),
+    ]
+    with SSEServer(*replies) as srv:
+        events = await run(loop, turn([user("go")], config(srv)), tools)
+
+    log = [i.message for i in items(events)]
+    assert [(m["role"], m.get("tool_call_id")) for m in log] == [
+        ("assistant", None),
+        ("tool", "r1"),
+        ("assistant", None),
+        ("tool", "r2"),
+        ("tool", "w1"),
+        ("assistant", None),
+    ]
+    assert srv.requests[2]["messages"][2:] == log[:-1]  # the log's view is the wire
+
+
+async def test_a_cancel_after_a_saved_write_result_closes_only_the_rest(loop):
+    tools = StubTools(delays={"r1": 5})
+    cancel = asyncio.Event()
+    calls = [
+        *tool_call(0, "w1", "write_file", '{"path": "a", "content": "x"}'),
+        *_second(tool_call(0, "r1", "validate_pipeline", '{"path": "p.pipe"}')),
+    ]
+    with SSEServer(Reply([*calls, done("tool_calls")])) as srv:
+        task = asyncio.create_task(run(loop, turn([user("go")], config(srv)), tools, cancel))
+        await asyncio.wait_for(tools.running["r1"].wait(), 5)
+        cancel.set()
+        events = await task
+
+    interrupted = "The tool call was interrupted before a result was produced."
+    results = [(i.message["tool_call_id"], i.message["content"]) for i in items(events)[1:]]
+    assert results == [("w1", "write_file ok"), ("r1", interrupted)]
+    assert of(events, "turn.end")[0]["stop"] == "cancelled"
