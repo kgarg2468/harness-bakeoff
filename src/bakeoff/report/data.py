@@ -802,11 +802,18 @@ def endpoint(base_url: str | None) -> str:
     return base_url.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0].rsplit("@", 1)[-1].lower()
 
 
-def route(base_url: str | None, template: str | None) -> str:
-    """The route a live run used: the path of its `--base-url` template when the result records
-    it ("{impl}" still in place, so the loops of one run compare), else the path of the
-    base_url as used. Never a guess at which segment was the loop's name. Never the query."""
-    return urlsplit(template or base_url or "").path.rstrip("/")
+def route(base_url: str | None, template: str | None, impl: str) -> str:
+    """The route a live run used, never with the query.
+
+    From its `--base-url` template when the result records it ("{impl}" still in place, so the
+    loops of one run compare): exact. Results from before `bakeoff live` recorded the template
+    fall back to the base_url's path with a segment that is this loop's own name read as
+    "{impl}", which is how those runs were compared before; it can only misread a fixed path
+    segment that happens to be a loop's name, and only in those older results."""
+    if template:
+        return urlsplit(template).path.rstrip("/")
+    path = urlsplit(base_url or "").path.rstrip("/")
+    return "/".join("{impl}" if part == impl else part for part in path.split("/"))
 
 
 def _thread_setup(log: Path, thread: Any) -> tuple[dict[str, Any], str] | str:
@@ -842,7 +849,7 @@ def live_settings(idir: Path, result: dict[str, Any]) -> tuple[dict[str, Any] | 
     base_url = model.get("base_url") or result.get("base_url")
     return {
         "endpoint": endpoint(base_url),
-        "path": route(base_url, result.get("base_url_template")),
+        "path": route(base_url, result.get("base_url_template"), idir.name),
         **{k: model.get(k, result.get(k)) for k in _LIVE_SETTINGS},
         "system": hashlib.sha256(system.encode()).hexdigest()[:12],
         # A run that lacks one is in no group (see `load_live`), whatever this says.

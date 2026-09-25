@@ -950,3 +950,20 @@ def test_a_fixed_path_segment_named_like_a_loop_does_not_split_runs(
             write_live(live, run_id, impl, seconds, base_url="http://127.0.0.1:8787/our/v1")
     text = re.sub(r"<[^>]+>", "", make(out, live=live))
     assert "over 2 live runs of one prompt and setup" in text
+
+
+def test_older_live_results_without_a_template_still_group_their_loops(
+    out: Path, tmp_path: Path
+) -> None:
+    """Greptile #4104738727: results written before bakeoff live recorded base_url_template,
+    whose URL had the loop's name in its path ({impl}), still form one setup."""
+    live = tmp_path / "live"
+    for run_id, ours in (("L1", 1.0), ("L2", 1.1)):
+        for impl, seconds in (("our", ours), ("pydantic", 2.0)):
+            write_live(live, run_id, impl, seconds, base_url="http://127.0.0.1:8787/s/{impl}/v1")
+            path = live / run_id / impl / "result.json"
+            data = json.loads(path.read_text())
+            del data["base_url_template"]  # as an older bakeoff live wrote it
+            write_json(path, data)
+    text = re.sub(r"<[^>]+>", "", make(out, live=live))
+    assert "over 2 live runs of one prompt and setup" in text
