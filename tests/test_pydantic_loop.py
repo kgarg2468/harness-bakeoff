@@ -394,7 +394,9 @@ async def test_crash_resume_after_a_persisted_result_does_not_rerun_the_tool(loo
     assert [i.message["content"] for i in items(events)] == ["done"]
 
 
-async def test_cancel_during_a_stall_stops_fast_and_replays_the_partial_answer(loop):
+async def test_cancel_during_a_stall_stops_fast_and_replays_the_partial_answer_unsigned_reasoning_dropped(
+    loop,
+):
     thinking = chunk({"reasoning_details": [{"type": "reasoning.text", "text": "Hmm", "index": 0}]})
     tools = StubTools()
     cancel = asyncio.Event()
@@ -415,22 +417,17 @@ async def test_cancel_during_a_stall_stops_fast_and_replays_the_partial_answer(l
     assert stopped_in < 0.2
     assert events[-1] == Event("turn.end", {"stop": "cancelled", "steps": 1})
     assert [(i.status, i.message["content"]) for i in partial] == [("incomplete", "Par")]
-    # Recorded behavior: pydantic-ai replays the interrupted response as it was, including the
-    # unsigned reasoning (an endpoint that rejects unsigned reasoning answers this with a 400).
-    assert srv.requests[1]["messages"][2] == {
-        "role": "assistant",
-        "content": "Par",
-        "reasoning_details": [
-            {
-                "id": None,
-                "format": None,
-                "index": 0,
-                "type": "reasoning.text",
-                "text": "Hmm",
-                "signature": None,
-            }
-        ],
-    }
+    # The log keeps the cut-off reasoning, but the replay drops it (ProcessHistory): it has no
+    # signature, and endpoints that check signatures (Anthropic) reject it with a 400.
+    assert [p["part_kind"] for p in partial[0].native["parts"]] == ["thinking", "text"]
+    assert (
+        srv.requests[1]["messages"][2]
+        == partial[0].message
+        == {
+            "role": "assistant",
+            "content": "Par",
+        }
+    )
 
 
 async def test_cancel_during_a_slow_tool_closes_the_open_call(loop):

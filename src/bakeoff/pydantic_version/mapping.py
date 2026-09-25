@@ -60,7 +60,7 @@ def to_history(items: list[Item]) -> list[ModelMessage]:
 def to_openai(message: ModelMessage) -> list[dict[str, Any]]:
     """The OpenAI chat messages for one native message: one per tool result or prompt, else one."""
     if isinstance(message, ModelResponse):
-        return [_assistant(message)]
+        return [_assistant(replayable([message])[0])]
     out: list[dict[str, Any]] = []
     for part in message.parts:
         if isinstance(part, ToolReturnPart):
@@ -71,6 +71,22 @@ def to_openai(message: ModelMessage) -> list[dict[str, Any]]:
             out.append({"role": "user", "content": part.model_response()})
         elif isinstance(part, UserPromptPart):
             out.append({"role": "user", "content": part.content})
+    return out
+
+
+def replayable(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """The history as the loop replays it (a `ProcessHistory` capability): a response cut short by
+    a cancel loses its unsigned thinking. The signature only arrives at the end of a thinking
+    block, and endpoints that check signatures (Anthropic) reject a replay without one."""
+    out: list[ModelMessage] = []
+    for message in messages:
+        if isinstance(message, ModelResponse) and message.state == "interrupted":
+            parts = [
+                p for p in message.parts if not (isinstance(p, ThinkingPart) and not p.signature)
+            ]
+            if len(parts) < len(message.parts):
+                message = replace(message, parts=parts)
+        out.append(message)
     return out
 
 

@@ -49,7 +49,7 @@ from pydantic_ai import (
     UsageLimitExceeded,
     UsageLimits,
 )
-from pydantic_ai.capabilities import Hooks
+from pydantic_ai.capabilities import Hooks, ProcessHistory
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.toolsets import ApprovalRequiredToolset, FunctionToolset
 
@@ -263,7 +263,10 @@ class PydanticLoop:
                 deps_type=_Turn,
                 output_type=[str, DeferredToolRequests],
                 toolsets=[toolset],
-                capabilities=[Hooks(after_model_request=_billed_cost)],
+                capabilities=[
+                    Hooks(after_model_request=_billed_cost),
+                    ProcessHistory(mapping.replayable),
+                ],
                 name=self.name,
             )
             self._agents[key] = agent
