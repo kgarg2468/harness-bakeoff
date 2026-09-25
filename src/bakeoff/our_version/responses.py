@@ -8,9 +8,9 @@ when reasoning is on, a reasoning summary unless the effort is "none", `max_outp
 at least 16, a `prompt_cache_key` of at most 64 characters, flat function tools with
 `strict: false`, the system prompt as a developer message), the conversion of chat-shaped
 messages to input items, which events carry text and reasoning (a blank line between summary
-parts), and the ends of a stream: `response.completed`, `.incomplete` (max_output_tokens is a
-truncation, any other reason an error), `.failed`, the `error` event, and a stream that ends
-before any of them.
+parts; between messages too, which Pi keeps apart as blocks), and the ends of a stream:
+`response.completed`, `.incomplete` (max_output_tokens is a truncation, any other reason an
+error), `.failed`, the `error` event, and a stream that ends before any of them.
 
 Not ported (this harness does not need them): images, custom and grammar tools, tool search,
 service tiers and their pricing, cache retention options, session headers, Copilot, foreign
@@ -110,6 +110,7 @@ class ResponsesStream(Stream):
     def __init__(self) -> None:
         super().__init__()
         self.native: list[dict[str, Any]] = []
+        self.parts = 0  # reasoning summary parts so far, over all reasoning items
 
     def feed(self, event: dict[str, Any]) -> Event | StreamedCall | None:
         """Take one event. Returns an event to publish, or a function call that just completed."""
@@ -121,8 +122,16 @@ class ResponsesStream(Stream):
             return Event("reasoning.delta", {"text": event["delta"]})
         if kind == "response.output_item.done":
             return self._done(event["item"])
-        if kind == "response.reasoning_summary_part.added" and event.get("summary_index"):
-            return Event("reasoning.delta", {"text": "\n\n"})
+        # Pi keeps each output item in a block of its own. Here all reasoning streams as one text
+        # and all messages make one, so a blank line sets apart summary parts and messages.
+        if kind == "response.reasoning_summary_part.added":
+            self.parts += 1
+            return Event("reasoning.delta", {"text": "\n\n"}) if self.parts > 1 else None
+        if kind == "response.output_item.added":
+            if self.text and event["item"]["type"] == "message":
+                self.text.append("\n\n")
+                return Event("text.delta", {"text": "\n\n"})
+            return None
         if kind in _END:
             response = event["response"]
             self.usage, self.done = response.get("usage"), True

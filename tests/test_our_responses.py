@@ -252,6 +252,33 @@ async def test_failed_responses(
         assert of(events, "error")[0]["message"] == reason and events[-1].data["stop"] == "error"
 
 
+async def test_output_items_are_set_apart_by_blank_lines() -> None:
+    commentary = {**message("I'll check."), "id": "msg_0", "phase": "commentary"}
+    events = []
+    for n, item in enumerate(({**REASONING, "id": "rs_0"}, REASONING)):
+        events += [
+            event("response.output_item.added", item={**item, "summary": []}),
+            event("response.reasoning_summary_part.added", summary_index=0),
+            event("response.reasoning_summary_text.delta", summary_index=0, delta=f"Plan {n}."),
+            done(item),
+        ]
+    for item in (commentary, message("Done.")):
+        text = item["content"][0]["text"]
+        events += [
+            event("response.output_item.added", item={**item, "content": []}),
+            event("response.content_part.added", part={"type": "output_text", "text": ""}),
+            event("response.output_text.delta", delta=text),
+            done(item),
+        ]
+    server = Server(response(*events, completed()))
+    events = await run(server.loop(), [user("hi")], StubTools(), model=MODEL)
+    assert "".join(e["text"] for e in of(events, "reasoning.delta")) == "Plan 0.\n\nPlan 1."
+    assert "".join(e["text"] for e in of(events, "text.delta")) == "I'll check.\n\nDone."
+    (item,) = items(events)
+    assert item.message["content"] == "I'll check.\n\nDone."
+    assert item.native[2:] == [commentary, message("Done.")]  # replayed as sent, without it
+
+
 async def test_a_response_without_done_items_replays_its_text() -> None:
     server = Server(
         response(event("response.output_text.delta", delta="Hi"), completed()), answer("Bye")
