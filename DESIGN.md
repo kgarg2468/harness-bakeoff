@@ -88,7 +88,8 @@ loop must handle them. A compaction item (`Item.compaction=True`, a user message
   `Resume(kind="approval", decisions={call_id: "allow"|"deny"}, reason=...)`. History ends with
   the assistant message whose calls are pending (plus results for calls that already ran).
   The loop runs the allowed ones, feeds `ToolResult(ok=False, content="Denied by user: <reason>")`
-  for denied ones, and continues.
+  for denied ones, and continues. Until then the runner refuses a new user message, a
+  compaction and a revert: each would come between the pending calls and their results.
 - **Crash**: the worker process died mid-turn. The runner restarts the turn with
   `Resume(kind="crash")`. The loop continues from history. Calls that have no result are
   re-checked: `ask` pauses again, `allow` runs. A tool whose result item was already persisted
