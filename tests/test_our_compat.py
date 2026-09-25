@@ -1,15 +1,22 @@
-"""Unit tests for our_version's Pi ports: compat flags, reasoning_details merging, retry policy."""
+"""Unit tests for our_version's Pi ports: compat flags, reasoning_details merging, retry policy,
+tool-call accumulation and replay filtering."""
 
 from __future__ import annotations
 
+import json
 from email.utils import formatdate
 from time import time
+from types import SimpleNamespace
+from typing import Any
 
 import httpx
+import pytest
 
+from bakeoff.our_version import provider
 from bakeoff.our_version.compat import merge_detail, static_body, usage_fields
+from bakeoff.our_version.provider import Stream, replayed
 from bakeoff.our_version.retry import backoff, classify, is_context_overflow, retry_after
-from bakeoff.shared.contract import ModelConfig
+from bakeoff.shared.contract import Item, ModelConfig
 
 
 def model(**kwargs: object) -> ModelConfig:
@@ -161,3 +168,62 @@ def test_overflow_ignores_throttling() -> None:
 def test_backoff_is_jittered_and_capped() -> None:
     assert 0.375 <= backoff(0) <= 0.5
     assert 6.0 <= backoff(10) <= 8.0
+
+
+def test_tool_deltas_without_index_use_the_id_then_the_last_call() -> None:
+    stream = Stream()
+    for delta in [
+        {"id": "c0", "function": {"name": "write_file", "arguments": '{"path": '}},
+        {"function": {"arguments": '"a"}'}},
+        {"id": "c1", "function": {"name": "edit_file", "arguments": "{}"}},
+    ]:
+        stream.tool_delta(delta, set())
+    assert [(c.id, c.name, c.arguments) for c in stream.tool_calls()] == [
+        ("c0", "write_file", '{"path": "a"}'),
+        ("c1", "edit_file", "{}"),
+    ]
+
+
+def test_read_only_call_completes_on_its_closing_brace(monkeypatch: pytest.MonkeyPatch) -> None:
+    parses: list[str] = []
+
+    def loads(text: str) -> Any:
+        parses.append(text)
+        return json.loads(text)
+
+    monkeypatch.setattr(provider, "json", SimpleNamespace(loads=loads, dumps=json.dumps))
+    args = json.dumps(
+        {"pipeline": {"components": [{"id": f"c{i}", "config": {}} for i in range(50)]}}
+    )
+    pieces = [args[i : i + 4] for i in range(0, len(args), 4)]
+    stream = Stream()
+    done = [
+        stream.tool_delta(
+            {"index": 0, "function": {"name": "validate_pipeline"}}, {"validate_pipeline"}
+        )
+    ]
+    done += [
+        stream.tool_delta({"index": 0, "function": {"arguments": p}}, {"validate_pipeline"})
+        for p in pieces
+    ]
+    assert done[-1] is not None and not any(done[:-1])
+    assert parses == [args]  # one parse per call, not one per piece ending in "}"
+
+    quoted = Stream()  # an unbalanced "{" inside a string only delays the start to the stream end
+    assert (
+        quoted.tool_delta(
+            {"index": 0, "function": {"name": "read_file", "arguments": '{"path": "{"}'}},
+            {"read_file"},
+        )
+        is None
+    )
+
+
+def test_replay_skips_empty_assistant_messages() -> None:
+    history = [
+        Item("u1", "t1", {"role": "user", "content": "hi"}),
+        Item("a1", "t1", {"role": "assistant", "content": None}),
+        Item("a2", "t1", {"role": "assistant", "content": None, "reasoning_details": [{}]}),
+        Item("u2", "t2", {"role": "user", "content": "hello?"}),
+    ]
+    assert [it.id for it in replayed(history)] == ["u1", "u2"]

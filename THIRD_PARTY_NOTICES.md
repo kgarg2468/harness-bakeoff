@@ -19,12 +19,16 @@ Copyright (c) 2026 Aparavi Software AG
 
 ## Pi (MIT)
 
-`src/bakeoff/our_version/compat.py` and `src/bakeoff/our_version/retry.py` are ported (TypeScript
-to Python) from [earendil-works/pi](https://github.com/earendil-works/pi) at commit
+`src/bakeoff/our_version/compat.py`, `src/bakeoff/our_version/provider.py` and
+`src/bakeoff/our_version/retry.py` contain code ported (TypeScript to Python) from
+[earendil-works/pi](https://github.com/earendil-works/pi) at commit
 `5fd446ca1843682e8da3fec4ceb71c42f56fbace`:
 
 - `packages/ai/src/api/openai-completions.ts`: endpoint compat flags, request parameters,
-  `reasoning_details` merging, usage parsing
+  `reasoning_details` merging, the streamed reasoning field names and usage parsing
+  (`compat.py`); tool-call delta accumulation, the finish_reason and stream-end checks,
+  skipping assistant messages with neither content nor tool calls on replay, and appending
+  OpenRouter's `metadata.raw` to error messages (`provider.py`)
 - `packages/ai/src/utils/retry.ts`, `packages/ai/src/utils/provider-retry.ts`: retryable-error
   classification, `Retry-After` parsing, backoff
 - `packages/ai/src/utils/overflow.ts`: context-overflow detection

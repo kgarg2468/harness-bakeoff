@@ -1,4 +1,11 @@
-"""Wire side of the loop: serialize-once request bodies and the streamed-response accumulator."""
+# Ported from Pi (MIT): packages/ai/src/api/openai-completions.ts @ 5fd446ca1843682e8da3fec4ceb71c42f56fbace
+# Changes: Python; only the stream-end checks, tool-call accumulation, empty-message skip and error text.
+"""Wire side of the loop: serialize-once request bodies and the streamed-response accumulator.
+
+The request-body cache (`Wire`) is ours. From Pi: skipping assistant messages with neither
+content nor tool calls on replay, accumulating tool-call deltas by index then id, the
+finish_reason checks, and appending OpenRouter's `metadata.raw` to error messages.
+"""
 
 from __future__ import annotations
 
@@ -12,10 +19,26 @@ from bakeoff.shared.contract import Item, ToolCall
 
 from .retry import ProviderError, classify
 
+_STOPS = frozenset({"stop", "end", "length", "tool_calls", "function_call"})
+
 
 def dump(obj: Any) -> bytes:
-    """Compact JSON bytes. Deterministic, so equal messages always give equal bytes."""
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+    """Compact ASCII JSON bytes. Deterministic, and never fails on a lone surrogate."""
+    return json.dumps(obj, separators=(",", ":")).encode()
+
+
+def replayed(history: list[Item]) -> list[Item]:
+    """Items the next request carries: the last compaction item and everything after it.
+
+    Cancelled output is never replayed, nor an assistant message with neither content nor tool
+    calls (providers reject those).
+    """
+    start = max((i for i, it in enumerate(history) if it.compaction), default=0)
+    return [it for it in history[start:] if it.status != "incomplete" and _sendable(it.message)]
+
+
+def _sendable(msg: dict[str, Any]) -> bool:
+    return msg.get("role") != "assistant" or bool(msg.get("content") or msg.get("tool_calls"))
 
 
 class Wire:
@@ -39,13 +62,14 @@ class Wire:
 class StreamedCall:
     """A tool call whose pieces are still arriving."""
 
-    __slots__ = ("id", "name", "parts", "ready")
+    __slots__ = ("depth", "id", "name", "parts", "ready")
 
     def __init__(self) -> None:
         self.id = ""
         self.name = ""
         self.parts: list[str] = []
         self.ready = False
+        self.depth = 0  # "{" minus "}" so far; braces inside strings only delay the eager start
 
     def finish(self) -> ToolCall:
         """Mark the call complete (its arguments are final) and return it."""
@@ -60,15 +84,16 @@ class Stream:
     def __init__(self) -> None:
         self.text: list[str] = []
         self.details: list[dict[str, Any]] = []
-        self.calls: dict[Any, StreamedCall] = {}  # keyed by index (else id), in call order
+        self.calls: dict[Any, StreamedCall] = {}  # keyed by index, else id; in call order
         self.usage: dict[str, Any] | None = None
         self.finish: str | None = None
-        self.done = False  # saw data: [DONE]
+        self.done = False  # complete: saw [DONE], or usage after finish_reason
 
     def tool_delta(self, delta: dict[str, Any], read_only: set[str]) -> StreamedCall | None:
         """Add one `tool_calls` delta. Returns the call if a read-only call just completed."""
-        index = delta.get("index")
-        key = index if index is not None else delta.get("id")
+        key = delta.get("index")
+        if key is None:  # no index: the id, else a continuation of the last call
+            key = delta.get("id") or next(reversed(self.calls), None)
         call = self.calls.get(key)
         if call is None:
             call = self.calls[key] = StreamedCall()
@@ -77,20 +102,26 @@ class Stream:
         call.name = call.name or fn.get("name") or ""
         if piece := fn.get("arguments"):
             call.parts.append(piece)
-            # A JSON object is complete once it parses, even if other calls are interleaved.
-            if call.name in read_only and not call.ready and piece.rstrip().endswith("}"):
-                try:
-                    return call if isinstance(json.loads("".join(call.parts)), dict) else None
-                except ValueError:
-                    return None
+            # Complete once the object parses, even with other calls interleaved. The brace count
+            # keeps this to about one parse per call instead of one per piece.
+            if call.name in read_only and not call.ready:
+                call.depth += piece.count("{") - piece.count("}")
+                if call.depth <= 0 and piece.rstrip().endswith("}"):
+                    try:
+                        return call if isinstance(json.loads("".join(call.parts)), dict) else None
+                    except ValueError:
+                        return None
         return None
 
     def check_end(self) -> None:
-        """Raise if the stream failed or was cut off."""
-        if self.finish == "error":
+        """Raise if the stream failed or was cut off. `[DONE]` without finish_reason is fine."""
+        if self.finish is None:
+            if not self.done:
+                raise classify("stream", "Stream ended without finish_reason")
+        elif self.finish == "error":  # OpenRouter's mid-stream failure, here without an error chunk
             raise classify("stream", "Provider returned error (finish_reason: error)")
-        if self.finish is None and not self.done:
-            raise classify("stream", "Stream ended without finish_reason")
+        elif self.finish not in _STOPS:  # retried only if transient, e.g. network_error
+            raise classify("stream", f"Provider finish_reason: {self.finish}")
 
     def message(self) -> dict[str, Any]:
         """The assistant message exactly as it will be replayed."""
