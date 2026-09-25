@@ -528,19 +528,45 @@ async def test_max_steps_stops_after_exactly_that_many_requests(loop):
 
 
 async def test_cost_without_provider_cost_is_labelled(loop):
-    priced = [{**c, "model": "gpt-4o-mini"} for c in [*text("a"), done()]]
-    unknown = [*text("b"), done()]
+    """Only OpenRouter's billed cost is "provider". genai-prices knows OpenRouter's prices, so an
+    OpenRouter response without a billed cost is an "estimate"; it cannot know what a BYOK
+    endpoint charges, so that is "none", never guessed (fakeprov S12b)."""
+    model_named = "openai/gpt-4o-mini"
+    unbilled = [{**c, "model": model_named} for c in [*text("a"), done()]]
+    byok_usage = [{**c, "model": "gpt-4o-mini"} for c in [*text("b"), done()]]
     no_usage = [{**c, "model": "gpt-4o-mini"} for c in [*text("c"), chunk(finish="stop")]]
-    with SSEServer(Reply(priced), Reply(unknown), Reply(no_usage)) as srv:
+    with SSEServer(Reply(unbilled), Reply(byok_usage), Reply(no_usage)) as srv:
+        openrouter = config(srv, model=model_named)
         byok = config(srv, kind="openai_compat", model="gpt-4o-mini")
-        estimated = of(await run(loop, turn([user("x")], byok), StubTools()), "usage")[0]
-        missing = of(await run(loop, turn([user("y")], byok), StubTools()), "usage")[0]
+        estimated = of(await run(loop, turn([user("x")], openrouter), StubTools()), "usage")[0]
+        byok_priced = of(await run(loop, turn([user("y")], byok), StubTools()), "usage")[0]
         unreported = of(await run(loop, turn([user("z")], byok), StubTools()), "usage")[0]
 
     assert estimated["cost_source"] == "estimate" and estimated["cost_usd"] > 0
-    assert (missing["cost_source"], missing["cost_usd"]) == ("none", None)
-    # No usage from the endpoint: nothing to price, so no (zero) estimate either.
+    assert (byok_priced["cost_source"], byok_priced["cost_usd"]) == ("none", None)
+    assert byok_priced["input_tokens"] == 10  # the tokens are still reported
     assert (unreported["cost_source"], unreported["cost_usd"]) == ("none", None)
+
+
+async def test_a_billed_cost_of_zero_is_a_provider_cost_and_spends_no_budget(loop):
+    """The library drops OpenRouter's `cost: 0` (A_CHECKLIST); A reads it back from `is_byok`,
+    which comes with OpenRouter's usage accounting, so a free step is not an estimate and does not
+    count against `max_cost_usd`."""
+
+    def free(n: int) -> Reply:
+        usage = {**done("tool_calls", cost=0)["usage"], "is_byok": False}
+        call = tool_call(0, f"c{n}", "read_file", '{"path": "a"}')
+        return Reply([*call, chunk(finish="tool_calls", usage=usage)])
+
+    final = {**done(cost=0)["usage"], "is_byok": False}
+    replies = [free(0), free(1), Reply([*text("ok"), chunk(finish="stop", usage=final)])]
+    with SSEServer(*replies) as srv:
+        model = config(srv, model="openai/gpt-4o-mini")  # a model genai-prices can price
+        limits = Limits(max_cost_usd=0.0000001)
+        events = await run(loop, turn([user("go")], model, limits=limits), StubTools())
+
+    assert {(u["cost_usd"], u["cost_source"]) for u in of(events, "usage")} == {(0, "provider")}
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 3}]
 
 
 async def test_reasoning_details_round_trip(loop, record_property):
@@ -706,11 +732,31 @@ async def test_cost_limit_ends_the_turn_with_budget_and_reports_every_billed_ste
         events = await run(loop, turn([user("go")], config(srv), limits=limits), tools)
 
     assert of(events, "turn.end") == [{"stop": "budget", "steps": 2}]
-    # Recorded behavior: the library drops the response that crossed the limit from history, so
-    # it gets no item and its call never runs. It was billed, so it still gets its usage event.
-    assert [i.message["role"] for i in items(events)] == ["assistant", "tool"]
+    # The library drops the response that crossed the limit from history; A keeps it (it was
+    # streamed and billed) and closes its call, which never runs.
+    interrupted = "The tool call was interrupted before a result was produced."
+    assert [(i.message["role"], i.message.get("tool_call_id")) for i in items(events)] == [
+        ("assistant", None),
+        ("tool", "c0"),
+        ("assistant", None),
+        ("tool", "c1"),
+    ]
+    assert items(events)[3].message["content"] == interrupted
     assert [c.id for c in tools.runs] == ["c0"]
     assert [(u["step"], u["cost_usd"]) for u in of(events, "usage")] == [(1, 0.0006), (2, 0.0006)]
+
+
+async def test_an_answer_that_crosses_the_budget_is_kept_for_the_next_turn(loop):
+    answer = Reply([*text("Hello there"), done(cost=0.002)])
+    with SSEServer(answer, Reply([*text("I said hello."), done(cost=0.0001)])) as srv:
+        limits = Limits(max_cost_usd=0.001)
+        events = await run(loop, turn([user("hi")], config(srv), limits=limits), StubTools())
+        history = [user("hi"), *items(events), user("what did you say?")]
+        await run(loop, turn(history, config(srv)), StubTools())
+
+    assert of(events, "turn.end") == [{"stop": "budget", "steps": 1}]
+    assert [i.message for i in items(events)] == [{"role": "assistant", "content": "Hello there"}]
+    assert srv.requests[1]["messages"][2] == {"role": "assistant", "content": "Hello there"}
 
 
 async def test_cost_limit_crossed_on_the_last_allowed_step_is_a_budget_stop(loop):

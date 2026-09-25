@@ -309,7 +309,12 @@ class PydanticLoop:
                                     raise _StreamRetry(run.usage) from exc
                                 raise
                 except UsageLimitExceeded:
-                    state.flush(run.new_messages())
+                    # The library drops the response that crossed the cost limit, though it was
+                    # streamed and billed: keep it, and close its calls (they never run).
+                    kept = {id(message) for message in run.all_messages()}
+                    dropped = [r for _, r in state.responses if id(r) not in kept]
+                    closing = mapping.close_pending([*run.all_messages(), *dropped])
+                    state.flush([*run.new_messages(), *dropped, *closing])
                     over_budget = cost_limit is not None and (run.usage.cost or 0) > cost_limit
                     return {"stop": "budget" if over_budget else "max_steps"}
                 result = run.result
@@ -478,11 +483,20 @@ def _retry_reason(exc: BaseException | None) -> str | None:
     return None
 
 
+def _billed(response: ModelResponse) -> float | None:
+    """OpenRouter's billed cost. The library drops a cost of exactly 0 (a library bug,
+    A_CHECKLIST), but keeps `is_byok`, which comes with OpenRouter's usage accounting."""
+    details = response.provider_details or {}
+    return details["cost"] if "cost" in details else 0.0 if "is_byok" in details else None
+
+
 def _usage(response: ModelResponse, step: int) -> dict[str, Any]:
     usage = response.usage
-    billed = (response.provider_details or {}).get("cost")
-    # Without usage from the provider there is nothing to price: no estimate.
-    estimate = float(usage.cost) if usage.cost is not None and usage.has_values() else None
+    billed = _billed(response)
+    # genai-prices knows OpenRouter's prices, not what a BYOK endpoint charges, and without usage
+    # from the provider there is nothing to price: then no estimate.
+    priced = response.provider_name == "openrouter" and usage.has_values()
+    estimate = float(usage.cost) if priced and usage.cost is not None else None
     source = "provider" if billed is not None else "estimate" if estimate is not None else "none"
     return {
         "step": step,
@@ -501,8 +515,8 @@ def _on_model_response(
     """Every response the model returns, before the library adds it to history and checks the
     limits. OpenRouter's billed cost becomes the response cost, so `RunUsage` and `cost_limit`
     count what was charged, and the usage event is queued (the response that crosses the cost
-    limit was billed too, although the library drops it)."""
-    if (cost := (response.provider_details or {}).get("cost")) is not None:
+    limit was billed too)."""
+    if (cost := _billed(response)) is not None:
         response.usage.cost = Decimal(str(cost))
     ctx.deps.responses.append((ctx.deps.steps, response))
     return response
