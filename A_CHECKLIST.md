@@ -33,14 +33,17 @@ If you'd do something differently, edit this file in a PR, and A will be changed
       history that ends with the user's request is passed as-is, with no `user_prompt`.*
 - [x] **Cancel**: `CancellationToken`.
       *The token cancels the task that drives the run, so the run gets its own task. Calls a cancel
-      leaves open get the same `interrupted` results the library would synthesize, persisted now.*
+      leaves open get the same `interrupted` results the library would synthesize, persisted now.
+      The library replays an interrupted response as it was, unsigned reasoning included, so an
+      endpoint that requires signatures rejects every later turn (recorded, not worked around).*
 - [x] **Limits**: `UsageLimits(request_limit=max_steps)`, with `UsageLimitExceeded` mapped to `max_steps`.
       *`max_cost_usd` uses `cost_limit` and maps to `budget`; the response that crosses it is dropped
       from history by the library.*
 - [x] **Cost**: OpenRouter's billed cost from `ModelResponse.provider_details["cost"]`. `RunUsage` cost is
       reported only as an estimate.
       *An `after_model_request` hook also sets the billed cost as the response cost, so `RunUsage` and
-      `cost_limit` count what was charged. Without it: `estimate` (genai-prices) or `none`.*
+      `cost_limit` count what was charged. Without it: `estimate` (genai-prices) or `none`. The
+      library drops a billed cost of exactly 0 (`if cost := usage.cost`), which then shows as an estimate.*
 - [x] **Retries**: the OpenAI SDK's built-in retries (`max_retries`). The `[retries]` tenacity
       transport is the alternative; reviewer's choice.
       *`retry` events come from httpx event hooks on the SDK's own client class, as each retry
