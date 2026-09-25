@@ -8,10 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from bakeoff import live
 from bakeoff.shared import skills
 from bakeoff.shared.contract import ToolCall
 from bakeoff.shared.skills import SKILLS_DIR, load_skills, parse_frontmatter, skills_prompt
 from bakeoff.shared.toolhost import MAX_OUTPUT, build_toolhost
+from bakeoff.shared.tools.skill_tools import UNATTENDED_NOTE
 
 NAMES = [
     "rocketride-building-pipelines",
@@ -502,10 +504,6 @@ def test_sync_copies_text_files_and_records_the_commit(tmp_path):
 async def test_unattended_runs_get_the_gate_note_next_to_the_skill(tmp_path):
     """When no call can ask, nobody can answer a gate, so load_skill says gates are pre-approved;
     with a person approving, it does not."""
-    from bakeoff.shared.contract import ToolCall
-    from bakeoff.shared.toolhost import build_toolhost
-    from bakeoff.shared.tools.skill_tools import UNATTENDED_NOTE
-
     args = '{"name": "rocketride-building-pipelines"}'
     cases = (
         ({"*": "allow"}, True),
@@ -516,3 +514,17 @@ async def test_unattended_runs_get_the_gate_note_next_to_the_skill(tmp_path):
         host = build_toolhost(tmp_path, rules, lambda e: None)
         result = await host.run(ToolCall("c1", "load_skill", args))
         assert result.ok and (UNATTENDED_NOTE in result.content) is expected
+
+
+@pytest.mark.parametrize(
+    "text", [UNATTENDED_NOTE, live.UNATTENDED], ids=["load_skill note", "live prompt"]
+)
+def test_unattended_texts_pre_approve_only_gates_a_person_answers(text):
+    """Gate C of the building skill is a check ("a TOOL gate, not a user gate": validate() must
+    return zero errors), so an unattended run must not treat it as approved."""
+    gate_c = skills.read(skills.resolve("rocketride-building-pipelines", "GATE_PROTOCOL.md"))
+    assert "a TOOL gate, not a user gate" in gate_c  # the premise, as the skill states it
+    assert "\n" not in text  # one line: the note joins the harness paragraph
+    assert "every gate" not in text
+    assert "waits for a person" in text
+    assert "validate_pipeline returns zero errors" in text

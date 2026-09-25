@@ -43,10 +43,14 @@ def harness_note(name: str) -> str:
 
 # RocketRide's skills stop at approval gates and wait for a person. Said here, right before the
 # gate protocol, because a note in the system prompt alone did not stop models from waiting.
+# Only gates a person answers are pre-approved: Gate C is a check (validate() returns zero
+# errors), and approving it unchecked would ship a broken pipeline.
 UNATTENDED_NOTE = (
-    "This run is unattended: nobody can answer approval gates. Treat every gate in "
-    "this skill as approved: state your choice in one line and continue to the end of the "
-    "task. Do not write gate state files."
+    "This run is unattended: nobody can answer a gate that waits for a person. Treat each such "
+    "gate in this skill as approved: state your choice in one line and continue to the end of "
+    "the task. Gates that are checks still apply and must pass: Gate C (validation) passes only "
+    "when validate_pipeline returns zero errors, so fix and re-validate until it does. Do not "
+    "write gate state files."
 )
 
 

@@ -306,10 +306,13 @@ async def _read_line(fd: int, pending: bytearray, stop: asyncio.Future[None]) ->
 
 # RocketRide's skills stop at approval gates and wait for a person. In a run with nobody to
 # answer (no call can evaluate to "ask"), that would end every build at the first gate.
+# Checks such as validation are gates too, but no person answers them: they still must pass.
 UNATTENDED = (
-    "This run is unattended: nobody can answer approval gates. When a skill says to present a"
-    " gate and wait, state what you chose in one line, treat it as approved, and keep going"
-    " until the task is done. Do not write gate state files."
+    "This run is unattended: nobody can answer a gate that waits for a person. When a skill says"
+    " to present such a gate and wait, state what you chose in one line, treat it as approved,"
+    " and keep going until the task is done. Gates that are checks still apply and must pass:"
+    " validation passes only when validate_pipeline returns zero errors. Do not write gate"
+    " state files."
 )
 
 
