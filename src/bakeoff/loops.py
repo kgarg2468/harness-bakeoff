@@ -69,14 +69,6 @@ REGISTRY: dict[str, LoopEntry] = {
             "our",
             "bakeoff.our_version:OurLoop",
             ("httpx",),
-            # It has no compat defaults for the kind, so it fails before sending a request.
-            _no_responses_api(
-                R01=_NOT_ANSWERED | {"requests", "usage"},
-                R02=_NO_TOOLS | {"usage"},
-                R03=_NO_TOOLS | {"files"},
-                R04=_NOT_ANSWERED | {"requests"},
-                R05=_NOT_ANSWERED | {"requests"},
-            ),
         ),
         LoopEntry(
             "pydantic",
