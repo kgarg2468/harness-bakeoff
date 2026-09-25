@@ -15,9 +15,14 @@ Rules every Loop must follow (tests enforce them, see DESIGN.md):
    previous request's messages plus new items only: history is append-only.
 4. Every tool call gets exactly one tool-result item, including on deny and
    cancel. A tool never runs twice for the same call id.
-5. Tools are called through `ToolHost`. Call `check()` first: "ask" means pause
-   (emit `permission.asked` per call, then `turn.end` with stop="paused" and the
-   pending ids); "deny" and "allow" both go to `run()`, which enforces deny.
+5. Tools are called through `ToolHost`. For a new call, call `check()` first:
+   "ask" means pause (emit `permission.asked` per call, then `turn.end` with
+   stop="paused" and the pending ids); "deny" and "allow" both go to `run()`,
+   which enforces deny. On an approval resume, the user's answer replaces
+   `check()` for the pending calls: `Resume.decisions[id] == "allow"` goes
+   straight to `run()` (`run()` only blocks "deny" rules), and "deny" becomes a
+   `ToolResult(ok=False, content="Denied by user: <reason>")` without running.
+   A crash resume has no decisions, so pending calls go through `check()` again.
 6. When `cancel` is set, stop within 200 ms, leave no orphan tool calls, and
    end with `turn.end` stop="cancelled".
 7. The last event of every turn is `turn.end`.
