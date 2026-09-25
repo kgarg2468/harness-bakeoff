@@ -744,6 +744,32 @@ async def test_batching_and_publish_order(log, tmp_path):
     reader.close()
 
 
+async def test_tool_start_is_stored_before_the_tool_runs(log, tmp_path):
+    reader = SessionLog(tmp_path / "log.sqlite")  # e.g. what survives a SIGKILL right now
+    stored = []
+
+    class Checking(StubTools):
+        async def run(self, call):
+            self.emit(Event("tool.start", {"call_id": call.id, "name": call.name}))
+            stored.append([e["type"] for e in reader.events(tid)][-3:])
+            self.emit(Event("tool.end", {"call_id": call.id, "name": call.name, "ok": True}))
+            return ToolResult(call.id, True, "ran")
+
+    async def script(turn, tools, cancel):
+        call = write_call(turn, "a.pipe")
+        yield Event("text.delta", {"text": "calling"})  # buffered until the tool.start
+        yield item(turn, "a", assistant(call))
+        yield Event("text.delta", {"text": "running"})
+        yield tool_item(turn, await tools.run(call))
+        yield Event("turn.end", {"stop": "end_turn", "steps": 1})
+
+    runner = Runner(log, tmp_path / "wc", Checking)
+    tid = runner.new_thread(impl="our", system="s", rules={}, model=MODEL)
+    await runner.turn(FakeLoop(script), tid, model=MODEL, user_text="go")
+    assert stored == [["item", "text.delta", "tool.start"]]
+    reader.close()
+
+
 async def test_revert(runner, log, tid, published):
     await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
     await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")

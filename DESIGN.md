@@ -54,9 +54,10 @@ cancel `asyncio.Event`. It yields `Event`s. The shared runner:
 2. emits `turn.start`, then consumes the loop's events, stamping each with
    `{v, thread, turn, impl, seq, t_us, type, data}` (`seq` has no gaps per thread; `t_us` is
    microseconds since turn start);
-3. persists `item` events immediately (one SQLite transaction per item) and other events in
-   batches (flush on item, on `turn.end`, and every 64 events), then publishes each event to
-   the sink (CLI printer, ndjson mirror, tests);
+3. persists `item` and `tool.start` events immediately (one SQLite transaction each; a
+   `tool.start` before its tool runs, so a crash cannot hide a run) and other events in
+   batches (flush on item, on `tool.start`, on `turn.end`, and every 64 events), then publishes
+   each event to the sink (CLI printer, ndjson mirror, tests);
 4. on `turn.end` with stop `end_turn`, `max_steps`, `budget`, `cancelled` or `error`, commits the
    working copy (`git add -A && git commit --allow-empty`), stores the sha on the turn row and
    emits `commit` (always the final event of a completed turn, right after the loop's

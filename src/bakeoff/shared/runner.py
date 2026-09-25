@@ -125,8 +125,9 @@ def _logged_failure(what: str) -> Iterator[None]:
 class _Publisher:
     """Stamps one turn's events, persists them and publishes them to the sink.
 
-    `item` events are persisted (with everything buffered before them) before they are
-    published; other events are published at once and persisted in batches.
+    `item` and `tool.start` events are persisted (with everything buffered before them) before
+    they are published, a `tool.start` before its tool runs, so no crash can hide a run from I2.
+    Other events are published at once and persisted in batches.
     """
 
     def __init__(
@@ -155,6 +156,9 @@ class _Publisher:
         row = event_row(env)
         if item is not None:
             self._log.append_item(self._thread, item, [*self._batch, row])
+            self._batch.clear()
+        elif type_ == "tool.start":
+            self._log.append_events([*self._batch, row])
             self._batch.clear()
         else:
             self._batch.append(row)
