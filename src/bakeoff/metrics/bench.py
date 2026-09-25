@@ -48,7 +48,11 @@ import math
 import os
 import platform
 import re
-import resource
+
+try:
+    import resource
+except ImportError:  # Windows: no getrusage; RSS numbers are then reported as unavailable
+    resource = None  # type: ignore[assignment]
 import signal
 import subprocess
 import sys
@@ -221,14 +225,21 @@ def _spread(values: list[float], scale: float) -> dict[str, float]:
     return {f"p{q}": round(percentile(values, q) * scale, 3) for q in (50, 95)}
 
 
-def _rss_mb() -> float:
+def _ru_peak_mb() -> float | None:
+    """Peak RSS from getrusage, or None where it does not exist (Windows)."""
+    if resource is None:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (2**20 if sys.platform == "darwin" else 2**10)  # bytes on macOS, else KiB
+
+
+def _rss_mb() -> float | None:
     """Current resident set size (Linux). Elsewhere the peak so far, which is coarser: a spike
-    before the start mark hides later growth."""
+    before the start mark hides later growth. None if the platform offers neither."""
     with contextlib.suppress(OSError):
         pages = int(Path("/proc/self/statm").read_text().split()[1])
         return pages * os.sysconf("SC_PAGE_SIZE") / 2**20
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return peak / (2**20 if sys.platform == "darwin" else 2**10)  # bytes on macOS, else KiB
+    return _ru_peak_mb()
 
 
 def _reset_peak_rss() -> None:
@@ -237,13 +248,13 @@ def _reset_peak_rss() -> None:
         Path("/proc/self/clear_refs").write_text("5")
 
 
-def _peak_rss_mb() -> float:
-    """Peak resident set size since `_reset_peak_rss` (Linux), else since the process started."""
+def _peak_rss_mb() -> float | None:
+    """Peak resident set size since `_reset_peak_rss` (Linux), else since the process started;
+    None if the platform offers neither."""
     with contextlib.suppress(OSError, StopIteration):
         status = Path("/proc/self/status").read_text().splitlines()
         return int(next(line for line in status if line.startswith("VmHWM:")).split()[1]) / 2**10
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return peak / (2**20 if sys.platform == "darwin" else 2**10)
+    return _ru_peak_mb()
 
 
 def child_env() -> dict[str, str]:
@@ -343,7 +354,7 @@ async def bench_loop(package: str, config: Config, workdir: Path) -> dict[str, A
     scenarios.mkdir(parents=True, exist_ok=True)
     (scenarios / f"{SCENARIO}.json").write_text(json.dumps(scenario(total, config.chunks)))
     pairs: list[tuple[_Sample, _Sample]] = []
-    rss: list[float] = []  # after each turn, outside the timed parts
+    rss: list[float | None] = []  # after each turn, outside the timed parts
     loop: Loop | None = None
     try:
         with fake_provider(scenarios, workdir / "wire") as port:
@@ -403,10 +414,19 @@ async def bench_loop(package: str, config: Config, workdir: Path) -> dict[str, A
             for clock in ("wall", "cpu")
         },
         # From before the loop was imported: import, warm-up and measured turns.
-        "peak_rss_delta_mb": round(peak - rss_start, 1),
+        "peak_rss_delta_mb": _delta(peak, rss_start),
         # Measured turns only: a number that grows with --turns is a leak.
-        "turns_rss_delta_mb": round(max(rss[config.warmup :]) - rss_warm, 1),
+        "turns_rss_delta_mb": _delta(_max_or_none(rss[config.warmup :]), rss_warm),
     }
+
+
+def _max_or_none(values: list[float | None]) -> float | None:
+    return None if not values or None in values else max(v for v in values if v is not None)
+
+
+def _delta(end: float | None, start: float | None) -> float | None:
+    """end - start in MB, rounded; None when the platform could not measure RSS."""
+    return None if end is None or start is None else round(end - start, 1)
 
 
 def _run_here(package: str, config: Config) -> dict[str, Any]:
@@ -448,6 +468,8 @@ def measure(
             results[name] = {"error": errors[name]} if name in errors else run(name, config)
         except BenchError as exc:
             results[name] = {"error": str(exc)}
+        except Exception as exc:  # a loop that crashes in-process must not hide the others
+            results[name] = {"error": f"{type(exc).__name__}: {exc}"}
     return {"config": asdict(config), "environment": environment(), "loops": results}
 
 
@@ -475,6 +497,15 @@ def _row(label: str, wall: dict[str, float], cpu: dict[str, float]) -> str:
     return f"  {label:<28}" + "".join(f"{c:>12.3f}" for c in cells)
 
 
+def _rss_row(peak: float | None, turns: float | None) -> str:
+    if peak is None or turns is None:
+        return f"  {'peak RSS growth':<28}{'n/a':>12} (this platform cannot measure RSS)"
+    return (
+        f"  {'peak RSS growth':<28}{peak:>+12.1f} MB over a raw-httpx process "
+        f"(measured turns only: {turns:+.1f} MB)"
+    )
+
+
 def summary(report: dict[str, Any]) -> str:
     """A short human-readable block per loop."""
     config, env = report["config"], report["environment"]
@@ -500,8 +531,7 @@ def summary(report: dict[str, Any]) -> str:
             _row("overhead per frame (us)", *r["overhead_us_per_frame"].values()),
             f"  {'events per second (p50)':<28}{rate['wall']:>12}{'':>12}{rate['cpu']:>12}"
             "   (wall: bounded by the fake server)",
-            f"  {'peak RSS growth':<28}{r['peak_rss_delta_mb']:>+12.1f} MB over a raw-httpx "
-            f"process (measured turns only: {r['turns_rss_delta_mb']:+.1f} MB)",
+            _rss_row(r["peak_rss_delta_mb"], r["turns_rss_delta_mb"]),
         ]
     return "\n".join(out)
 

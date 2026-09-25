@@ -146,3 +146,36 @@ def test_regressions() -> None:
         "our_version: CPU overhead 500.0 us per frame (p50) > 50.0"
     ]
     assert bench.regressions(report(5.0), ceiling_us=1.0) != []
+
+
+def test_rss_is_optional_where_the_platform_cannot_measure_it(monkeypatch):
+    """Windows has no `resource` and no /proc: RSS numbers become None, never a crash."""
+    from pathlib import Path
+
+    from bakeoff.metrics import bench
+
+    monkeypatch.setattr(bench, "resource", None)
+    real = Path.read_text
+
+    def no_proc(self, *a, **k):
+        if str(self).startswith("/proc/"):
+            raise OSError("no /proc here")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", no_proc)
+    assert bench._rss_mb() is None and bench._peak_rss_mb() is None
+    assert bench._delta(None, 1.0) is None and bench._max_or_none([1.0, None]) is None
+    assert "n/a" in bench._rss_row(None, None)
+
+
+def test_an_in_process_loop_crash_is_recorded_not_raised(monkeypatch):
+    from bakeoff.metrics import bench
+
+    def boom(package, config):
+        raise FileNotFoundError("wire/003.json")
+
+    monkeypatch.setattr(bench, "_run_here", boom)
+    report = bench.measure(
+        bench.Config(turns=1, warmup=0, chunks=10), ["our_version"], isolate=False
+    )
+    assert report["loops"]["our_version"] == {"error": "FileNotFoundError: wire/003.json"}
