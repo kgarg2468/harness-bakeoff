@@ -11,7 +11,7 @@
   "exchanges": [
     {
       "note": "OpenAI style: usage arrives in a trailing choices:[] chunk only if stream_options.include_usage was sent, and it carries no cost.",
-      "expect": {"last_role": "user", "messages_len": 2, "body_has": ["stream_options"]},
+      "expect": {"last_role": "user", "messages_len": 2, "body_equals": {"stream_options.include_usage": true}},
       "respond": {
         "stream": [
           {"text": "chat -> llm_openai_api -> response_answers.", "chunks": 2},
@@ -21,5 +21,13 @@
       }
     }
   ],
-  "expect": {"stops": ["end_turn"], "requests": 1, "commits": 1, "cost_usd": 0, "text_contains": "response_answers"}
+  "expect": {
+    "stops": ["end_turn"],
+    "requests": 1,
+    "commits": 1,
+    "text_contains": "response_answers",
+    "usage": {"input_tokens": 1310, "output_tokens": 11, "cached_tokens": 1280},
+    "cost_usd": 0,
+    "cost_source": "none"
+  }
 }

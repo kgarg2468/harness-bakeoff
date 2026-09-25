@@ -110,7 +110,8 @@ Only `respond` is required. Before answering, the server applies, in order:
    `body_has` / `body_lacks` (top-level keys), `model` (equal), `last_role`,
    `last_content_contains` (substring; list content is joined text parts), `messages_len`,
    `tool_result_contains: {call_id: substring}` (a `role: tool` message for that call contains
-   it; `""` only checks that the result exists), `messages_at: [{index, role?, contains?}]`
+   it; `""` only checks that the result exists), `body_equals: {"dotted.path": value}` (exact
+   value at a path in the body), `messages_at: [{index, role?, contains?}]`
    (checks one message; a negative index counts from the end), and `min_gap_ms` (the request
    must arrive at least this long after the cursor's previous one, e.g. a retry that honours
    `retry-after`).
@@ -150,6 +151,8 @@ Responses are deterministic: identical for every run and impl.
 | `requests` | number of chat requests recorded for the cursor |
 | `text_contains` | the last assistant text of the last turn contains it |
 | `cost_usd` | the sum of provider-reported costs over all usage events (compare with a 1e-9 tolerance) |
+| `usage` | `{input_tokens, output_tokens, cached_tokens}`: the totals over all usage events |
+| `cost_source` | every usage event's `cost_source` equals it: `provider` (billed cost from the provider), `estimate` (a price table) or `none` (no cost available, never guessed) |
 
 Tool call ids are `call_<scenario>_<n>`, unique per scenario; the loader rejects references
 to ids that no exchange scripts. Content checks on tool results stay loose (substrings),
@@ -171,7 +174,8 @@ because results come from the shared tools and `MockEngine`.
 | S10a | `reasoning_details` round-trip: split text, metadata-only signature, encrypted detail |
 | S10b | as S10a, plus an unknown field on a fragment (informational) |
 | S11 | the model calls tools forever; `max_steps: 3` |
-| S12 | OpenRouter cost per step and turn; then a BYOK-style (`openai`) response without cost |
+| S12 | OpenRouter cost per step and per turn, across two turns |
+| S12b | BYOK (`openai_compat`, `openai` style): `stream_options.include_usage: true` must be sent; usage arrives in a trailing `choices: []` chunk without cost, so cost is reported as unavailable |
 | S13 | BYOK thinking: `openai_compat`, `qwen3-32b`, `reasoning_effort` on the wire, `reasoning_content` back |
 | S14 | BYOK strict endpoint: 400 on `reasoning`, `reasoning_effort` or `stream_options` |
 | S15 | compaction: after the summary a request is `[system, summary, new user]`, then append-only |

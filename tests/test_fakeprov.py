@@ -366,6 +366,11 @@ def test_expect_checks_pass_on_a_matching_request(serve):
         ),
         ({"messages_at": [{"index": -1, "contains": "zzz"}]}, "message -1 lacks 'zzz'"),
         ({"messages_at": [{"index": 9}]}, "no message at index 9"),
+        (
+            {"body_equals": {"stream_options.include_usage": True}},
+            "body lacks 'stream_options.include_usage'",
+        ),
+        ({"body_equals": {"stream": False}}, "body stream is True, expected False"),
     ],
 )
 def test_each_expect_mismatch_is_named(serve, expect, failure):

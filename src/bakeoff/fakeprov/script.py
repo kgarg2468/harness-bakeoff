@@ -194,6 +194,8 @@ _EXCHANGE_EXPECT = _obj(
         # The request must arrive at least this long after the cursor's previous request
         # (e.g. a retry that honours `retry-after`).
         "min_gap_ms": {"type": "number", "minimum": 0},
+        # {"dotted.path": value}: the body's value at that path equals it exactly.
+        "body_equals": {"type": "object"},
     }
 )
 _RESPOND = _obj(
@@ -213,6 +215,8 @@ _FINAL_EXPECT = _obj(
         "requests": _INT0,
         "text_contains": _STR,
         "cost_usd": {"type": "number", "minimum": 0},
+        "usage": _obj({"input_tokens": _INT0, "output_tokens": _INT0, "cached_tokens": _INT0}),
+        "cost_source": {"enum": ["provider", "estimate", "none"]},
     },
     "stops",
 )
@@ -414,6 +418,9 @@ def _unsigned_reasoning(details: object) -> list[str]:
     return [key for key, ok in signed.items() if not ok]
 
 
+_MISSING = object()
+
+
 def _expect_failures(
     expect: dict[str, Any], body: dict[str, Any], gap_ms: float | None = None
 ) -> list[str]:
@@ -453,6 +460,14 @@ def _expect_failures(
             )
         if "contains" in check and check["contains"] not in _text(message.get("content")):
             failures.append(f"message {i} lacks {check['contains']!r}")
+    for path, want in expect.get("body_equals", {}).items():
+        got: Any = body
+        for key in path.split("."):
+            got = got.get(key, _MISSING) if isinstance(got, dict) else _MISSING
+        if got is _MISSING:
+            failures.append(f"body lacks {path!r}")
+        elif got != want:
+            failures.append(f"body {path} is {got!r}, expected {want!r}")
     if "min_gap_ms" in expect and (gap_ms is None or gap_ms < expect["min_gap_ms"]):
         got = "no previous request" if gap_ms is None else f"{gap_ms:.0f} ms"
         failures.append(f"arrived after {got}, expected at least {expect['min_gap_ms']} ms")
