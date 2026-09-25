@@ -130,6 +130,15 @@ def _assistant(response: ModelResponse) -> dict[str, Any] | None:
     """The assistant message OpenRouterModel / OpenAIChatModel sends for a response, or None."""
     text = "".join(part.content for part in response.parts if isinstance(part, TextPart))
     message: dict[str, Any] = {"role": "assistant", "content": text or None}
+    details: list[dict[str, Any]] = []
+    fields: dict[str, list[str]] = {}
+    for part in response.parts:
+        if isinstance(part, ThinkingPart) and part.provider_name == "openrouter":
+            details.append(_reasoning_detail(part))
+        elif isinstance(part, ThinkingPart) and part.id not in (None, "content"):
+            # BYOK: sent back in the field it streamed in, e.g. `reasoning_content`.
+            fields.setdefault(part.id, []).append(part.content)
+    message.update({name: "\n\n".join(texts) for name, texts in fields.items()})
     if response.tool_calls:
         message["tool_calls"] = [
             {
@@ -139,7 +148,7 @@ def _assistant(response: ModelResponse) -> dict[str, Any] | None:
             }
             for call in response.tool_calls
         ]
-    if details := [_reasoning_detail(p) for p in response.parts if isinstance(p, ThinkingPart)]:
+    if details:
         message["reasoning_details"] = details
     return message if text or response.tool_calls or details else None
 

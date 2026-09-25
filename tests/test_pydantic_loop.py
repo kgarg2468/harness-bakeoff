@@ -594,6 +594,23 @@ async def test_byok_thinking_reaches_the_wire_for_a_non_openai_model(loop):
     assert not stock.profile.get("supports_thinking")
 
 
+async def test_byok_thinking_is_replayed_in_the_field_it_came_in(loop):
+    reply = [chunk({"reasoning_content": "Let me think."}), *text("42"), done()]
+    with SSEServer(Reply(reply), Reply([*text("ok"), done()])) as srv:
+        byok = config(srv, kind="openai_compat", model="qwen3-coder", reasoning={"effort": "low"})
+        events = await run(loop, turn([user("q")], byok), StubTools())
+        history = [user("q"), *items(events), user("again")]
+        await run(loop, turn(history, byok), StubTools())
+
+    [answer] = items(events)
+    assert answer.message == {
+        "role": "assistant",
+        "content": "42",
+        "reasoning_content": "Let me think.",
+    }
+    assert srv.requests[1]["messages"][2] == answer.message  # Item.message is what is sent
+
+
 async def test_threads_share_one_model_and_send_their_own_session_id(loop):
     with SSEServer(*[Reply([*text("ok"), done()]) for _ in range(3)]) as srv:
         for session in ("thread-a", "thread-b", None):
