@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 import uuid
@@ -27,7 +28,7 @@ from bakeoff.shared.contract import (
     ToolHost,
     TurnInput,
 )
-from bakeoff.shared.sessionlog import SessionLog, item_to_json
+from bakeoff.shared.sessionlog import EventRow, SessionLog, event_row, item_to_json
 from bakeoff.shared.workcopy import WorkCopy
 
 Sink = Callable[[dict[str, Any]], None]
@@ -38,6 +39,7 @@ _CANCEL_POLL_S = 0.05
 _STATUS = {"end_turn": "done", "max_steps": "done", "budget": "done", "cancelled": "cancelled"}
 _DEFAULT_LIMITS = Limits()
 _THREAD_ID = re.compile(r"[\w-]+")
+logger = logging.getLogger(__name__)
 
 # Starts the content of a compaction item; see contract rule 8.
 SUMMARY_PREFIX = "[harness] Conversation summary:"
@@ -59,32 +61,51 @@ class _Publisher:
         self._head = {"v": 1, "thread": thread_id, "turn": turn_id, "impl": impl}
         self._seq = log.next_seq(thread_id)
         self._t0 = time.perf_counter_ns()
-        self._batch: list[dict[str, Any]] = []
-        self._tools_open = True
+        self._batch: list[EventRow] = []
+        self._open = True  # until the loop's turn.end
+        # Tool events after the loop's turn.end: `{"t_us", "type", "data"}`.
+        self.late: list[dict[str, Any]] = []
+
+    def _t_us(self) -> int:
+        return (time.perf_counter_ns() - self._t0) // 1000
 
     def emit(self, type_: str, data: dict[str, Any]) -> None:
-        if type_ == "turn.end":
-            self._tools_open = False
-        t_us = (time.perf_counter_ns() - self._t0) // 1000
-        env = {**self._head, "seq": self._seq, "t_us": t_us, "type": type_, "data": data}
-        if type_ == "item":
-            item: Item = data["item"]
+        env = {**self._head, "seq": self._seq, "t_us": self._t_us(), "type": type_, "data": data}
+        item: Item | None = data["item"] if type_ == "item" else None
+        if item is not None:
             env["data"] = {**data, "item": item_to_json(item)}
-            self._log.append_item(self._thread, item, [*self._batch, env])
+        # Serialized now, so a later change to `data` cannot alter the record, and a value
+        # that is not JSON fails here, at the event that carries it.
+        row = event_row(env)
+        if item is not None:
+            self._log.append_item(self._thread, item, [*self._batch, row])
             self._batch.clear()
         else:
-            self._batch.append(env)
+            self._batch.append(row)
         self._seq += 1
+        if type_ == "turn.end":
+            self._open = False
         if len(self._batch) >= _BATCH or type_ == "turn.end":
             self.flush()
-        if self._sink is not None:
-            self._sink(env)
+        self._to_sink(row[-1])
+
+    def _to_sink(self, envelope_json: str) -> None:
+        if self._sink is None:
+            return
+        try:
+            self._sink(json.loads(envelope_json))  # a private copy, equal to the stored one
+        except Exception:
+            # A broken consumer (e.g. a closed stdout) must not fail the turn.
+            logger.exception("event sink failed; it gets no more events this turn")
+            self._sink = None
 
     def publish(self, event: Event) -> None:
-        """The ToolHost's `emit` callback. Events from a tool that outlives the loop's
-        `turn.end` are dropped, so `commit` always follows `turn.end` directly."""
-        if self._tools_open:
+        """The ToolHost's `emit` callback. A tool event after the loop's `turn.end` cannot
+        join the stream (`commit` must follow `turn.end` directly), so it goes to `late`."""
+        if self._open:
             self.emit(event.type, event.data)
+        else:
+            self.late.append({"t_us": self._t_us(), "type": event.type, "data": event.data})
 
     def flush(self) -> None:
         if self._batch:
@@ -93,7 +114,7 @@ class _Publisher:
 
     def close(self) -> None:
         self.flush()
-        self._tools_open = False
+        self._open = False
 
 
 class NdjsonMirror:
@@ -139,20 +160,18 @@ class Runner:
         model: ModelConfig,
         thread_id: str | None = None,
     ) -> str:
-        """Create a thread (its meta keeps rules and the model config minus the api key).
-
-        The working copy directory is created here; its git repository is initialised by the
-        first turn, because `WorkCopy.init` is async.
-        """
+        """Create a thread (its meta keeps rules and the model config minus the api key) and
+        its git working copy."""
         thread_id = thread_id or uuid.uuid4().hex[:12]
         if not _THREAD_ID.fullmatch(thread_id):
             raise ValueError(f"thread id must match {_THREAD_ID.pattern}: {thread_id!r}")
         model_meta = asdict(model)
         del model_meta["api_key"]
+        # The repository first: once the thread row exists, every turn can rely on it.
+        WorkCopy(self.workdir(thread_id)).init_sync()
         self.log.create_thread(
             thread_id, impl=impl, system=system, meta={"rules": rules, "model": model_meta}
         )
-        self.workdir(thread_id).mkdir(parents=True, exist_ok=True)
         return thread_id
 
     async def turn(
@@ -171,19 +190,18 @@ class Runner:
 
         Returns `{"turn_id", "stop", "pending", "commit"}`. A loop exception ends the turn with
         stop="error" instead of raising. `asyncio.CancelledError` propagates and leaves the turn
-        "running", like a crash; resume it with `Resume(kind="crash")`.
+        "running", like a crash; resume it with `Resume(kind="crash")`. If the commit fails,
+        the turn is recorded as "error" without a commit and the git error is raised.
         """
         if (user_text is None) == (resume is None):
             raise ValueError("pass exactly one of user_text and resume")
         thread = self._thread(thread_id)
         if loop.name != thread["impl"]:
             raise ValueError(f"thread {thread_id} belongs to {thread['impl']!r}, not {loop.name!r}")
-        wc = WorkCopy(self.workdir(thread_id))
-        await wc.init()
-        # No await between the check and the new row, so a second turn() cannot slip in.
-        self._check_idle(thread_id, crash_resume=resume is not None and resume.kind == "crash")
-        row = self.log.start_turn(thread_id, resume.kind if resume else "user")
+        kind = resume.kind if resume else "user"
+        row = self.log.start_turn(thread_id, kind)  # raises if a turn is running (unless crash)
         turn_id = row["id"]
+        wc = WorkCopy(self.workdir(thread_id))
         pub = _Publisher(self.log, self.sink, thread_id, turn_id, thread["impl"])
         cancel = cancel or asyncio.Event()
         watcher = (
@@ -192,6 +210,8 @@ class Runner:
             else None
         )
         try:
+            if kind == "crash":
+                await wc.recover(self._last_commit(thread_id))
             start: dict[str, Any] = {"turn_id": turn_id}
             if resume is not None:
                 start["resume"] = asdict(resume)
@@ -213,11 +233,21 @@ class Runner:
             if stop == "paused":
                 pending = list(end.get("pending") or [])
                 self.log.set_turn_status(turn_id, "paused", stop=stop, pending=pending)
+                if pub.late:  # no commit event to carry them
+                    logger.warning("turn %s: tool events after turn.end: %s", turn_id, pub.late)
                 return {"turn_id": turn_id, "stop": stop, "pending": pending, "commit": None}
-            sha, files = await wc.commit(f"turn {row['idx']}: {stop}")
+            try:
+                sha, files = await wc.commit(f"turn {row['idx']}: {stop}")
+            except Exception:
+                # Record it, or the turn stays "running" and blocks the thread.
+                self.log.set_turn_status(turn_id, "error", stop=stop)
+                raise
             self.log.set_turn_status(turn_id, _STATUS.get(stop, "error"), stop=stop, commit_sha=sha)
+            commit: dict[str, Any] = {"sha": sha, "files": files}
+            if pub.late:  # evidence for the checks (I2) without breaking rule 7
+                commit["late"] = pub.late
             # Last, so a consumer that sees `commit` finds the turn row complete (rule 7).
-            pub.emit("commit", {"sha": sha, "files": files})
+            pub.emit("commit", commit)
             return {"turn_id": turn_id, "stop": stop, "pending": [], "commit": sha}
         finally:
             if watcher is not None:
@@ -262,16 +292,19 @@ class Runner:
         """Undo a committed turn's changes with a new commit, recorded as a new "revert" turn.
 
         Appends a runner item telling the model what was reverted. Returns the same summary
-        shape as `turn()`.
+        shape as `turn()`. If git fails (e.g. a conflict), no turn is recorded.
         """
         thread = self._thread(thread_id)
-        self._check_idle(thread_id)
         target = next((t for t in self.log.turns(thread_id) if t["id"] == turn_id), None)
         if target is None or not target["commit_sha"]:
             raise ValueError(f"turn {turn_id} of thread {thread_id} has no commit to revert")
-        # git first: if the revert conflicts, no turn is recorded.
-        sha, files = await WorkCopy(self.workdir(thread_id)).revert(target["commit_sha"])
+        # The running turn row keeps other turns out while git works.
         row = self.log.start_turn(thread_id, "revert")
+        try:
+            sha, files = await WorkCopy(self.workdir(thread_id)).revert(target["commit_sha"])
+        except Exception:
+            self.log.discard_turn(row["id"])  # it recorded nothing yet
+            raise
         pub = _Publisher(self.log, self.sink, thread_id, row["id"], thread["impl"])
         note = f"[harness] Reverted turn {target['idx']}; files: {', '.join(files) or 'none'}"
         message = {"role": "user", "content": note}
@@ -287,7 +320,6 @@ class Runner:
         Compaction changes no files, so the turn has no commit.
         """
         thread = self._thread(thread_id)
-        self._check_idle(thread_id)
         row = self.log.start_turn(thread_id, "compact")
         item = Item(
             id=f"{row['id']}:compact",
@@ -307,10 +339,9 @@ class Runner:
             raise KeyError(f"unknown thread {thread_id}")
         return thread
 
-    def _check_idle(self, thread_id: str, *, crash_resume: bool = False) -> None:
-        last = self.log.last_turn(thread_id)
-        if last is not None and last["status"] == "running" and not crash_resume:
-            raise RuntimeError(f"thread {thread_id} has a running turn: {last['id']}")
+    def _last_commit(self, thread_id: str) -> str | None:
+        shas = [t["commit_sha"] for t in self.log.turns(thread_id) if t["commit_sha"]]
+        return shas[-1] if shas else None
 
     async def _watch_cancel(self, thread_id: str, since_us: int, cancel: asyncio.Event) -> None:
         # Polls because the request may come from another process (`bakeoff cancel`).

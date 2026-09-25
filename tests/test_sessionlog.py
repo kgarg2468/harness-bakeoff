@@ -5,7 +5,13 @@ import sys
 import pytest
 
 from bakeoff.shared.contract import Item
-from bakeoff.shared.sessionlog import SessionLog, item_from_json, item_to_json, now_us
+from bakeoff.shared.sessionlog import (
+    SessionLog,
+    event_row,
+    item_from_json,
+    item_to_json,
+    now_us,
+)
 
 
 @pytest.fixture
@@ -27,6 +33,10 @@ def env(seq, type_="text.delta", turn="th.0", **data):
         "type": type_,
         "data": data,
     }
+
+
+def row(seq, type_="text.delta", turn="th.0", **data):
+    return event_row(env(seq, type_, turn, **data))
 
 
 def test_wal_mode(log, tmp_path):
@@ -67,6 +77,25 @@ def test_turns_get_indexes_and_status(log):
     assert log.last_turn("other") is None
 
 
+def test_only_a_crash_resume_starts_while_a_turn_runs(log, tmp_path):
+    log.start_turn("th", "user")
+    other = SessionLog(tmp_path / "out" / "log.sqlite")  # e.g. another process
+    for kind in ("user", "approval", "revert", "compact"):
+        with pytest.raises(RuntimeError, match=r"running turn: th\.0"):
+            other.start_turn("th", kind)
+    assert other.start_turn("th", "crash")["id"] == "th.1"
+    other.close()
+    log.set_turn_status("th.1", "done")
+    assert log.start_turn("th", "user")["id"] == "th.2"
+
+
+def test_discard_turn(log):
+    log.start_turn("th", "revert")
+    log.discard_turn("th.0")
+    assert log.turns("th") == []
+    assert log.start_turn("th", "user")["id"] == "th.0"
+
+
 def test_turn_kind_and_status_are_checked(log):
     with pytest.raises(sqlite3.IntegrityError):
         log.start_turn("th", "bogus")
@@ -94,7 +123,7 @@ def test_items_append_in_order_with_events(log):
     a = Item("a", "th.0", {"role": "user", "content": "hi"})
     b = Item("b", "th.0", {"role": "assistant", "content": "yo"}, native=[1, 2])
     assert log.append_item("th", a) == 0
-    assert log.append_item("th", b, [env(1, "turn.start"), env(2, "item")]) == 1
+    assert log.append_item("th", b, [row(1, "turn.start"), row(2, "item")]) == 1
     assert log.items("th") == [a, b]
     assert [e["seq"] for e in log.events("th")] == [1, 2]
     assert log.items("other") == []
@@ -102,18 +131,23 @@ def test_items_append_in_order_with_events(log):
 
 def test_events_batch_and_next_seq(log):
     assert log.next_seq("th") == 1
-    log.append_events([env(1), env(2, text="x")])
-    log.append_events([env(3, "turn.end", turn="th.1", stop="end_turn")])
+    log.append_events([row(1), row(2, text="x")])
+    log.append_events([row(3, "turn.end", turn="th.1", stop="end_turn")])
     events = log.events("th")
     assert events[1] == env(2, text="x")
     assert [e["turn"] for e in events] == ["th.0", "th.0", "th.1"]
     assert log.next_seq("th") == 4
 
 
+def test_event_row_rejects_data_that_is_not_json():
+    with pytest.raises(TypeError):
+        row(1, cost=object())
+
+
 def test_duplicate_event_seq_is_rejected(log):
-    log.append_events([env(1)])
+    log.append_events([row(1)])
     with pytest.raises(sqlite3.IntegrityError):
-        log.append_events([env(2), env(1)])
+        log.append_events([row(2), row(1)])
     assert [e["seq"] for e in log.events("th")] == [1]  # the failed batch left nothing behind
 
 
@@ -124,16 +158,22 @@ def test_duplicate_event_seq_is_rejected(log):
         "DELETE FROM items",
         "UPDATE events SET type = 'x'",
         "DELETE FROM events",
+        # REPLACE deletes the old row without firing DELETE triggers.
+        "INSERT OR REPLACE INTO items VALUES ('th', 0, 'th.0', 'a', '{}')",
+        "REPLACE INTO events VALUES ('th', 1, 'th.0', 'forged', 0, '{}')",
+        "INSERT INTO events VALUES ('th', 1, 'th.0', 'forged', 0, '{}')"
+        " ON CONFLICT DO UPDATE SET type = 'forged'",
     ],
 )
 def test_items_and_events_are_append_only(log, tmp_path, sql):
-    log.append_item("th", Item("a", "th.0", {"role": "user", "content": "hi"}), [env(1, "item")])
+    item = Item("a", "th.0", {"role": "user", "content": "hi"})
+    log.append_item("th", item, [row(1, "item")])
     db = sqlite3.connect(tmp_path / "out" / "log.sqlite")
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         db.execute(sql)
     db.close()
-    assert len(log.items("th")) == 1
-    assert len(log.events("th")) == 1
+    assert log.items("th") == [item]
+    assert [e["type"] for e in log.events("th")] == ["item"]
 
 
 def test_cancel_requests_since(log):

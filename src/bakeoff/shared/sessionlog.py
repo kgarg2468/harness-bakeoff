@@ -1,8 +1,9 @@
 """SQLite session log: threads, turns, items and events.
 
-Items and events are append-only (triggers reject UPDATE and DELETE); thread and turn rows
-may change. The file runs in WAL mode, so several processes can share it (a worker running a
-turn plus a separate `approve` or `cancel` command).
+Items and events are append-only (triggers reject UPDATE, DELETE and any insert over an
+existing row); thread and turn rows may change. The file runs in WAL mode, so several
+processes can share it (a worker running a turn plus a separate `approve` or `cancel`
+command).
 """
 
 from __future__ import annotations
@@ -45,9 +46,19 @@ CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
     BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
     BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+-- REPLACE deletes the old row without firing DELETE triggers, so block it at the insert.
+CREATE TRIGGER IF NOT EXISTS items_no_replace BEFORE INSERT ON items
+    WHEN EXISTS (SELECT 1 FROM items WHERE thread = NEW.thread AND seq = NEW.seq)
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_replace BEFORE INSERT ON events
+    WHEN EXISTS (SELECT 1 FROM events WHERE thread = NEW.thread AND seq = NEW.seq)
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 """
 
 _ITEM_FIELDS = tuple(f.name for f in fields(Item))
+
+# One stored event: thread, seq, turn, type, t_us and the envelope as JSON.
+EventRow = tuple[str, int, str, str, int, str]
 
 
 def now_us() -> int:
@@ -63,6 +74,13 @@ def item_to_json(item: Item) -> dict[str, Any]:
 def item_from_json(data: dict[str, Any]) -> Item:
     """Inverse of `item_to_json`."""
     return Item(**data)
+
+
+def event_row(envelope: dict[str, Any]) -> EventRow:
+    """Serialize an event envelope (`{"v", "thread", "turn", "impl", "seq", "t_us", "type",
+    "data"}`) for `append_events` / `append_item`. Raises TypeError if it is not JSON."""
+    e = envelope
+    return (e["thread"], e["seq"], e["turn"], e["type"], e["t_us"], json.dumps(e))
 
 
 class SessionLog:
@@ -111,11 +129,20 @@ class SessionLog:
     # turns
 
     def start_turn(self, thread_id: str, kind: str) -> dict[str, Any]:
-        """Insert a running turn with the next index; its id is `<thread>.<idx>`."""
+        """Insert a running turn with the next index; its id is `<thread>.<idx>`.
+
+        Raises RuntimeError if the thread's last turn is still running, unless `kind` is
+        "crash" (the worker running it died). The check and the insert are one transaction,
+        so two processes cannot both start a turn.
+        """
         with self._tx() as db:
-            (idx,) = db.execute(
-                "SELECT COUNT(*) FROM turns WHERE thread = ?", (thread_id,)
+            last = db.execute(
+                "SELECT id, idx, status FROM turns WHERE thread = ? ORDER BY idx DESC LIMIT 1",
+                (thread_id,),
             ).fetchone()
+            if last is not None and last["status"] == "running" and kind != "crash":
+                raise RuntimeError(f"thread {thread_id} has a running turn: {last['id']}")
+            idx = 0 if last is None else last["idx"] + 1
             turn_id = f"{thread_id}.{idx}"
             db.execute(
                 "INSERT INTO turns (id, thread, idx, kind, status, started_us)"
@@ -147,6 +174,10 @@ class SessionLog:
             ),
         )
 
+    def discard_turn(self, turn_id: str) -> None:
+        """Delete a turn that recorded no items or events (a revert that git refused)."""
+        self._db.execute("DELETE FROM turns WHERE id = ?", (turn_id,))
+
     def turns(self, thread_id: str) -> list[dict[str, Any]]:
         """All turns of a thread in order, as dicts of the `turns` columns."""
         return self._turn_rows("WHERE thread = ? ORDER BY idx", thread_id)
@@ -164,7 +195,7 @@ class SessionLog:
 
     # items and events
 
-    def append_item(self, thread_id: str, item: Item, events: Iterable[dict[str, Any]] = ()) -> int:
+    def append_item(self, thread_id: str, item: Item, events: Iterable[EventRow] = ()) -> int:
         """Append an item (seq = its position in history) plus `events`, in one transaction."""
         data = json.dumps(item_to_json(item))
         with self._tx() as db:
@@ -184,20 +215,14 @@ class SessionLog:
         ).fetchall()
         return [item_from_json(json.loads(r[0])) for r in rows]
 
-    def append_events(self, events: Iterable[dict[str, Any]]) -> None:
-        """Insert event envelopes (`{"v", "thread", "turn", "impl", "seq", "t_us", "type", "data"}`)."""
+    def append_events(self, events: Iterable[EventRow]) -> None:
+        """Insert events serialized with `event_row`, in one transaction."""
         with self._tx() as db:
             self._insert_events(db, events)
 
     @staticmethod
-    def _insert_events(db: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> None:
-        db.executemany(
-            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                (e["thread"], e["seq"], e["turn"], e["type"], e["t_us"], json.dumps(e))
-                for e in events
-            ],
-        )
+    def _insert_events(db: sqlite3.Connection, events: Iterable[EventRow]) -> None:
+        db.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)", events)
 
     def events(self, thread_id: str) -> list[dict[str, Any]]:
         """All event envelopes of a thread in seq order."""
