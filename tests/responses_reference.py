@@ -25,7 +25,8 @@ class RetryableError(Exception):
 
 
 class ReferenceLoop:
-    name = "our"  # the thread's impl, so a scenario runs it in the "our" cell
+    # The thread's impl: a child process loads it by this name (see reference_worker.py).
+    name = "reference"
 
     def __init__(self) -> None:
         self.client = httpx.AsyncClient(timeout=30)
