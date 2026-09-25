@@ -1,9 +1,10 @@
-"""Build the pydantic-ai model for a `ModelConfig`.
+"""Build the pydantic-ai model for an endpoint.
 
 OpenRouter uses `OpenRouterModel` + `OpenRouterProvider`, as the docs recommend, so
 `reasoning_details` and the billed `cost` are parsed. A BYOK OpenAI-compatible endpoint uses
 `OpenAIChatModel` with `CompatProvider`, which turns our endpoint compat flags into the profile
-and settings options pydantic-ai already has.
+and settings options pydantic-ai already has. A model is built once per endpoint and shared by
+every thread; the per-thread part (`session_id`) is a run setting.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from pydantic_ai.profiles import ModelProfile, merge_profile
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
+from pydantic_ai.settings import ModelSettings
 
 from bakeoff.shared.contract import ModelConfig
 
@@ -42,7 +44,8 @@ class CompatProvider(OpenAIProvider):
 
 
 def build_model(cfg: ModelConfig, event_hooks: EventHooks) -> OpenAIChatModel:
-    """The model for `cfg`. Retries are the OpenAI SDK's own (`max_retries`); the hooks only observe."""
+    """The model for `cfg`'s endpoint (`cfg.session_id` is ignored: see `run_settings`).
+    Retries are the OpenAI SDK's own (`max_retries`); the hooks only observe."""
     client = AsyncOpenAI(
         base_url=cfg.base_url,
         api_key=cfg.api_key,
@@ -68,20 +71,24 @@ def build_model(cfg: ModelConfig, event_hooks: EventHooks) -> OpenAIChatModel:
     )
 
 
+def run_settings(model: OpenAIChatModel, cfg: ModelConfig) -> ModelSettings | None:
+    """The per-thread settings: OpenRouter's sticky routing `session_id`. Run settings replace the
+    model's `extra_body` as a whole (settings merge shallowly), so it carries the model's keys."""
+    if cfg.kind != "openrouter" or not cfg.session_id:
+        return None
+    extra_body = (model.settings or {}).get("extra_body") or {}
+    return ModelSettings(extra_body={**extra_body, "session_id": cfg.session_id})
+
+
 def _openrouter_settings(cfg: ModelConfig) -> OpenRouterModelSettings:
     settings = OpenRouterModelSettings()
     if cfg.reasoning:
         settings["openrouter_reasoning"] = cfg.reasoning  # type: ignore[typeddict-item]
-    # No library setting exists for these two. `openrouter_cache_messages` would put
-    # `cache_control` on whichever message is last, changing that message's shape from one
+    # No library setting exists for top-level `cache_control`. `openrouter_cache_messages` would
+    # put `cache_control` on whichever message is last, changing that message's shape from one
     # request to the next; OpenRouter's top-level `cache_control` caches the prefix instead.
-    extra_body: dict[str, Any] = {}
-    if cfg.session_id:
-        extra_body["session_id"] = cfg.session_id
     if cfg.model.startswith("anthropic/"):
-        extra_body["cache_control"] = {"type": "ephemeral"}
-    if extra_body:
-        settings["extra_body"] = extra_body
+        settings["extra_body"] = {"cache_control": {"type": "ephemeral"}}
     return settings
 
 

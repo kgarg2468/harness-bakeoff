@@ -587,6 +587,17 @@ async def test_byok_thinking_reaches_the_wire_for_a_non_openai_model(loop):
     assert not stock.profile.get("supports_thinking")
 
 
+async def test_threads_share_one_model_and_send_their_own_session_id(loop):
+    with SSEServer(*[Reply([*text("ok"), done()]) for _ in range(3)]) as srv:
+        for session in ("thread-a", "thread-b", None):
+            await run(loop, turn([user("hi")], config(srv, session_id=session)), StubTools())
+
+    assert len(loop._models) == 1 and len(loop._agents) == 1  # one HTTP pool for the endpoint
+    sent = [(body.get("session_id"), body["cache_control"]) for body in srv.requests]
+    ephemeral = {"type": "ephemeral"}
+    assert sent == [("thread-a", ephemeral), ("thread-b", ephemeral), (None, ephemeral)]
+
+
 async def test_compaction_item_resets_the_request_prefix(loop):
     summary = "[harness] Conversation summary: the user likes pipes."
     old = native_item(ModelResponse(parts=[TextPart("old answer")]))

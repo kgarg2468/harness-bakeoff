@@ -15,7 +15,7 @@ import uuid
 import warnings
 from collections.abc import AsyncIterator, Iterable
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from typing import Any
 
@@ -55,7 +55,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.toolsets import ApprovalRequiredToolset, FunctionToolset
 
 from bakeoff.pydantic_version import mapping
-from bakeoff.pydantic_version.model import build_model
+from bakeoff.pydantic_version.model import build_model, run_settings
 from bakeoff.shared.contract import (
     Event,
     Item,
@@ -146,8 +146,8 @@ _TURN: ContextVar[_Turn] = ContextVar("pydantic_version_turn")
 
 
 class PydanticLoop:
-    """`contract.Loop` on pydantic-ai. Agents, and their HTTP pools, are cached per model config
-    and tool set."""
+    """`contract.Loop` on pydantic-ai. The Agent is built once per tool set and the model (with
+    its HTTP pool) once per endpoint; every thread shares them."""
 
     name = "pydantic"
 
@@ -158,7 +158,7 @@ class PydanticLoop:
         pydantic_ai.BANNER_ENABLED = False
         warnings.filterwarnings("ignore", "Sampling parameters", UserWarning, "pydantic_ai")
         self._agents: dict[str, Agent[_Turn, str | DeferredToolRequests]] = {}
-        self._models: list[OpenAIChatModel] = []
+        self._models: dict[str, OpenAIChatModel] = {}
 
     async def run_turn(
         self, turn: TurnInput, tools: ToolHost, cancel: asyncio.Event
@@ -174,7 +174,7 @@ class PydanticLoop:
             await asyncio.gather(task, return_exceptions=True)
 
     async def aclose(self) -> None:
-        for model in self._models:
+        for model in self._models.values():
             await model.client.close()
         self._agents.clear()
         self._models.clear()
@@ -216,12 +216,14 @@ class PydanticLoop:
                 return _pause(state, asks)
         limits = turn.limits
         cost_limit = None if limits.max_cost_usd is None else Decimal(str(limits.max_cost_usd))
-        agent = self._agent(turn.model, state.tools.specs())
+        model = self._model(turn.model)
         run: AgentRun[_Turn, str | DeferredToolRequests] | None = None
         try:
-            async with agent.iter(
+            async with self._agent(state.tools.specs()).iter(
                 message_history=history,  # ends with the user's request: the library resumes it
                 deferred_tool_results=deferred,
+                model=model,
+                model_settings=run_settings(model, turn.model),
                 instructions=turn.system,
                 deps=state,
                 usage_limits=UsageLimits(request_limit=limits.max_steps, cost_limit=cost_limit),
@@ -258,18 +260,14 @@ class PydanticLoop:
             return _pause(state, result.output.approvals)
         return {"stop": "end_turn"}
 
-    def _agent(
-        self, cfg: ModelConfig, specs: list[ToolSpec]
-    ) -> Agent[_Turn, str | DeferredToolRequests]:
-        key = json.dumps([asdict(cfg), [asdict(spec) for spec in specs]], sort_keys=True)
+    def _agent(self, specs: list[ToolSpec]) -> Agent[_Turn, str | DeferredToolRequests]:
+        key = json.dumps([asdict(spec) for spec in specs], sort_keys=True)
         if (agent := self._agents.get(key)) is None:
-            model = build_model(cfg, {"request": [_on_request], "response": [_on_response]})
             toolset = ApprovalRequiredToolset(
                 FunctionToolset([_tool(spec) for spec in specs]),
                 approval_required_func=_needs_approval,
             )
-            agent = Agent(
-                model,
+            agent = self._agents[key] = Agent(
                 deps_type=_Turn,
                 output_type=[str, DeferredToolRequests],
                 toolsets=[toolset],
@@ -279,9 +277,14 @@ class PydanticLoop:
                 ],
                 name=self.name,
             )
-            self._agents[key] = agent
-            self._models.append(model)
         return agent
+
+    def _model(self, cfg: ModelConfig) -> OpenAIChatModel:
+        key = json.dumps(asdict(replace(cfg, session_id=None)), sort_keys=True)
+        if (model := self._models.get(key)) is None:
+            hooks = {"request": [_on_request], "response": [_on_response]}
+            model = self._models[key] = build_model(cfg, hooks)
+        return model
 
 
 def _tool(spec: ToolSpec) -> Tool[_Turn]:
