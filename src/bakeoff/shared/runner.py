@@ -212,13 +212,12 @@ class Runner:
             stop = end.get("stop", "error")
             if stop == "paused":
                 pending = list(end.get("pending") or [])
-                pub.flush()
                 self.log.set_turn_status(turn_id, "paused", stop=stop, pending=pending)
                 return {"turn_id": turn_id, "stop": stop, "pending": pending, "commit": None}
             sha, files = await wc.commit(f"turn {row['idx']}: {stop}")
-            pub.emit("commit", {"sha": sha, "files": files})
-            pub.flush()
             self.log.set_turn_status(turn_id, _STATUS.get(stop, "error"), stop=stop, commit_sha=sha)
+            # Last, so a consumer that sees `commit` finds the turn row complete (rule 7).
+            pub.emit("commit", {"sha": sha, "files": files})
             return {"turn_id": turn_id, "stop": stop, "pending": [], "commit": sha}
         finally:
             if watcher is not None:
@@ -277,9 +276,9 @@ class Runner:
         note = f"[harness] Reverted turn {target['idx']}; files: {', '.join(files) or 'none'}"
         message = {"role": "user", "content": note}
         pub.emit("item", {"item": Item(f"{row['id']}:revert", row["id"], message)})
+        self.log.set_turn_status(row["id"], "done", commit_sha=sha)
         pub.emit("commit", {"sha": sha, "files": files})
         pub.close()
-        self.log.set_turn_status(row["id"], "done", commit_sha=sha)
         return {"turn_id": row["id"], "stop": None, "pending": [], "commit": sha}
 
     def compact(self, thread_id: str, summary: str) -> Item:

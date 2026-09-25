@@ -416,7 +416,7 @@ async def test_watch_cancel_polls_the_log(runner, log, tid, tmp_path):
     assert log.last_turn(tid)["status"] == "cancelled"
 
 
-async def test_batching_and_persist_before_publish(log, tmp_path):
+async def test_batching_and_publish_order(log, tmp_path):
     reader = SessionLog(tmp_path / "log.sqlite")
     stored_counts = {}
 
@@ -424,6 +424,9 @@ async def test_batching_and_persist_before_publish(log, tmp_path):
         if envelope["type"] == "item":  # published only after it is stored
             assert envelope["data"]["item"]["id"] in [i.id for i in reader.items(tid)]
             assert reader.events(tid)[-1] == envelope
+        if envelope["type"] == "commit":  # the turn row is already complete
+            turn = reader.last_turn(tid)
+            assert (turn["status"], turn["commit_sha"]) == ("done", envelope["data"]["sha"])
 
     async def deltas(turn, tools, cancel):
         for n in range(1, 131):
