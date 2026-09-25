@@ -15,6 +15,7 @@ ORDER = [
     "read_file",
     "write_file",
     "edit_file",
+    "load_skill",
 ]
 READ_ONLY = {
     "list_components",
@@ -22,6 +23,7 @@ READ_ONLY = {
     "validate_pipeline",
     "list_files",
     "read_file",
+    "load_skill",
 }
 
 

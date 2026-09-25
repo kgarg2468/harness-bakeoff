@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "The same agent harness twice: once on pydantic-ai, once on a lean hand-written Python loop."
 readme = "README.md"
 license = "MIT"
+# The wheel ships RocketRide data (catalog, examples, skills) and ported code, so their notices travel with it.
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.12"
 # Runtime deps are pinned to the exact versions inside the RocketRide engine bundle,
 # so "our_version" adds nothing the engine does not already ship.
