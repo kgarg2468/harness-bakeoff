@@ -680,6 +680,31 @@ async def test_cost_limit_ends_the_turn_with_budget_and_reports_every_billed_ste
     assert [(u["step"], u["cost_usd"]) for u in of(events, "usage")] == [(1, 0.0006), (2, 0.0006)]
 
 
+async def test_cost_limit_crossed_on_the_last_allowed_step_is_a_budget_stop(loop):
+    costly = Reply(
+        [*tool_call(0, "c0", "read_file", '{"path": "a"}'), done("tool_calls", cost=0.002)]
+    )
+    with SSEServer(costly) as srv:
+        limits = Limits(max_steps=1, max_cost_usd=0.001)
+        events = await run(loop, turn([user("go")], config(srv), limits=limits), StubTools())
+
+    assert of(events, "turn.end") == [{"stop": "budget", "steps": 1}]
+
+
+async def test_cost_limit_without_a_known_price_stays_quiet(loop, capfd):
+    with (
+        warnings.catch_warnings(record=True) as caught,
+        SSEServer(Reply([*text("ok"), done()])) as srv,
+    ):
+        byok = config(srv, kind="openai_compat", model="qwen3-coder")
+        limits = Limits(max_cost_usd=1.0)
+        events = await run(loop, turn([user("hi")], byok, limits=limits), StubTools())
+
+    assert of(events, "turn.end")[0]["stop"] == "end_turn"
+    assert of(events, "usage")[0]["cost_source"] == "none"
+    assert (caught, capfd.readouterr()) == ([], ("", ""))  # no CostNotFoundWarning (rule 1)
+
+
 async def test_reasoning_model_with_temperature_stays_quiet(capfd):
     with (
         warnings.catch_warnings(record=True) as caught,

@@ -24,6 +24,7 @@ from pydantic_ai import (
     Agent,
     AgentRun,
     CancellationToken,
+    CostNotFoundWarning,
     DeferredToolRequests,
     DeferredToolResults,
     ModelHTTPError,
@@ -153,11 +154,13 @@ class PydanticLoop:
     name = "pydantic"
 
     def __init__(self) -> None:
-        # Nothing may reach stdout/stderr (rule 1): newer releases print a first-run banner, and
-        # the library warns each time it drops `temperature` for a reasoning model (it drops it
-        # correctly either way).
+        # Nothing may reach stdout/stderr (rule 1): newer releases print a first-run banner, the
+        # library warns each time it drops `temperature` for a reasoning model (it drops it
+        # correctly either way), and it warns at the end of a run with a cost limit that no
+        # price is known for (the usage events already say cost_source="none").
         pydantic_ai.BANNER_ENABLED = False
         warnings.filterwarnings("ignore", "Sampling parameters", UserWarning, "pydantic_ai")
+        warnings.filterwarnings("ignore", category=CostNotFoundWarning)
         self._agents: dict[str, Agent[_Turn, str | DeferredToolRequests]] = {}
         self._models: dict[str, OpenAIChatModel] = {}
 
@@ -247,8 +250,8 @@ class PydanticLoop:
                                 state.stream_event(event)
                 except UsageLimitExceeded:
                     state.flush(run.new_messages())
-                    stop = "max_steps" if run.usage.requests >= limits.max_steps else "budget"
-                    return {"stop": stop}
+                    over_budget = cost_limit is not None and (run.usage.cost or 0) > cost_limit
+                    return {"stop": "budget" if over_budget else "max_steps"}
                 result = run.result
         except Exception as exc:
             # Keep what completed and close the calls left open (rule 4). After a cancel the
