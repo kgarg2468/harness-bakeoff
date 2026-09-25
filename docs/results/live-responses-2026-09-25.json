@@ -1,0 +1,181 @@
+{
+ "what": "The Responses API live runs behind the README: `bakeoff live --impl our,pydantic --api responses --model gpt-6-luna --reasoning xhigh --max-steps 20` on api.openai.com, 2026-09-25. Copied field by field from out/live/<run_id>/<loop>/result.json, and kind, reasoning and validations from its session log (no keys, no request bodies); written by scripts/snapshot_live.py.",
+ "runs": [
+  {
+   "run_id": "20260925-164443-83be",
+   "loop": "our",
+   "model": "gpt-6-luna",
+   "base_url": "https://api.openai.com/v1",
+   "kind": "openai_responses",
+   "reasoning": {
+    "effort": "xhigh",
+    "summary": "auto"
+   },
+   "max_steps": 20,
+   "attended": false,
+   "prompt": "Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it.",
+   "stops": [
+    "end_turn"
+   ],
+   "steps": 10,
+   "requests": 10,
+   "input_tokens": 244843,
+   "cached_tokens": 203677,
+   "output_tokens": 5307,
+   "first_token_ms": 2697.097,
+   "duration_ms": 62295.3,
+   "tool_runs": 15,
+   "files": [
+    "chat.pipe"
+   ],
+   "validations": [
+    {
+     "ok": true,
+     "errors": [],
+     "warnings": []
+    }
+   ],
+   "passed": true,
+   "error": null,
+   "invariants": {
+    "I2": true,
+    "I3": true,
+    "I5": true,
+    "I7": true
+   },
+   "final_text": "Created **`chat.pipe`** with the flow `chat → llm_openai (openai-5-2) → response_answers`. It uses `${ROCKETRIDE_OPENAI_KEY}` for the API key; no key is hardcoded.\n\nValidation returned **0 errors and 0 warnings**. The pipeline is not run, and it answers from the LLM rather than retrieving from a document collection."
+  },
+  {
+   "run_id": "20260925-164443-83be",
+   "loop": "pydantic",
+   "model": "gpt-6-luna",
+   "base_url": "https://api.openai.com/v1",
+   "kind": "openai_responses",
+   "reasoning": {
+    "effort": "xhigh",
+    "summary": "auto"
+   },
+   "max_steps": 20,
+   "attended": false,
+   "prompt": "Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it.",
+   "stops": [
+    "end_turn"
+   ],
+   "steps": 12,
+   "requests": 12,
+   "input_tokens": 304761,
+   "cached_tokens": 262268,
+   "output_tokens": 6531,
+   "first_token_ms": 1495.971,
+   "duration_ms": 73169.6,
+   "tool_runs": 15,
+   "files": [
+    "chat.pipe"
+   ],
+   "validations": [
+    {
+     "ok": true,
+     "errors": [],
+     "warnings": []
+    }
+   ],
+   "passed": true,
+   "error": null,
+   "invariants": {
+    "I2": true,
+    "I3": true,
+    "I5": true,
+    "I7": true
+   },
+   "final_text": "Built and validated **`chat.pipe`**. It wires the chat source’s `questions` output to an OpenAI LLM, then sends its `answers` output to the reply node. This is a conversational LLM pipeline, not a document-grounded RAG pipeline.\n\nThe selected components were confirmed in the index and their schemas fetched: `chat` (`source`, emits `questions`), `llm_openai` (`llm`, accepts `questions` and emits `answers`), and `response_answers` (accepts `answers`). The LLM uses the schema-supported `openai-4o-mini` profile and `${ROCKETRIDE_OPENAI_KEY}`; set that environment variable before running.\n\nDiscovery covered 3 relevant archetypes:\n- **Source** candidates: `chat`, `dropper`, `filestore_source`, `filesys`, `telegram`, `tools`, `webhook`. Count: 7.\n- **LLM** candidates: `llm_anthropic`, `llm_baidu_qianfan`, `llm_bedrock`, `llm_deepseek`, `llm_gemini`, `llm_glm`, `llm_gmi_cloud`, `llm_kimi`, `llm_minimax`, `llm_mistral`, `llm_nebius`, `llm_ollama`, `llm_openai`, `llm_openai_api`, `llm_perplexity`, `llm_qwen`, `llm_xai`. Count: 17.\n- **Response/target** candidates: `response_answers`, `response_audio`, `response_documents`, `response_image`, `response_json`, `response_questions`, `response_table`, `response_text`, `response_video`, `local-text-output`, `text-output`. Count: 11.\n- Selected nodes: `chat`, `llm_openai`, `response_answers`. Count: 3.\n\nChecklist passed for each node: `chat_1` (source has no input), `llm_1`, and `response_1` (both have input arrays). The file uses a `.pipe` extension, components-first ordering, a literal GUID, unique IDs, matching lanes, a reachable acyclic graph, and no literal secrets.\n\n**Validation:** `validate(): 0 errors, 0 warnings`. No pipeline run was submitted."
+  },
+  {
+   "run_id": "20260925-164700-df77",
+   "loop": "our",
+   "model": "gpt-6-luna",
+   "base_url": "https://api.openai.com/v1",
+   "kind": "openai_responses",
+   "reasoning": {
+    "effort": "xhigh",
+    "summary": "auto"
+   },
+   "max_steps": 20,
+   "attended": false,
+   "prompt": "Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it.",
+   "stops": [
+    "end_turn"
+   ],
+   "steps": 12,
+   "requests": 12,
+   "input_tokens": 302042,
+   "cached_tokens": 262810,
+   "output_tokens": 3874,
+   "first_token_ms": 1616.387,
+   "duration_ms": 76728.6,
+   "tool_runs": 14,
+   "files": [
+    "chat.pipe"
+   ],
+   "validations": [
+    {
+     "ok": true,
+     "errors": [],
+     "warnings": []
+    }
+   ],
+   "passed": true,
+   "error": null,
+   "invariants": {
+    "I2": true,
+    "I3": true,
+    "I5": true,
+    "I7": true
+   },
+   "final_text": "Created `chat.pipe` with a `chat → llm_openai → response_answers` flow. It uses the schema’s `openai-5-2` profile and references the API key through `${ROCKETRIDE_OPENAI_KEY}`.\n\nValidation: **0 errors, 0 warnings**. The pipeline was not run."
+  },
+  {
+   "run_id": "20260925-164700-df77",
+   "loop": "pydantic",
+   "model": "gpt-6-luna",
+   "base_url": "https://api.openai.com/v1",
+   "kind": "openai_responses",
+   "reasoning": {
+    "effort": "xhigh",
+    "summary": "auto"
+   },
+   "max_steps": 20,
+   "attended": false,
+   "prompt": "Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it.",
+   "stops": [
+    "end_turn"
+   ],
+   "steps": 13,
+   "requests": 13,
+   "input_tokens": 341101,
+   "cached_tokens": 298196,
+   "output_tokens": 9564,
+   "first_token_ms": 2073.799,
+   "duration_ms": 107583.6,
+   "tool_runs": 15,
+   "files": [
+    "chat.pipe"
+   ],
+   "validations": [
+    {
+     "ok": true,
+     "errors": [],
+     "warnings": []
+    }
+   ],
+   "passed": true,
+   "error": null,
+   "invariants": {
+    "I2": true,
+    "I3": true,
+    "I5": true,
+    "I7": true
+   },
+   "final_text": "Created **`chat.pipe`** with the flow `chat_1 → llm_1 → response_1`: chat questions go to an OpenAI LLM, and its answers are returned to the chat.\n\nGate A/B (unattended policy): I chose `chat`, `llm_openai`, and `response_answers`, wired as `questions` → `answers`. Six relevant archetypes were considered; three nodes were selected.\n\nThe LLM uses the `openai-5-2` profile and references `${ROCKETRIDE_OPENAI_KEY}` for its credential. The pipeline doesn’t add document retrieval or persistent memory.\n\n**Checklist:** 9/9 items pass, including source resolution, unique IDs, lane compatibility, and acyclic wiring.  \n**Validation:** `validate_pipeline` returned **0 errors and 0 warnings**. I validated the pipeline but did not run it."
+  }
+ ]
+}
