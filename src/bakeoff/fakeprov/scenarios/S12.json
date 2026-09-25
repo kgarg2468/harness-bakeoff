@@ -1,6 +1,6 @@
 {
   "id": "S12",
-  "title": "Cost metering: OpenRouter cost per step and per turn; a BYOK step without cost",
+  "title": "Cost metering: OpenRouter cost per step and per turn (the BYOK case is S12b)",
   "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
   "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
   "rules": {"*": "allow"},
@@ -82,17 +82,15 @@
       }
     },
     {
-      "note": "BYOK-style response: usage (without cost) only if stream_options.include_usage was sent. The loop must label any fallback cost.",
-      "style": "openai",
       "expect": {"last_role": "user", "messages_len": 6},
       "respond": {
         "stream": [
           {"text": "chat -> llm_openai_api -> response_answers.", "chunks": 2},
           {"finish": "stop"},
-          {"usage": {"prompt_tokens": 1310, "completion_tokens": 11, "cached_tokens": 1280}}
+          {"usage": {"prompt_tokens": 1310, "completion_tokens": 11, "cached_tokens": 1280, "cost": 0.0003}}
         ]
       }
     }
   ],
-  "expect": {"stops": ["end_turn", "end_turn"], "requests": 3, "commits": 2, "cost_usd": 0.00175}
+  "expect": {"stops": ["end_turn", "end_turn"], "requests": 3, "commits": 2, "cost_usd": 0.00205}
 }

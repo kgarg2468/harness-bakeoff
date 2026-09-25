@@ -174,7 +174,8 @@ recordings and the session log, never from what a loop says about itself.
 | S10a | `reasoning_details` round-trip with known fields, split across chunks, incl. metadata-only fragments | semantic equality of {type,text,signature,data,format,index}; byte equality reported as info |
 | S10b | same plus a synthetic unknown field | informational footnote only |
 | S11 | step cap: the model calls tools forever | stop=max_steps after exactly `max_steps` requests; no orphan calls |
-| S12 | cost metering: OpenRouter `cost`; BYOK run without `cost` | per-step and per-turn totals exact; fallback clearly labelled |
+| S12 | cost metering on OpenRouter: provider `cost` per step, across two turns | per-step and per-turn totals exact |
+| S12b | cost metering on a BYOK OpenAI-compatible endpoint: usage only when `stream_options.include_usage` is sent, no `cost` | usage counted; cost reported as unavailable, never guessed |
 | S13 | BYOK thinking: `openai_compat` endpoint, non-OpenAI model name, reasoning requested | the reasoning parameter reaches the wire |
 | S14 | BYOK strict endpoint: 400 if body has `reasoning`, `reasoning_effort` or `stream_options` (configured via compat flags) | the turn finishes |
 | S15 | compaction hand-off: runner appends a summary item; loop sends [system, summary, new user] | prefix resets only at the compaction boundary |
