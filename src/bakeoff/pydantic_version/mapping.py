@@ -105,8 +105,9 @@ def pending_calls(history: list[ModelMessage]) -> list[ToolCallPart]:
 
 
 def close_pending(history: list[ModelMessage]) -> list[ModelMessage]:
-    """Results for calls a cancel or error left open, exactly as pydantic-ai's own history repair
-    would synthesize them before the next request. Persisting them keeps rule 4 in the log."""
+    """Results for calls a cancel, an error or an abandoned pause left open, exactly as
+    pydantic-ai's own history repair would synthesize them before the next request. Persisting
+    them keeps rule 4 in the log."""
     parts = [
         ToolReturnPart(
             tool_name=call.tool_name,

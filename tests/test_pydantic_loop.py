@@ -327,6 +327,34 @@ async def test_deny_sends_the_reason_to_the_model_without_running_the_tool(loop)
     assert srv.requests[1]["messages"][-1] == denial
 
 
+async def test_a_new_message_after_an_unanswered_pause_closes_its_calls(loop):
+    """The runner lets the user send a new message instead of answering a pause. The open call
+    gets the result the library would synthesize for it, as an item (rule 4), and never runs."""
+    tools = StubTools({"write_file": "ask"})
+    replies = [_batch(), Reply([*text("hi"), done()]), Reply([*text("hi again"), done()])]
+    with SSEServer(*replies) as srv:
+        history = await _pause_for_write(loop, srv, tools)
+        history += [user("never mind, just say hi")]
+        events = await run(loop, turn(history, config(srv)), tools)
+        history += [*items(events), user("again")]
+        await run(loop, turn(history, config(srv)), tools)
+
+    interrupted = "The tool call was interrupted before a result was produced."
+    closing = {"role": "tool", "tool_call_id": "c2", "content": interrupted}
+    assert [i.message for i in items(events)] == [closing, {"role": "assistant", "content": "hi"}]
+    assert [c.id for c in tools.runs] == ["c1"]
+    second, third = srv.requests[1]["messages"], srv.requests[2]["messages"]
+    # The library puts tool results before the user's message within one request.
+    assert [(m["role"], m.get("tool_call_id")) for m in second[2:]] == [
+        ("assistant", None),
+        ("tool", "c1"),
+        ("tool", "c2"),
+        ("user", None),
+    ]
+    assert second[4] == closing
+    assert third[: len(second)] == second  # append-only
+
+
 async def test_crash_between_the_results_of_one_batch_keeps_the_saved_one(loop):
     """Rule 4 across a crash: the worker dies right after c1's result item is saved. c1 never runs
     again; c2 ran but its result was not saved, so the crash resume runs it again (DESIGN)."""

@@ -204,7 +204,13 @@ class PydanticLoop:
         """One agent run over the rebuilt history. Returns the turn.end data."""
         history = mapping.to_history(turn.history)
         deferred = None
-        if turn.resume is not None and (pending := mapping.pending_calls(history)):
+        if turn.resume is None:
+            # A new message after a pause nobody answered: its calls get the result the library
+            # would synthesize, saved as items (rule 4).
+            closing = mapping.close_pending(history)
+            state.flush(closing)
+            history += closing
+        elif pending := mapping.pending_calls(history):
             deferred, asks = _answers(turn.resume, pending, state.tools)
             if asks:
                 return _pause(state, asks)
