@@ -29,7 +29,7 @@ from urllib.parse import urlsplit
 
 from bakeoff import loops
 from bakeoff.fakeprov.script import SCENARIOS_DIR, load_scenario
-from bakeoff.shared import netguard
+from bakeoff.shared import netguard, permissions
 from bakeoff.shared.contract import Limits, Loop, ModelConfig, Resume
 from bakeoff.shared.scenario import (
     Captured,
@@ -329,7 +329,7 @@ def system_prompt(*, attended: bool = True) -> str:
 
 def _attended(rules: dict[str, Any]) -> bool:
     """Whether a person approves anything in this run (some rule says "ask")."""
-    return any(v == "ask" or (isinstance(v, dict) and "ask" in v.values()) for v in rules.values())
+    return permissions.asks(rules)
 
 
 @dataclass(slots=True)

@@ -57,3 +57,8 @@ def validate_rules(rules: Mapping[str, Any]) -> None:
         for decision in rule.values() if isinstance(rule, Mapping) else [rule]:
             if decision not in DECISIONS:
                 raise ValueError(f"Invalid permission rule for {tool!r}: {decision!r}")
+
+
+def asks(rules: dict) -> bool:
+    """Whether any rule answers "ask", i.e. a person approves something in this thread."""
+    return any(v == "ask" or (isinstance(v, dict) and "ask" in v.values()) for v in rules.values())

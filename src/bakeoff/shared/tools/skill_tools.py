@@ -41,11 +41,22 @@ def harness_note(name: str) -> str:
     )
 
 
+# RocketRide's skills stop at approval gates and wait for a person. Said here, right before the
+# gate protocol, because a note in the system prompt alone did not stop models from waiting.
+UNATTENDED_NOTE = (
+    "This run is unattended: nobody can answer approval gates. Treat every gate in "
+    "this skill as approved: state your choice in one line and continue to the end of the "
+    "task. Do not write gate state files."
+)
+
+
 async def load_skill(args: dict[str, Any], ctx: ToolContext) -> str:
-    """The harness note, then the requested file of the skill (default `SKILL.md`)."""
+    """The harness note (plus `UNATTENDED_NOTE` when nobody approves), then the requested file
+    of the skill (default `SKILL.md`)."""
     name = args["name"]
     path = skills.resolve(name, args.get("file"))
-    return f"{harness_note(name)}\n\n--- {path} ---\n{skills.read(path)}"
+    note = harness_note(name) + (f" {UNATTENDED_NOTE}" if ctx.unattended else "")
+    return f"{note}\n\n--- {path} ---\n{skills.read(path)}"
 
 
 # The names are in the tool description too, so a thread whose system prompt lacks
