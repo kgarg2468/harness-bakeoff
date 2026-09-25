@@ -1,8 +1,9 @@
 """Scorecard metrics: lines of code, dependency footprint and harness overhead.
 
 - `loc`: code / comment / docstring / blank lines and statements per loop and for `shared/`.
-- `deps`: installed distributions, site-packages size and cold import time per loop (network).
-- `bench`: harness overhead per turn and per chunk against the in-process fake provider.
+- `deps`: installed distributions, site-packages size, cold import time and third-party code
+  loaded per loop, each in a throwaway venv (network).
+- `bench`: harness overhead per turn and per chunk against the fake provider on 127.0.0.1.
 - `collect`: runs them and writes `out/metrics.json`.
 
 Each module is also a command: `python -m bakeoff.metrics.<name> --help`. Submodules are not

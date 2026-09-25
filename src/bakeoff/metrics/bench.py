@@ -20,10 +20,19 @@ under test, and on a 16-core laptop that made every frame 3-4x slower for the lo
 baseline alike, with p95 overhead noise of about 40 us per frame.
 
 Reported per loop: p50/p95 of turn time (loop, baseline, overhead) in wall and CPU time,
-overhead per SSE frame, events per second, and peak RSS growth. RSS is only meaningful in a
-fresh process, so the command benchmarks each loop in its own subprocess. `--quick` is the CI
-mode: few turns and a generous ceiling that fails only on large regressions. Unit tests assert
-sanity, never timing.
+overhead per SSE frame, events per second, and peak RSS growth. Overhead per frame includes the
+per-turn fixed cost spread over the frames, so compare it only between runs with the same
+`chunks`. Events per wall second are bounded by the fake server; events per CPU second are not.
+
+RSS is only meaningful in a fresh process, so the command benchmarks each loop in its own
+subprocess, and that subprocess imports `bakeoff` from this checkout. The scenario and a used
+baseline client exist before the start mark, so the RSS growth is what the loop adds on top of
+a process that already talks to the server with raw httpx. On Linux the peak is the kernel's
+high-water mark (VmHWM, reset at the start mark), so spikes inside a turn count too.
+
+A loop package that exists but does not import, or fails a turn, gets an `error` entry instead
+of numbers, and the command exits non-zero. `--quick` is the CI mode: few turns and a generous
+ceiling that fails only on large regressions. Unit tests assert sanity, never timing.
 """
 
 from __future__ import annotations
@@ -32,9 +41,12 @@ import argparse
 import asyncio
 import contextlib
 import importlib
+import importlib.metadata
+import importlib.util
 import json
 import math
 import os
+import platform
 import re
 import resource
 import signal
@@ -50,7 +62,7 @@ from typing import Any
 
 import httpx
 
-from bakeoff.metrics import LOOP_PACKAGES
+from bakeoff.metrics import LOOP_PACKAGES, REPO_ROOT
 from bakeoff.shared import netguard
 from bakeoff.shared.contract import (
     Decision,
@@ -75,10 +87,16 @@ SYSTEM = "You are Rocket Agent. You build and fix RocketRide pipelines."
 # large regression trips them on a slow, noisy CI runner.
 MAX_OVERHEAD_US = {"our_version": 50.0}
 DEFAULT_MAX_OVERHEAD_US = 2500.0
+# Distributions whose versions the loops' numbers depend on (recorded with the results).
+KEY_DISTRIBUTIONS = ("httpx", "jsonschema", "openai", "pydantic", "pydantic-ai-slim")
 
 
 class BenchError(RuntimeError):
     """A loop did not complete a benchmark turn the way the script requires."""
+
+
+class LoopImportError(BenchError):
+    """A loop package exists but importing it fails (e.g. a library API it uses was renamed)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,21 +154,58 @@ def scenario(turns: int, chunks: int) -> dict[str, Any]:
 
 
 def discover_one(package: str) -> type[Loop] | None:
-    """The loop class exported (in `__all__`) by `bakeoff.<package>`, or None when the package is
-    missing, still empty, or its dependencies are not installed."""
+    """The loop class exported (in `__all__`) by `bakeoff.<package>`, or None when there is no
+    such package or it exports no loop yet. Raises LoopImportError when the package exists but
+    its import fails: that must show up on the scorecard, not drop the loop from it."""
+    if importlib.util.find_spec(f"bakeoff.{package}") is None:
+        return None
     try:
         module = importlib.import_module(f"bakeoff.{package}")
-    except ImportError:
-        return None
+    except Exception as exc:
+        raise LoopImportError(
+            f"bakeoff.{package} does not import: {type(exc).__name__}: {exc}"
+        ) from exc
     for name in getattr(module, "__all__", ()):
         if hasattr(cls := getattr(module, name), "run_turn"):
             return cls
     return None
 
 
-def discover() -> dict[str, type[Loop]]:
-    """The loop classes that import in this environment, by package name."""
-    return {p: cls for p in LOOP_PACKAGES if (cls := discover_one(p)) is not None}
+def discover() -> tuple[dict[str, type[Loop]], dict[str, str]]:
+    """The loop classes that import here, by package name, and the import error of each loop
+    package that exists but does not import."""
+    loops: dict[str, type[Loop]] = {}
+    errors: dict[str, str] = {}
+    for package in LOOP_PACKAGES:
+        try:
+            if (cls := discover_one(package)) is not None:
+                loops[package] = cls
+        except LoopImportError as exc:
+            errors[package] = str(exc)
+    return loops, errors
+
+
+def environment() -> dict[str, Any]:
+    """The machine and library versions the numbers were measured on. The benchmark children
+    run this same interpreter, so these are their versions too."""
+    cpu = platform.processor()
+    with contextlib.suppress(OSError):  # Linux names the CPU model here; elsewhere keep processor()
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                cpu = line.partition(":")[2].strip()
+                break
+    versions = {}
+    for dist in KEY_DISTRIBUTIONS:
+        with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+            versions[dist] = importlib.metadata.version(dist)
+    return {
+        "python": platform.python_version(),
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "cpu": cpu,
+        "cpu_count": os.cpu_count(),
+        "versions": versions,
+    }
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -176,12 +231,34 @@ def _rss_mb() -> float:
     return peak / (2**20 if sys.platform == "darwin" else 2**10)  # bytes on macOS, else KiB
 
 
+def _reset_peak_rss() -> None:
+    """Start a new peak window (Linux: writing 5 to clear_refs resets VmHWM to the current RSS)."""
+    with contextlib.suppress(OSError):
+        Path("/proc/self/clear_refs").write_text("5")
+
+
+def _peak_rss_mb() -> float:
+    """Peak resident set size since `_reset_peak_rss` (Linux), else since the process started."""
+    with contextlib.suppress(OSError, StopIteration):
+        status = Path("/proc/self/status").read_text().splitlines()
+        return int(next(line for line in status if line.startswith("VmHWM:")).split()[1]) / 2**10
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (2**20 if sys.platform == "darwin" else 2**10)
+
+
+def child_env() -> dict[str, str]:
+    """The environment of a child `python -P`: this checkout's `src` first on its path, so the
+    child measures the same code as this process (and as `loc` and the git sha)."""
+    path = [str(REPO_ROOT / "src"), *filter(None, [os.environ.get("PYTHONPATH")])]
+    return os.environ | {"PYTHONPATH": os.pathsep.join(path)}
+
+
 @contextlib.contextmanager
 def fake_provider(scenarios: Path, wire: Path) -> Iterator[int]:
     """Serve `scenarios` with `python -m bakeoff.fakeprov` in a child process; yield its port."""
-    command = [sys.executable, "-u", "-m", "bakeoff.fakeprov", "--port", "0"]
+    command = [sys.executable, "-P", "-u", "-m", "bakeoff.fakeprov", "--port", "0"]
     command += ["--scenarios", str(scenarios), "--wire-dir", str(wire)]
-    proc = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=child_env())
     try:
         assert proc.stdout is not None
         line = proc.stdout.readline()  # "serving http://127.0.0.1:<port>/s/..."
@@ -206,10 +283,11 @@ class _Sample:
     count: int  # loop: events yielded; baseline: SSE data frames read
 
 
-async def _loop_turn(
+async def loop_turn(
     loop: Loop, n: int, base_url: str, tools: NoopTools, expected_text: int
 ) -> _Sample:
-    """Run one turn to its end. Raises unless it ended cleanly with every text chunk seen."""
+    """Run turn `n` of the benchmark scenario to its end, counting its events. Raises unless it
+    ended cleanly with every text chunk seen."""
     user = Item(uuid.uuid4().hex, f"turn-{n}", {"role": "user", "content": "bench"})
     turn = TurnInput(
         thread_id=f"bench-{n}",
@@ -251,31 +329,40 @@ async def _raw_turn(client: httpx.AsyncClient, url: str, bodies: list[bytes]) ->
     return _Sample(time.perf_counter() - wall, time.process_time() - cpu, frames)
 
 
+def expected_text(chunks: int) -> int:
+    """Characters of text a loop must stream in one turn of the benchmark scenario."""
+    return len(WORD) * chunks + len(FINAL)
+
+
 async def bench_loop(package: str, config: Config, workdir: Path) -> dict[str, Any]:
     """Benchmark one loop package; the scenario and wire recordings go under `workdir`."""
     if config.turns < 1 or config.warmup < 0 or config.chunks < 1:
         raise ValueError(f"nothing to measure with {config}")
-    rss_start = _rss_mb()
-    loop_cls = discover_one(package)
-    if loop_cls is None:
-        raise BenchError(f"bakeoff.{package} has no importable loop")
     total = config.warmup + config.turns
     scenarios = workdir / "scenarios"
     scenarios.mkdir(parents=True, exist_ok=True)
     (scenarios / f"{SCENARIO}.json").write_text(json.dumps(scenario(total, config.chunks)))
-    expected_text = len(WORD) * config.chunks + len(FINAL)
-    loop, tools = loop_cls(), NoopTools()
     pairs: list[tuple[_Sample, _Sample]] = []
     rss: list[float] = []  # after each turn, outside the timed parts
+    loop: Loop | None = None
     try:
         with fake_provider(scenarios, workdir / "wire") as port:
             base = f"http://127.0.0.1:{port}/s/{SCENARIO}"
             wire = workdir / "wire" / SCENARIO / "loop" / package
             async with httpx.AsyncClient(trust_env=False, timeout=60) as client:
+                # The start mark comes after the benchmark's own setup (the scenario, and a
+                # baseline client that has made a request, which loads httpx's lazy imports)
+                # and before the loop's import, so the growth is the loop's alone.
+                (await client.get(f"{base}/raw/{package}/v1/models")).raise_for_status()
+                _reset_peak_rss()
+                rss_start = _rss_mb()
+                loop_cls = discover_one(package)
+                if loop_cls is None:
+                    raise BenchError(f"bakeoff.{package} exports no loop")
+                loop, tools = loop_cls(), NoopTools()
                 for n in range(total):
-                    turn = await _loop_turn(
-                        loop, n, f"{base}/loop/{package}/v1", tools, expected_text
-                    )
+                    url = f"{base}/loop/{package}/v1"
+                    turn = await loop_turn(loop, n, url, tools, expected_text(config.chunks))
                     # Both cursors walk the same exchanges, so each turn must send exactly two.
                     if (wire / f"{2 * n + 3:03d}.json").exists():
                         raise BenchError(f"turn {n} sent more than 2 requests")
@@ -286,11 +373,14 @@ async def bench_loop(package: str, config: Config, workdir: Path) -> dict[str, A
                     if n >= config.warmup:
                         pairs.append((turn, raw))
                     rss.append(_rss_mb())
+                peak = _peak_rss_mb()
     finally:
-        await loop.aclose()
+        if loop is not None:
+            await loop.aclose()
     rss_warm = rss[config.warmup - 1] if config.warmup else rss_start
     frames = pairs[-1][1].count
     result: dict[str, Any] = {
+        "loop_class": f"{loop_cls.__module__}.{loop_cls.__qualname__}",
         "frames_per_turn": frames,
         "events_per_turn": round(percentile([t.count for t, _ in pairs], 50)),
     }
@@ -307,9 +397,13 @@ async def bench_loop(package: str, config: Config, workdir: Path) -> dict[str, A
         per_frame[clock] = _spread(over, 1e6 / frames)
     return result | {
         "overhead_us_per_frame": per_frame,
-        "events_per_s": round(percentile([t.count / t.wall for t, _ in pairs], 50)),
+        # Per wall second this is bounded by the fake server's speed; per CPU second it is not.
+        "events_per_s": {
+            clock: round(percentile([t.count / getattr(t, clock) for t, _ in pairs], 50))
+            for clock in ("wall", "cpu")
+        },
         # From before the loop was imported: import, warm-up and measured turns.
-        "peak_rss_delta_mb": round(max(rss) - rss_start, 1),
+        "peak_rss_delta_mb": round(peak - rss_start, 1),
         # Measured turns only: a number that grows with --turns is a leak.
         "turns_rss_delta_mb": round(max(rss[config.warmup :]) - rss_warm, 1),
     }
@@ -322,29 +416,52 @@ def _run_here(package: str, config: Config) -> dict[str, Any]:
 
 def _run_isolated(package: str, config: Config) -> dict[str, Any]:
     """Run `bench_loop` in a fresh interpreter, so imports and RSS start from nothing."""
-    command = [sys.executable, "-m", "bakeoff.metrics.bench", "--no-isolate", "--json"]
+    command = [sys.executable, "-P", "-m", "bakeoff.metrics.bench", "--no-isolate", "--json"]
     command += ["--loop", package, "--turns", str(config.turns)]
     command += ["--warmup", str(config.warmup), "--chunks", str(config.chunks)]
-    proc = subprocess.run(command, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        raise BenchError(f"{package}: benchmark process failed:\n{proc.stderr.strip()}")
-    # The report is the last stdout line, whatever a library may have printed before it.
-    return json.loads(proc.stdout.strip().splitlines()[-1])["loops"][package]
+    proc = subprocess.run(
+        command, capture_output=True, text=True, check=False, cwd=REPO_ROOT, env=child_env()
+    )
+    try:
+        # The report is the last stdout line, whatever a library may have printed before it.
+        return json.loads(proc.stdout.strip().splitlines()[-1])["loops"][package]
+    except (IndexError, KeyError, json.JSONDecodeError):
+        raise BenchError(
+            f"bakeoff.{package}: benchmark process failed:\n{proc.stderr.strip()}"
+        ) from None
 
 
 def measure(
     config: Config, packages: list[str] | None = None, *, isolate: bool = True
 ) -> dict[str, Any]:
-    """Benchmark each loop package (default: every loop that imports here)."""
-    names = list(discover()) if packages is None else packages
+    """Benchmark each loop package (default: every loop package here that exports a loop). A
+    loop that does not import or fails gets `{"error": ...}` instead of numbers."""
+    if packages is None:
+        loops, errors = discover()
+        packages = [p for p in LOOP_PACKAGES if p in loops or p in errors]
+    else:
+        errors = {}
     run = _run_isolated if isolate else _run_here
-    return {"config": asdict(config), "loops": {name: run(name, config) for name in names}}
+    results: dict[str, Any] = {}
+    for name in packages:
+        try:
+            results[name] = {"error": errors[name]} if name in errors else run(name, config)
+        except BenchError as exc:
+            results[name] = {"error": str(exc)}
+    return {"config": asdict(config), "environment": environment(), "loops": results}
+
+
+def failed_loops(report: dict[str, Any]) -> list[str]:
+    """The loops that got no numbers, with the reason."""
+    return [f"{name}: {r['error']}" for name, r in report["loops"].items() if "error" in r]
 
 
 def regressions(report: dict[str, Any], ceiling_us: float | None = None) -> list[str]:
     """Loops whose p50 CPU overhead per frame exceeds their ceiling (`ceiling_us` for all)."""
     failures = []
     for name, result in report["loops"].items():
+        if "error" in result:
+            continue  # see failed_loops()
         limit = MAX_OVERHEAD_US.get(name, DEFAULT_MAX_OVERHEAD_US)
         limit = limit if ceiling_us is None else ceiling_us
         got = result["overhead_us_per_frame"]["cpu"]["p50"]
@@ -360,22 +477,31 @@ def _row(label: str, wall: dict[str, float], cpu: dict[str, float]) -> str:
 
 def summary(report: dict[str, Any]) -> str:
     """A short human-readable block per loop."""
-    config = report["config"]
+    config, env = report["config"], report["environment"]
     heads = "".join(f"{h:>12}" for h in ("wall p50", "wall p95", "cpu p50", "cpu p95"))
-    out = []
+    versions = ", ".join(f"{k} {v}" for k, v in env["versions"].items())
+    out = [
+        f"{env['cpu']} ({env['cpu_count']} CPUs, {env['machine']}), python {env['python']}; "
+        + versions
+    ]
     for name, r in report["loops"].items():
+        if "error" in r:
+            out.append(f"{name}: ERROR {r['error']}")
+            continue
         wall, cpu = r["wall_ms"], r["cpu_ms"]
+        rate = r["events_per_s"]
         out += [
-            f"{name}: {config['turns']} turns (+{config['warmup']} warm-up), per turn "
-            f"{r['frames_per_turn']} SSE frames and {r['events_per_turn']} loop events",
+            f"{name} ({r['loop_class']}): {config['turns']} turns (+{config['warmup']} warm-up), "
+            f"per turn {r['frames_per_turn']} SSE frames and {r['events_per_turn']} loop events",
             f"  {'':<28}{heads}",
             _row("loop turn (ms)", wall["loop"], cpu["loop"]),
             _row("raw httpx baseline (ms)", wall["baseline"], cpu["baseline"]),
             _row("harness overhead (ms)", wall["overhead"], cpu["overhead"]),
             _row("overhead per frame (us)", *r["overhead_us_per_frame"].values()),
-            f"  {'events per second (p50)':<28}{r['events_per_s']:>12}",
-            f"  {'peak RSS growth':<28}{r['peak_rss_delta_mb']:>+12.1f} MB "
-            f"(measured turns only: {r['turns_rss_delta_mb']:+.1f} MB)",
+            f"  {'events per second (p50)':<28}{rate['wall']:>12}{'':>12}{rate['cpu']:>12}"
+            "   (wall: bounded by the fake server)",
+            f"  {'peak RSS growth':<28}{r['peak_rss_delta_mb']:>+12.1f} MB over a raw-httpx "
+            f"process (measured turns only: {r['turns_rss_delta_mb']:+.1f} MB)",
         ]
     return "\n".join(out)
 
@@ -397,17 +523,20 @@ def main(argv: list[str] | None = None) -> int:
     netguard.install()  # I6: the benchmark only ever talks to 127.0.0.1
     base = QUICK if args.quick else FULL
     config = Config(
-        turns=args.turns or base.turns,
+        turns=base.turns if args.turns is None else args.turns,
         warmup=base.warmup if args.warmup is None else args.warmup,
-        chunks=args.chunks or base.chunks,
+        chunks=base.chunks if args.chunks is None else args.chunks,
     )
+    if config.turns < 1 or config.warmup < 0 or config.chunks < 1:
+        parser.error(f"nothing to measure with {config}")
     report = measure(config, args.loop, isolate=not args.no_isolate)
     print(json.dumps(report) if args.json else summary(report))
+    failures = [f"ERROR {e}" for e in failed_loops(report)]
     if args.quick or args.max_overhead_us is not None:
-        for failure in (failures := regressions(report, args.max_overhead_us)):
-            print(f"REGRESSION {failure}", file=sys.stderr)
-        return int(bool(failures))
-    return 0
+        failures += [f"REGRESSION {r}" for r in regressions(report, args.max_overhead_us)]
+    for failure in failures:
+        print(failure, file=sys.stderr)
+    return int(bool(failures))
 
 
 if __name__ == "__main__":
