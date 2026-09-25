@@ -24,7 +24,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/two-loops.svg" alt="Two loop folders sit on top and are the only code that is counted: A, pydantic_version, the loop on pydantic-ai with Agent.iter and deferred tools, used the way its docs recommend; and B, our_version, our own low-latency loop on raw httpx with some pieces ported from Pi. Both implement one seam, shared/contract.py: a loop gets the history and the tools, and only yields events. Everything under the seam is shared, identical for both and not counted: the runner, session log, git working copy, RocketRide tools, permission rules and skills that run a turn, and the fake model server, 22 scenarios, invariants I1 to I7, metrics and report page that judge it." width="880">
+  <img src="docs/assets/two-loops.svg" alt="Two loop folders sit on top and are the only code that is counted: A, pydantic_version, the loop on pydantic-ai with Agent.iter and deferred tools, used the way its docs recommend; and B, our_version, our own low-latency loop on raw httpx with some pieces ported from Pi. Both implement one seam, shared/contract.py: a loop gets the history and the tools, and only yields events. Everything under the seam is shared, identical for both and not counted: the runner, session log, git working copy, RocketRide tools, permission rules and skills that run a turn, and the fake model server, 22 scenarios, invariants I1, I2, I3, I5 and I7, metrics and report page that judge it." width="880">
 </p>
 
 ## Results at a glance
@@ -52,7 +52,7 @@ The full comparison is one page, `out/report.html`: a scorecard, the scenario ma
 - **Packages, import time and overhead:** `out/metrics.json` from `python -m bakeoff.metrics.collect --deps --bench full`, at commit `8ce862e`. B has grown by 4 code lines since (cancel fixes), and a re-run on `main` gives the same picture. Each loop's dependency set is installed alone in a fresh virtual environment. The benchmark turn is a tool step of 2,000 streamed chunks plus a one-chunk answer, against the local fake server, 100 measured turns per loop; overhead is the loop's turn time minus a bare `httpx` client reading the same stream. AMD Ryzen 9 6900HS, Python 3.12.3.
 - **Scenarios:** `uv run bakeoff scenario --all --impl our,pydantic`. R01–R05 (the Responses API) are expected failures on `main` for both loops; each loop passes 22 / 22 on its PR branch.
 - **Engine fit:** `./scripts/engine_fit.sh` asks uv to resolve each loop's dependencies together with the engine's pins.
-- **Live runs:** three `bakeoff live` runs per loop on 2026-09-25, `gpt-6-luna` on api.openai.com with reasoning `none`, a 20-step cap and the prompt *"Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it."* Medians per step, because the model chooses how many steps to take (7 or 8 here). Every run ended with `end_turn`, its one `validate_pipeline` call returned 0 errors and 0 warnings (on MockEngine, which carries the real RocketRide node catalog), and the invariants checked on live runs (I2, I3, I5, I7) held.
+- **Live runs:** three `bakeoff live` runs per loop on 2026-09-25, `gpt-6-luna` on api.openai.com with reasoning `none`, a 20-step cap and the prompt *"Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it."* Medians per step, because the model chooses how many steps to take (7 or 8 here). Every run ended with `end_turn`, its one `validate_pipeline` call returned 0 errors and 0 warnings (on MockEngine, which carries the real RocketRide node catalog), and the invariants checked on live runs (I2, I3, I5, I7) held. Each run's key fields are kept in [`docs/results/live-2026-09-25.json`](docs/results/live-2026-09-25.json), so these figures can be checked without paying for new runs.
 - **Responses API lines:** the line tables in PRs [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13) (B: 713 → 853) and [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14) (A: 681 → 727).
 
 </details>
@@ -76,7 +76,7 @@ The seam is [`src/bakeoff/shared/contract.py`](src/bakeoff/shared/contract.py): 
 ## How we keep it fair
 
 <p align="center">
-  <img src="docs/assets/fairness.svg" alt="The same test for both loops. A, pydantic-ai, and B, our own loop, each talk to the same fake model server, fakeprov on 127.0.0.1, which plays 22 scripted scenarios, with a fresh copy of each script per loop. Every request a loop sends, the session log and the git working copy are recorded. Both loops are judged the same way from those recordings only: each scenario's checks and the invariants I1 to I7 give a pass or fail matrix. The rules from FAIRNESS.md: predictions were written before either loop; A is used the way the pydantic-ai docs recommend, per A_CHECKLIST.md, which its reviewer can change; both loops have the same feature floor (retries, cost, cancel, approvals, crash resume); and there is no automatic winner: the report shows evidence and people decide." width="880">
+  <img src="docs/assets/fairness.svg" alt="The same test for both loops. A, pydantic-ai, and B, our own loop, each talk to the same fake model server, fakeprov on 127.0.0.1, which plays 22 scripted scenarios, with a fresh copy of each script per loop. Every request a loop sends, the session log and the git working copy are recorded. Both loops are judged the same way from those recordings only: each scenario's checks and the invariants I1, I2, I3, I5 and I7 give a pass or fail matrix (I6, no traffic beyond this machine, is enforced by a network guard instead). The rules from FAIRNESS.md: predictions were written before either loop; A is used the way the pydantic-ai docs recommend, per A_CHECKLIST.md, which its reviewer can change; both loops have the same feature floor (retries, cost, cancel, approvals, crash resume); and there is no automatic winner: the report shows evidence and people decide." width="880">
 </p>
 
 - **One seam.** Only `our_version/` and `pydantic_version/` are counted. Everything else is shared and identical for both.
@@ -139,7 +139,7 @@ src/bakeoff/
     tools/             file tools, RocketRide engine tools, load_skill
     engine/            MockEngine over the real RocketRide node catalog; RealEngine (optional)
     skills.py          the RocketRide pipeline skills in the system prompt
-    invariants.py      I1-I7 over the wire recordings and the session log
+    invariants.py      I1, I2, I3, I7 over the wire recordings and the session log (I5 and I6: driver and netguard)
     scenario.py        runs one scripted scenario against the fake server
     netguard.py        the loopback-only network guard (I6)
   fakeprov/            the scripted fake model server, and scenarios/*.json
@@ -261,11 +261,13 @@ out/runs/<run_id>/<scenario>/<loop>/result.json  every check and invariant, with
                                     wire/        every request body the fake server received
                                     events.ndjson, wc/ (the git working copy)
 out/runs/latest -> <run_id>
-out/live/<run_id>/<loop>/                        the same for a live run; result.json adds the model,
-                                                 prompt, final answer and latency
+out/live/<run_id>/<loop>/result.json             a live run: model, prompt, final answer, stops, steps,
+                                                 tokens, latency, tool runs, invariants (I2, I3, I5, I7)
+                        log.sqlite, events.ndjson, wc/   as above; no wire/ (live request bodies are not recorded)
+out/live/latest -> <run_id>
 ```
 
-A run id is never reused. Wire recordings hold request bodies only, never headers, and live recordings are not committed.
+A run id is never reused. Wire recordings (scenario runs only) hold request bodies only, never headers. `out/` is not committed; the live-run figures above are kept in [`docs/results/live-2026-09-25.json`](docs/results/live-2026-09-25.json).
 
 </details>
 

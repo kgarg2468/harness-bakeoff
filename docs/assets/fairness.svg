@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 404" width="880" height="404" role="img" aria-labelledby="t d">
   <title id="t">How the bake-off keeps it fair</title>
-  <desc id="d">The same test for both loops. A, pydantic-ai, and B, our own loop, each talk to the same scripted fake model server, fakeprov, on 127.0.0.1: 22 scenarios, and each loop gets its own copy of the same script. What gets recorded: every request a loop sends, the session log and the git working copy. Both are judged the same way, from those recordings only: each scenario's checks and the invariants I1 to I7, which give a pass or fail matrix. The rules from FAIRNESS.md: predictions were written in PREDICTIONS.md before either loop; A is used the way the pydantic-ai docs recommend, per A_CHECKLIST.md, which its reviewer can change; both loops have the same feature floor (retries, cost, cancel, approvals, crash resume), each covered by a test; and there is no automatic winner: the report shows evidence and people decide.</desc>
+  <desc id="d">The same test for both loops. A, pydantic-ai, and B, our own loop, each talk to the same scripted fake model server, fakeprov, on 127.0.0.1: 22 scenarios, and each loop gets its own copy of the same script. What gets recorded: every request a loop sends, the session log and the git working copy. Both are judged the same way, from those recordings only: each scenario's checks and the invariants I1, I2, I3, I5 and I7, which give a pass or fail matrix (I6, no traffic beyond this machine, is enforced by a network guard instead). The rules from FAIRNESS.md: predictions were written in PREDICTIONS.md before either loop; A is used the way the pydantic-ai docs recommend, per A_CHECKLIST.md, which its reviewer can change; both loops have the same feature floor (retries, cost, cancel, approvals, crash resume), each covered by a test; and there is no automatic winner: the report shows evidence and people decide.</desc>
   <defs>
     <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
   </defs>
@@ -82,7 +82,7 @@
   <rect class="box" x="644" y="44" width="212" height="112" rx="8"/>
   <text class="h" x="662" y="70">Judged the same way</text>
   <text class="s" x="662" y="94">each scenario's checks</text>
-  <text class="s" x="662" y="114">invariants I1–I7</text>
+  <text class="s" x="662" y="114">invariants I1–3, I5, I7</text>
   <text class="s" x="662" y="134">a pass / fail matrix</text>
 
   <line class="div" x1="24" y1="184" x2="856" y2="184"/>

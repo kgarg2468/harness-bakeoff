@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 432" width="880" height="432" role="img" aria-labelledby="t d">
   <title id="t">One agent harness, built twice</title>
-  <desc id="d">Two loop folders sit on top and are the only code that is counted: A, pydantic_version, the loop on pydantic-ai with Agent.iter and deferred tools, used the way its docs recommend; and B, our_version, our own latency-optimized loop on raw httpx with some pieces ported from Pi. Both implement one seam, shared/contract.py: a loop gets the history and the tools, and only yields events. Everything under the seam is shared and identical for both, and not counted. What runs a turn: the runner, the session log, the git working copy, the RocketRide tools, the permission rules and the skills. What judges it: the fake model server, 22 scenarios, the invariants I1 to I7, the metrics and the report page.</desc>
+  <desc id="d">Two loop folders sit on top and are the only code that is counted: A, pydantic_version, the loop on pydantic-ai with Agent.iter and deferred tools, used the way its docs recommend; and B, our_version, our own latency-optimized loop on raw httpx with some pieces ported from Pi. Both implement one seam, shared/contract.py: a loop gets the history and the tools, and only yields events. Everything under the seam is shared and identical for both, and not counted. What runs a turn: the runner, the session log, the git working copy, the RocketRide tools, the permission rules and the skills. What judges it: the fake model server, 22 scenarios, five invariants (I1, I2, I3, I5, I7), the metrics and the report page.</desc>
   <defs>
     <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
   </defs>
@@ -93,7 +93,7 @@
   <text class="sec" x="40" y="371">JUDGES IT</text>
   <rect class="chip" x="160" y="352" width="144" height="28" rx="6"/><text class="c" x="232" y="371" text-anchor="middle">fake model server</text>
   <rect class="chip" x="312" y="352" width="106" height="28" rx="6"/><text class="c" x="365" y="371" text-anchor="middle">22 scenarios</text>
-  <rect class="chip" x="426" y="352" width="136" height="28" rx="6"/><text class="c" x="494" y="371" text-anchor="middle">invariants I1–I7</text>
+  <rect class="chip" x="426" y="352" width="136" height="28" rx="6"/><text class="c" x="494" y="371" text-anchor="middle">5 invariants</text>
   <rect class="chip" x="570" y="352" width="76" height="28" rx="6"/><text class="c" x="608" y="371" text-anchor="middle">metrics</text>
   <rect class="chip" x="654" y="352" width="104" height="28" rx="6"/><text class="c" x="706" y="371" text-anchor="middle">report page</text>
 
