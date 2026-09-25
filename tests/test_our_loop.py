@@ -302,6 +302,98 @@ async def test_read_only_tool_starts_before_the_stream_ends() -> None:
     assert [e["call_id"] for e in of(events, "tool_call.ready")] == ["c0", "c1"]
 
 
+class FileTools(StubTools):
+    """StubTools plus one file: a write lands when it ends, validate reports what it saw at start."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.files = {"a.pipe": "v1"}
+
+    async def run(self, call: ToolCall) -> ToolResult:
+        args = json.loads(call.arguments)
+        seen = self.files.get(args.get("path", ""))
+        result = await super().run(call)
+        if call.name == "write_file":
+            self.files[args["path"]] = args["content"]
+        elif call.name == "validate_pipeline":
+            return ToolResult(call.id, True, f"validated {seen}")
+        return result
+
+
+def results(events: list[Event]) -> list[tuple[str, str]]:
+    return [(it.message["tool_call_id"], it.message["content"]) for it in items(events)[1:-1]]
+
+
+WRITE = '{"path": "a.pipe", "content": "v2"}'
+
+
+async def test_write_then_validate_in_one_batch_sees_the_write() -> None:
+    server = Server(
+        sse(
+            call(0, WRITE, "c0", "write_file"),
+            call(1, '{"path": "a.pipe"}', "c1", "validate_pipeline"),
+            finish("tool_calls"),
+        ),
+        reply("done"),
+    )
+    tools = FileTools(delays={"write_file": 0.05})
+    events = await run(server.loop(), [user("write and validate")], tools)
+    assert results(events) == [("c0", "write_file ok"), ("c1", "validated v2")]
+    assert tools.spans["c1"][0] >= tools.spans["c0"][1]
+
+
+async def test_reads_before_a_write_start_early_and_reads_after_it_wait() -> None:
+    tools = FileTools(delays={"describe_component": 0.05, "write_file": 0.05})
+    started_mid_stream: list[dict[str, int]] = []
+
+    async def body() -> AsyncIterator[bytes]:
+        yield sse_bytes(
+            call(0, '{"name": "a"}', "c0", "describe_component"),
+            call(1, '{"name": "b"}', "c1", "describe_component"),
+            call(2, WRITE, "c2", "write_file"),
+            call(3, '{"path": "a.pipe"}', "c3", "validate_pipeline"),
+        )
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(tools.started.wait(), 1)
+        await asyncio.sleep(0.01)
+        started_mid_stream.append(dict(tools.run_counts))
+        yield sse_bytes(finish("tool_calls"))
+
+    server = Server(lambda: httpx.Response(200, content=body()), reply("done"))
+    events = await run(server.loop(), [user("go")], tools)
+    assert started_mid_stream == [{"c0": 1, "c1": 1}]  # not c3: it comes after the write
+    spans = tools.spans
+    assert max(spans["c0"][0], spans["c1"][0]) < min(spans["c0"][1], spans["c1"][1])  # overlap
+    assert spans["c2"][0] >= max(spans["c0"][1], spans["c1"][1])
+    assert spans["c3"][0] >= spans["c2"][1]
+    assert results(events) == [
+        ("c0", "describe_component ok"),
+        ("c1", "describe_component ok"),
+        ("c2", "write_file ok"),
+        ("c3", "validated v2"),
+    ]
+
+
+async def test_calls_after_an_ask_wait_for_the_answer() -> None:
+    batch = sse(
+        call(0, WRITE, "c0", "write_file"),
+        call(1, '{"path": "a.pipe"}', "c1", "validate_pipeline"),
+        finish("tool_calls"),
+    )
+    tools = FileTools(rules={"write_file": "ask"})
+    history = [user("write and validate")]
+    paused = await run(Server(batch).loop(), history, tools)
+    assert paused[-1].data == {"stop": "paused", "steps": 1, "pending": ["c0"]}
+    assert tools.run_counts == {} and len(items(paused)) == 1  # validate did not run early
+    history += [persisted(it) for it in items(paused)]
+    resume = Resume("approval", {"c0": "allow"})
+    resumed = await run(Server(reply("ok")).loop(), history, tools, resume=resume)
+    assert [(it.message["tool_call_id"], it.message["content"]) for it in items(resumed)[:2]] == [
+        ("c0", "write_file ok"),
+        ("c1", "validated v2"),
+    ]
+
+
 def approval_batch() -> httpx.Response:
     return sse(
         call(0, '{"pipeline": {}}', "c0", "validate_pipeline"),
@@ -427,6 +519,7 @@ async def test_cancel_during_a_slow_tool_leaves_no_orphans() -> None:
         sse(
             call(0, '{"path": "a"}', "c0", "write_file"),
             call(1, '{"path": "b"}', "c1", "edit_file"),
+            call(2, '{"name": "x"}', "c2", "describe_component"),  # waits for the ask
             finish("tool_calls"),
         )
     )
@@ -448,7 +541,9 @@ async def test_cancel_during_a_slow_tool_leaves_no_orphans() -> None:
     assert [it.message for it in items(events)[1:]] == [
         {"role": "tool", "tool_call_id": "c0", "content": "Cancelled by user"},
         {"role": "tool", "tool_call_id": "c1", "content": "Cancelled by user"},
+        {"role": "tool", "tool_call_id": "c2", "content": "Cancelled by user"},
     ]
+    assert tools.run_counts == {"c0": 1}
     assert_no_orphans(history + items(events))
 
 

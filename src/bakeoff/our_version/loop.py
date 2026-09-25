@@ -170,7 +170,7 @@ class _Turn:
                                 merge_detail(stream.details, fragment)
                             for tool_delta in delta.get("tool_calls") or ():
                                 if done := stream.tool_delta(tool_delta, self.read_only):
-                                    yield self._ready(done, eager=True)
+                                    yield self._ready(done, stream)
                             if usage := chunk.get("usage"):
                                 stream.usage = usage  # replaced, never added: counted once
                                 if stream.finish:  # finish_reason and usage: nothing else is due
@@ -201,7 +201,7 @@ class _Turn:
                         return
                 for call in stream.calls.values():
                     if not call.ready:
-                        yield self._ready(call, eager=False)
+                        yield self._ready(call)
                 usage = {"step": self.steps, **usage_fields(stream.usage)}
                 self.cost += usage["cost_usd"]
                 yield self._item(stream.message(), usage=usage)
@@ -281,40 +281,70 @@ class _Turn:
         }
         return [Event("retry", retry)], wait
 
-    def _ready(self, streamed: StreamedCall, *, eager: bool) -> Event:
-        """A call's arguments are complete. Eager: start an allowed read-only call right away."""
+    def _ready(self, streamed: StreamedCall, stream: Stream | None = None) -> Event:
+        """A call's arguments are complete. Mid-stream (`stream` given), start what may start early."""
         call = streamed.finish()
-        if eager and self.tools.check(call) == "allow":
-            self.jobs[call.id] = self._spawn(self.tools.run(call))
+        if stream is not None:
+            self._start_early(stream)
         return Event(
             "tool_call.ready", {"call_id": call.id, "name": call.name, "arguments": call.arguments}
         )
 
+    def _start_early(self, stream: Stream) -> None:
+        """Start complete, allowed read-only calls while the model is still streaming, in call
+        order: a call starts early only if every call before it did, so none can run ahead of
+        an earlier write."""
+        for streamed in stream.calls.values():
+            if streamed.id in self.jobs:
+                continue
+            if not streamed.ready or streamed.name not in self.read_only:
+                return
+            call = streamed.call()
+            if self.tools.check(call) != "allow":
+                return
+            self._start(call)
+
     async def _tools(self, calls: list[ToolCall]) -> AsyncIterator[Event]:
-        """Run calls concurrently and append one result per call, in call order."""
-        asked: list[ToolCall] = []
-        for call in calls:
-            user = self.user.get(call.id)
-            if user == "deny" or call.id in self.jobs:
-                continue  # denied by the user, or already started eagerly
-            if user is None and self.tools.check(call) == "ask":
-                asked.append(call)
-            else:  # allowed, approved, or denied by a rule (run() enforces that)
-                self.jobs[call.id] = self._spawn(self.tools.run(call))
+        """Run the calls and append one result per call, in call order.
+
+        Consecutive read-only calls run concurrently. Any other call runs alone, after everything
+        before it, and everything after waits for it, so no call sees older state than the calls
+        before it left. "ask" calls pause the turn; the calls after the first of them run on resume.
+        """
+        asked = [
+            c
+            for c in calls
+            if c.id not in self.jobs and c.id not in self.user and self.tools.check(c) == "ask"
+        ]
         for call in asked:
             yield Event(
                 "permission.asked",
                 {"call_id": call.id, "name": call.name, "arguments": call.arguments},
             )
-        for call in calls:
-            if call not in asked:
-                yield self._result(await self._outcome(call))
-        if self.cancel.is_set():  # no orphans: asked calls get a result too
-            for call in asked:
+        now = calls[: calls.index(asked[0])] if asked else calls
+        done = 0  # calls of `now` whose result is appended
+        for i, call in enumerate(now):
+            if call.id in self.jobs or self.user.get(call.id) == "deny":
+                continue  # started early, or denied by the user
+            if call.name in self.read_only:  # allowed, or denied by a rule (run() enforces that)
+                self._start(call)
+                continue
+            for c in now[done:i]:  # a write waits for everything before it ...
+                yield self._result(await self._outcome(c))
+            self._start(call)
+            yield self._result(await self._outcome(call))  # ... and everything after waits for it
+            done = i + 1
+        for call in now[done:]:
+            yield self._result(await self._outcome(call))
+        if self.cancel.is_set():  # no orphans: calls that did not run get a result too
+            for call in calls[len(now) :]:
                 yield self._result(ToolResult(call.id, False, CANCELLED))
             yield self._end("cancelled")
         elif asked:
             yield self._end("paused", pending=[call.id for call in asked])
+
+    def _start(self, call: ToolCall) -> None:
+        self.jobs[call.id] = self._spawn(self.tools.run(call))
 
     async def _outcome(self, call: ToolCall) -> ToolResult:
         job = self.jobs.pop(call.id, None)

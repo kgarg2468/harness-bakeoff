@@ -75,6 +75,9 @@ class StreamedCall:
         """Mark the call complete (its arguments are final) and return it."""
         self.ready = True
         self.id = self.id or f"call_{uuid.uuid4().hex[:24]}"
+        return self.call()
+
+    def call(self) -> ToolCall:
         return ToolCall(self.id, self.name, "".join(self.parts))
 
 
@@ -148,7 +151,7 @@ class Stream:
         return msg
 
     def tool_calls(self) -> list[ToolCall]:
-        return [ToolCall(c.id, c.name, "".join(c.parts)) for c in self.calls.values()]
+        return [c.call() for c in self.calls.values()]
 
 
 def stream_error(error: Any) -> ProviderError:
