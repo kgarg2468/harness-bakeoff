@@ -130,13 +130,13 @@ async def test_request_shape_and_a_reasoned_answer() -> None:
     events = await run(server.loop(), [first], StubTools(), model=MODEL)
     assert [e.type for e in events] == [
         "request.start",
-        *["reasoning.delta"] * 3,
+        *["reasoning.delta"] * 2,
         *["text.delta"] * 2,
         "item",
         "usage",
         "turn.end",
     ]
-    assert [e["text"] for e in of(events, "reasoning.delta")] == ["Plan", "\n\n", "Answer"]
+    assert [e["text"] for e in of(events, "reasoning.delta")] == ["Plan", "\n\nAnswer"]
     (item,) = items(events)
     assert item.message == {"role": "assistant", "content": "Hello"}
     assert item.native == [REASONING, message("Hello")]  # the done items, not the added ones
@@ -283,7 +283,12 @@ async def test_output_items_are_set_apart_by_blank_lines() -> None:
         events += [
             event("response.output_item.added", item={**item, "summary": []}),
             event("response.reasoning_summary_part.added", summary_index=0),
-            event("response.reasoning_summary_text.delta", summary_index=0, delta=f"Plan {n}."),
+            event(
+                "response.reasoning_summary_text.delta",
+                item_id=item["id"],
+                summary_index=0,
+                delta=f"Plan {n}.",
+            ),
             done(item),
         ]
     for item in (commentary, message("Done.")):
@@ -301,6 +306,36 @@ async def test_output_items_are_set_apart_by_blank_lines() -> None:
     (item,) = items(events)
     assert item.message["content"] == "I'll check.\n\nDone."
     assert item.native[2:] == [commentary, message("Done.")]  # replayed as sent, without it
+
+
+async def test_raw_reasoning_text_is_set_apart_by_item_and_part() -> None:
+    """Models that stream their reasoning itself: the raw text of separate reasoning items (and
+    of separate parts, summaries included) does not run together in the reasoning stream."""
+
+    def raw(item_id: str, index: int, delta: str) -> dict[str, Any]:
+        return event(
+            "response.reasoning_text.delta", item_id=item_id, content_index=index, delta=delta
+        )
+
+    server = Server(
+        response(
+            raw("rs_0", 0, "Look "),
+            raw("rs_0", 0, "first."),
+            raw("rs_0", 1, "Then this."),
+            raw("rs_1", 0, "Next item."),
+            event(
+                "response.reasoning_summary_text.delta",
+                item_id="rs_1",
+                summary_index=0,
+                delta="Sum.",
+            ),
+            completed(),
+        )
+    )
+    events = await run(server.loop(), [user("hi")], StubTools(), model=MODEL)
+    assert "".join(e["text"] for e in of(events, "reasoning.delta")) == (
+        "Look first.\n\nThen this.\n\nNext item.\n\nSum."
+    )
 
 
 async def test_a_response_without_done_items_replays_its_text() -> None:

@@ -9,8 +9,8 @@ here always, not only when reasoning is on; a reasoning summary unless the effor
 tools with `strict: false`, the system prompt as a developer message), the conversion of
 chat-shaped messages to input items, replaying output items without their ids when their
 reasoning item is not replayed (Pi: calls from another model), which events carry text and
-reasoning (a blank line between summary parts; between messages too, which Pi keeps apart as
-blocks), and the ends of a stream:
+reasoning (a blank line between summary parts; between reasoning items, their raw text parts
+and messages too, which Pi keeps apart as blocks), and the ends of a stream:
 `response.completed`, `.incomplete` (max_output_tokens is a truncation, any other reason an
 error), `.failed`, the `error` event, and a stream that ends before any of them.
 
@@ -114,7 +114,7 @@ class ResponsesStream(Stream):
     def __init__(self) -> None:
         super().__init__()
         self.native: list[dict[str, Any]] = []
-        self.parts = 0  # reasoning summary parts so far, over all reasoning items
+        self.at: tuple[Any, ...] | None = None  # the reasoning part the last delta was in
         self.unpaired = False  # the last reasoning item was dropped (see _done)
         self.cut = False  # a call's done item came incomplete: out of max_output_tokens
 
@@ -124,15 +124,22 @@ class ResponsesStream(Stream):
         if kind in _TEXT:
             self.text.append(text := event["delta"])
             return Event("text.delta", {"text": text})
+        # Pi keeps each output item in a block of its own. Here all reasoning streams as one text
+        # and all messages make one, so a blank line sets apart messages and reasoning parts: a
+        # summary part or raw text part of one reasoning item, told apart by each delta's ids.
         if kind in _REASONING:
-            return Event("reasoning.delta", {"text": event["delta"]})
+            at = (
+                kind,
+                event.get("item_id"),
+                event.get("summary_index", event.get("content_index")),
+            )
+            text = event["delta"]
+            if self.at is not None and at != self.at:
+                text = "\n\n" + text
+            self.at = at
+            return Event("reasoning.delta", {"text": text})
         if kind == "response.output_item.done":
             return self._done(event["item"])
-        # Pi keeps each output item in a block of its own. Here all reasoning streams as one text
-        # and all messages make one, so a blank line sets apart summary parts and messages.
-        if kind == "response.reasoning_summary_part.added":
-            self.parts += 1
-            return Event("reasoning.delta", {"text": "\n\n"}) if self.parts > 1 else None
         if kind == "response.output_item.added":
             if self.text and event["item"]["type"] == "message":
                 self.text.append("\n\n")
