@@ -28,6 +28,7 @@ from pydantic import ValidationError
 from pydantic_ai import (
     Agent,
     AgentRun,
+    ApprovalRequired,
     CancellationToken,
     CostNotFoundWarning,
     DeferredToolRequests,
@@ -104,6 +105,7 @@ class _Turn:
     turn_id: str
     tools: ToolHost
     max_steps: int
+    decided: set[str]  # the calls the user answered in this resume
     out: asyncio.Queue[Event | None] = field(default_factory=asyncio.Queue)
     steps: int = 0
     attempt: int = 0  # of the current step
@@ -197,7 +199,8 @@ class PydanticLoop:
     async def run_turn(
         self, turn: TurnInput, tools: ToolHost, cancel: asyncio.Event
     ) -> AsyncIterator[Event]:
-        state = _Turn(turn.turn_id, tools, turn.limits.max_steps)
+        decided = set(turn.resume.decisions) if turn.resume else set()
+        state = _Turn(turn.turn_id, tools, turn.limits.max_steps, decided)
         task = asyncio.create_task(self._drive(turn, state, cancel))
         try:
             while (event := await state.out.get()) is not None:
@@ -260,17 +263,22 @@ class PydanticLoop:
     ) -> dict[str, Any]:
         """One agent run over the history rebuilt from `items`. Returns the turn.end data."""
         history = mapping.to_history(items)
+        # Open calls that must never run (cut short by a cancel, or abandoned for a new message)
+        # get the result the library would synthesize, saved as items (rule 4).
+        closing = mapping.close_abandoned(history)
+        state.flush(closing)
+        history += closing
+        if usage is None:
+            # A resume continues the turn: its steps and cost count against the limits.
+            usage = mapping.spent(history)
+            state.steps = usage.requests
+            if turn.resume is not None and (stop := mapping.finished(history)):
+                return {"stop": stop}  # a crash came after the turn's end was saved
         deferred = None
-        if turn.resume is None:
-            # A new message after a pause nobody answered: its calls get the result the library
-            # would synthesize, saved as items (rule 4).
-            closing = mapping.close_pending(history)
-            state.flush(closing)
-            history += closing
-        elif pending := mapping.pending_calls(history):
-            deferred, asks = _answers(turn.resume, pending, state.tools)
-            if asks:
-                return _pause(state, asks)
+        if pending := mapping.pending_calls(history):
+            # The library needs an answer for every open call; `_before_execute` asks again for
+            # those the user did not decide, once `check()` says "ask" (rule 5).
+            deferred = DeferredToolResults(approvals=_approvals(turn.resume, pending))
         limits = turn.limits
         cost_limit = None if limits.max_cost_usd is None else Decimal(str(limits.max_cost_usd))
         model = self._model(turn.model)
@@ -346,7 +354,7 @@ class PydanticLoop:
                     Hooks(
                         after_model_request=_on_model_response,
                         tool_validate_error=_unparsed_args,
-                        before_tool_execute=_step_cap,
+                        before_tool_execute=_before_execute,
                     ),
                     ProcessHistory(mapping.replayable),
                 ],
@@ -409,13 +417,19 @@ def _unparsed_args(
     return {}
 
 
-def _step_cap(
+def _before_execute(
     ctx: RunContext[_Turn], /, *, call: ToolCallPart, tool_def: ToolDefinition, args: Any
 ) -> Any:
     """The step cap is checked before the next request, so the calls of the last allowed response
-    would run although their results can never be sent. Skip them; each still gets a result."""
-    if ctx.usage.requests >= ctx.deps.max_steps:
+    would run although their results can never be sent: skip them (each still gets a result).
+    A call resumed without the user's decision (a crash resume, or one the user left out) is
+    re-checked, and deferred again if it must be asked."""
+    turn = ctx.deps
+    if ctx.usage.requests >= turn.max_steps:
         raise SkipToolExecution(_STEP_CAP_RESULT)
+    resumed = ctx.tool_call_approved and call.tool_call_id not in turn.decided
+    if resumed and turn.tools.check(_to_call(call)) == "ask":
+        raise ApprovalRequired
     return args
 
 
@@ -436,24 +450,17 @@ def _call_data(part: ToolCallPart) -> dict[str, Any]:
     return {"call_id": call.id, "name": call.name, "arguments": call.arguments}
 
 
-def _answers(
-    resume: Resume, pending: list[ToolCallPart], tools: ToolHost
-) -> tuple[DeferredToolResults, list[ToolCallPart]]:
-    """Approvals for the open calls: the user's decision, else `check()` again (a crash resume).
-    Calls that come back "ask" are returned to be asked again."""
-    approvals: dict[str, bool | ToolDenied] = {}
-    asks: list[ToolCallPart] = []
-    for call in pending:
-        decision = resume.decisions.get(call.tool_call_id)
-        if decision == "deny":
-            approvals[call.tool_call_id] = ToolDenied(
-                f"Denied by user: {resume.reason or 'no reason given'}"
-            )
-        elif decision == "allow" or tools.check(_to_call(call)) != "ask":
-            approvals[call.tool_call_id] = True  # run() still enforces "deny" rules
-        else:
-            asks.append(call)
-    return DeferredToolResults(approvals=approvals), asks
+def _approvals(resume: Resume | None, pending: list[ToolCallPart]) -> dict[str, bool | ToolDenied]:
+    """The user's answers for the open calls; a call without one is approved here and re-checked
+    before it runs (`_before_execute`). `run()` still enforces "deny" rules."""
+    decisions = resume.decisions if resume else {}
+    reason = (resume.reason if resume else None) or "no reason given"
+    return {
+        call.tool_call_id: ToolDenied(f"Denied by user: {reason}")
+        if decisions.get(call.tool_call_id) == "deny"
+        else True
+        for call in pending
+    }
 
 
 def _pause(state: _Turn, calls: list[ToolCallPart]) -> dict[str, Any]:

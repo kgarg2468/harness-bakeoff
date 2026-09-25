@@ -329,7 +329,9 @@ async def test_approval_pauses_then_resumes_in_a_fresh_loop(loop):
     assert second["messages"][: len(first["messages"])] == first["messages"]  # append-only
     assert [m["role"] for m in second["messages"][2:]] == ["assistant", "tool", "tool"]
     assert [i.message["role"] for i in items(events)] == ["tool", "assistant"]
-    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+    # The resume continues the turn: its request is the turn's second step.
+    assert of(events, "request.start") == [{"step": 2, "attempt": 1}]
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
 
 
 async def test_deny_sends_the_reason_to_the_model_without_running_the_tool(loop):
@@ -412,8 +414,11 @@ async def test_crash_resume_rechecks_open_calls(loop):
     tools = StubTools({"write_file": "ask"})
     with SSEServer(Reply([*text("done"), done()])) as srv:
         events = await run(loop, turn(history, config(srv), resume=Resume("crash")), tools)
-        assert of(events, "turn.end") == [{"stop": "paused", "steps": 0, "pending": ["c2"]}]
-        assert tools.runs == []
+        # As the first run would have: the allowed call runs, the other one is asked again.
+        assert of(events, "permission.asked")[0]["call_id"] == "c2"
+        assert of(events, "turn.end") == [{"stop": "paused", "steps": 1, "pending": ["c2"]}]
+        assert [c.id for c in tools.runs] == ["c1"]
+        history += items(events)
 
         approve = Resume("approval", {"c2": "allow"})
         events = await run(loop, turn(history, config(srv), resume=approve), tools)
@@ -889,3 +894,110 @@ async def test_a_dropped_stream_or_an_error_event_is_retried(
     assert retry["reason"].lower().startswith(reason)  # 3.x wraps some: "Connection error."
     assert [i.message["content"] for i in items(events)] == ["Hi again!"]
     assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+
+
+def _write_then_stall() -> Reply:
+    call = tool_call(0, "w1", "write_file", '{"path": "a", "content": "x"}')
+    return Reply([*text("Writing it."), *call], stall=True)
+
+
+async def _cancelled_write(loop: PydanticLoop, srv: SSEServer, tools: StubTools) -> list[Item]:
+    """A turn whose response (a complete write call) is cut short by a cancel."""
+    cancel = asyncio.Event()
+    events = []
+    async for event in loop.run_turn(turn([user("write a")], config(srv)), tools, cancel):
+        events.append(event)
+        if event.type == "text.delta":
+            asyncio.get_running_loop().call_later(0.2, cancel.set)
+    assert of(events, "turn.end")[0]["stop"] == "cancelled"
+    return items(events)
+
+
+async def test_a_crash_after_a_cancel_never_runs_the_cancelled_call(loop):
+    """Rule 6 across a crash: the worker dies after the cut-off response is saved and before its
+    closing result is. The crash resume closes the call from the history (the response is
+    `interrupted`), finishes the cancel and sends nothing."""
+    tools = StubTools()
+    with SSEServer(_write_then_stall()) as srv:
+        cut, closing = await _cancelled_write(loop, srv, tools)
+        assert cut.status == "incomplete" and cut.message["tool_calls"][0]["id"] == "w1"
+        history = [user("write a"), cut]  # SIGKILL before the closing item was saved
+        fresh = PydanticLoop()
+        events = await run(fresh, turn(history, config(srv), resume=Resume("crash")), tools)
+        await fresh.aclose()
+
+    assert tools.runs == []
+    assert [i.message for i in items(events)] == [closing.message]
+    assert of(events, "turn.end") == [{"stop": "cancelled", "steps": 1}]
+    assert len(srv.bodies) == 1  # no request after the resume
+
+
+async def test_a_crash_after_the_final_answer_sends_nothing_more(loop):
+    tools = StubTools()
+    replies = [Reply([*tool_call(0, "c1", "read_file", '{"path": "a"}'), done("tool_calls")])]
+    with SSEServer(*replies, Reply([*text("All done."), done()])) as srv:
+        events = await run(loop, turn([user("go")], config(srv)), tools)
+        history = [user("go"), *items(events)]  # SIGKILL after the answer, before the turn closed
+        resumed = await run(loop, turn(history, config(srv), resume=Resume("crash")), tools)
+
+    assert len(srv.bodies) == 2
+    assert (of(resumed, "item"), of(resumed, "turn.end")) == (
+        [],
+        [{"stop": "end_turn", "steps": 2}],
+    )
+
+
+async def test_a_partial_approval_runs_what_was_decided_and_asks_for_the_rest(loop):
+    """The user answers only c1. c1 runs now (its answer is not lost), c2 is asked again, and
+    answering c2 finishes the turn: each call runs once."""
+    tools = StubTools({"write_file": "ask"})
+    calls = tool_call(0, "c1", "write_file", '{"path": "a", "content": "x"}') + tool_call(
+        1, "c2", "write_file", '{"path": "b", "content": "y"}'
+    )
+    with SSEServer(Reply([*calls, done("tool_calls")]), Reply([*text("ok"), done()])) as srv:
+        first = await run(loop, turn([user("go")], config(srv)), tools)
+        assert of(first, "turn.end")[0]["pending"] == ["c1", "c2"]
+        history = [user("go"), *items(first)]
+        partial = Resume("approval", {"c1": "allow"})
+        second = await run(loop, turn(history, config(srv), resume=partial), tools)
+        assert [c.id for c in tools.runs] == ["c1"]
+        assert of(second, "permission.asked")[0]["call_id"] == "c2"
+        assert of(second, "turn.end") == [{"stop": "paused", "steps": 1, "pending": ["c2"]}]
+        history += items(second)
+        rest = Resume("approval", {"c2": "allow"})
+        third = await run(loop, turn(history, config(srv), resume=rest), tools)
+
+    assert [c.id for c in tools.runs] == ["c1", "c2"]
+    assert of(third, "turn.end")[0]["stop"] == "end_turn"
+    tool_ids = [m.get("tool_call_id") for m in srv.requests[1]["messages"] if m["role"] == "tool"]
+    assert tool_ids == ["c1", "c2"]
+
+
+@pytest.mark.parametrize("limit", ["max_steps", "max_cost_usd"])
+async def test_a_crash_resume_continues_the_step_cap_and_the_budget(loop, limit):
+    """The steps and cost a turn spent before a crash count after it: with a cap of 3 steps (or
+    $0.0025 at $0.001 a step), a turn that crashed after 2 steps makes exactly one more request."""
+
+    def step(n: int) -> Reply:
+        call = tool_call(0, f"c{n}", "read_file", '{"path": "a"}')
+        return Reply([*call, done("tool_calls", cost=0.001)])
+
+    limits = Limits(max_steps=3) if limit == "max_steps" else Limits(max_cost_usd=0.0025)
+    tools = StubTools()
+    with SSEServer(*[step(n) for n in range(6)]) as srv:
+        history = [user("go")]
+        stream = loop.run_turn(turn(history, config(srv), limits=limits), tools, asyncio.Event())
+        async with contextlib.aclosing(stream):
+            async for event in stream:
+                if event.type == "item":
+                    history.append(items([event])[0])
+                    if event.data["item"].message.get("tool_call_id") == "c1":
+                        break  # SIGKILL after step 2's result is saved
+        resumed = await run(
+            loop, turn(history, config(srv), resume=Resume("crash"), limits=limits), tools
+        )
+
+    assert len(srv.bodies) == 3
+    assert of(resumed, "request.start") == [{"step": 3, "attempt": 1}]
+    stop = "max_steps" if limit == "max_steps" else "budget"
+    assert of(resumed, "turn.end") == [{"stop": stop, "steps": 3}]

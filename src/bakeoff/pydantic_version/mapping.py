@@ -26,6 +26,7 @@ from pydantic_ai import (
 )
 from pydantic_ai.messages import INTERRUPTED_TOOL_RETURN_CONTENT
 from pydantic_ai.profiles import DEFAULT_THINKING_TAGS
+from pydantic_ai.usage import RunUsage
 
 from bakeoff.shared.contract import Item
 
@@ -121,6 +122,49 @@ def close_pending(history: list[ModelMessage]) -> list[ModelMessage]:
         for call in pending_calls(history)
     ]
     return [ModelRequest(parts=parts)] if parts else []
+
+
+def close_abandoned(history: list[ModelMessage]) -> list[ModelMessage]:
+    """Results for open calls that must never run: a cancel (or a failed stream) cut their
+    response short, or the user sent a new message instead of answering the pause. Decided from
+    the history alone, so a crash resume cannot run what a cancel stopped."""
+    for index in range(len(history) - 1, -1, -1):
+        if isinstance(response := history[index], ModelResponse):
+            later = [part for message in history[index + 1 :] for part in message.parts]
+            moved_on = any(isinstance(part, UserPromptPart) for part in later)
+            return close_pending(history) if response.state == "interrupted" or moved_on else []
+    return []
+
+
+def this_turn(history: list[ModelMessage]) -> list[ModelMessage]:
+    """The messages since the user's last message: what a resumed turn continues."""
+    for index in range(len(history) - 1, -1, -1):
+        if any(isinstance(part, UserPromptPart) for part in history[index].parts):
+            return history[index + 1 :]
+    return history
+
+
+def spent(history: list[ModelMessage]) -> RunUsage:
+    """What the turn already used before a resume: its responses (steps) and their cost."""
+    usage = RunUsage()
+    for message in this_turn(history):
+        if isinstance(message, ModelResponse):
+            usage.requests += 1
+            usage.incr(message.usage)
+    return usage
+
+
+def finished(history: list[ModelMessage]) -> str | None:
+    """How the turn ended if its end is already saved (a crash came after it): "end_turn" after
+    the final answer, "cancelled" after a response cut short (a cancel, or a failed stream that
+    ended the turn). None if the turn goes on."""
+    turn = this_turn(history)
+    response = next((m for m in reversed(turn) if isinstance(m, ModelResponse)), None)
+    if response is not None and response.state == "interrupted":
+        return "cancelled"
+    if turn and turn[-1] is response and not response.tool_calls:
+        return "end_turn"
+    return None
 
 
 def _tool(call_id: str, content: str) -> dict[str, Any]:
