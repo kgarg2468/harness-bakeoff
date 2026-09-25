@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 432" width="880" height="432" role="img" aria-labelledby="t d">
+  <title id="t">One agent harness, built twice</title>
+  <desc id="d">Two loop folders sit on top and are the only code that is counted: A, pydantic_version, the loop on pydantic-ai with Agent.iter and deferred tools, used the way its docs recommend; and B, our_version, our own latency-optimized loop on raw httpx with some pieces ported from Pi. Both implement one seam, shared/contract.py: a loop gets the history and the tools, and only yields events. Everything under the seam is shared and identical for both, and not counted. What runs a turn: the runner, the session log, the git working copy, the RocketRide tools, the permission rules and the skills. What judges it: the fake model server, 22 scenarios, the invariants I1 to I7, the metrics and the report page.</desc>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+  </defs>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+    .panel { fill: #FFFFFF; stroke: #D0D7DE; }
+    .grp   { fill: #F6F8FA; stroke: #D0D7DE; stroke-width: 1.2; }
+    .chip  { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1.1; }
+    .seam  { fill: #FFFFFF; stroke: #59636E; stroke-width: 1.6; }
+    .abox  { fill: #F3EFFD; stroke: #6A3FD1; stroke-width: 2; }
+    .bbox  { fill: #E8F6F7; stroke: #0F7C86; stroke-width: 2; }
+    .adot  { fill: #6A3FD1; }
+    .bdot  { fill: #0F7C86; }
+    .at    { fill: #6A3FD1; }
+    .bt    { fill: #0F7C86; }
+    .let   { font-size: 15px; font-weight: 700; fill: #FFFFFF; }
+    .t1    { font-size: 17px; font-weight: 650; }
+    .h     { font-size: 14.5px; font-weight: 600; fill: #1F2328; }
+    .s     { font-size: 13px; fill: #59636E; }
+    .c     { font-size: 12.5px; fill: #1F2328; }
+    .sec   { font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em; fill: #59636E; }
+    .line  { stroke: #8C959F; stroke-width: 1.8; fill: none; }
+    .head  { fill: #8C959F; }
+    .div   { stroke: #D0D7DE; stroke-width: 1.2; stroke-dasharray: 6 6; }
+    @media (prefers-color-scheme: dark) {
+      .panel { fill: #0D1117; stroke: #3D444D; }
+      .grp   { fill: #161B22; stroke: #3D444D; }
+      .chip  { fill: #0D1117; stroke: #6E7681; }
+      .seam  { fill: #0D1117; stroke: #9198A1; }
+      .abox  { fill: #1D1633; stroke: #A48AF0; }
+      .bbox  { fill: #0B2427; stroke: #3AB7C1; }
+      .adot  { fill: #8B6CE8; }
+      .bdot  { fill: #1C98A3; }
+      .at    { fill: #B9A3F7; }
+      .bt    { fill: #5CC8D1; }
+      .h, .c { fill: #E6EDF3; }
+      .s, .sec { fill: #9198A1; }
+      .line  { stroke: #6E7681; }
+      .head  { fill: #6E7681; }
+      .div   { stroke: #3D444D; }
+    }
+  </style>
+
+  <rect class="panel" x="0.5" y="0.5" width="879" height="431" rx="12"/>
+
+  <!-- counted: the two loops -->
+  <text class="sec" x="24" y="32">COUNTED · THE LOOP, BUILT TWICE</text>
+
+  <rect class="abox" x="24" y="44" width="404" height="108" rx="8"/>
+  <circle class="adot" cx="56" cy="77" r="16"/>
+  <text class="let" x="56" y="82" text-anchor="middle">A</text>
+  <text class="t1 at" x="84" y="77">pydantic-ai</text>
+  <text class="s mono" x="84" y="100">src/bakeoff/pydantic_version/</text>
+  <text class="s" x="84" y="121">Agent.iter() and deferred tools,</text>
+  <text class="s" x="84" y="140">used the way its docs recommend</text>
+
+  <rect class="bbox" x="452" y="44" width="404" height="108" rx="8"/>
+  <circle class="bdot" cx="484" cy="77" r="16"/>
+  <text class="let" x="484" y="82" text-anchor="middle">B</text>
+  <text class="t1 bt" x="512" y="77">our own loop</text>
+  <text class="s mono" x="512" y="100">src/bakeoff/our_version/</text>
+  <text class="s" x="512" y="121">raw httpx, built for low latency,</text>
+  <text class="s" x="512" y="140">some pieces ported from Pi</text>
+
+  <line class="line" x1="226" y1="152" x2="226" y2="176" marker-end="url(#ah)"/>
+  <line class="line" x1="654" y1="152" x2="654" y2="176" marker-end="url(#ah)"/>
+
+  <!-- the seam -->
+  <rect class="seam" x="24" y="180" width="832" height="50" rx="8"/>
+  <text class="h mono" x="44" y="210">shared/contract.py</text>
+  <text class="s" x="232" y="210">the one seam: a loop gets the history and the tools, and only yields events</text>
+
+  <line class="div" x1="24" y1="250" x2="856" y2="250"/>
+
+  <!-- shared, not counted -->
+  <text class="sec" x="24" y="274">SHARED · IDENTICAL FOR BOTH, NOT COUNTED</text>
+
+  <rect class="grp" x="24" y="286" width="832" height="48" rx="8"/>
+  <text class="sec" x="40" y="315">RUNS A TURN</text>
+  <rect class="chip" x="160" y="296" width="64" height="28" rx="6"/><text class="c" x="192" y="315" text-anchor="middle">runner</text>
+  <rect class="chip" x="232" y="296" width="100" height="28" rx="6"/><text class="c" x="282" y="315" text-anchor="middle">session log</text>
+  <rect class="chip" x="340" y="296" width="136" height="28" rx="6"/><text class="c" x="408" y="315" text-anchor="middle">git working copy</text>
+  <rect class="chip" x="484" y="296" width="136" height="28" rx="6"/><text class="c" x="552" y="315" text-anchor="middle">RocketRide tools</text>
+  <rect class="chip" x="628" y="296" width="104" height="28" rx="6"/><text class="c" x="680" y="315" text-anchor="middle">permissions</text>
+  <rect class="chip" x="740" y="296" width="64" height="28" rx="6"/><text class="c" x="772" y="315" text-anchor="middle">skills</text>
+
+  <rect class="grp" x="24" y="342" width="832" height="48" rx="8"/>
+  <text class="sec" x="40" y="371">JUDGES IT</text>
+  <rect class="chip" x="160" y="352" width="144" height="28" rx="6"/><text class="c" x="232" y="371" text-anchor="middle">fake model server</text>
+  <rect class="chip" x="312" y="352" width="106" height="28" rx="6"/><text class="c" x="365" y="371" text-anchor="middle">22 scenarios</text>
+  <rect class="chip" x="426" y="352" width="136" height="28" rx="6"/><text class="c" x="494" y="371" text-anchor="middle">invariants I1–I7</text>
+  <rect class="chip" x="570" y="352" width="76" height="28" rx="6"/><text class="c" x="608" y="371" text-anchor="middle">metrics</text>
+  <rect class="chip" x="654" y="352" width="104" height="28" rx="6"/><text class="c" x="706" y="371" text-anchor="middle">report page</text>
+
+  <text class="s" x="440" y="415" text-anchor="middle">Swap one loop folder for the other and nothing else changes, so the numbers compare only the loop.</text>
+</svg>

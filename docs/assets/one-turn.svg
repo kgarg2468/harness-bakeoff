@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 430" width="880" height="430" role="img" aria-labelledby="t d">
+  <title id="t">How one turn runs</title>
+  <desc id="d">Your message arrives. The loop builds a request from the full history and streams the model's answer: text and tool calls. The shared runner saves each new item to the session log and emits an event. If there are no tool calls, the turn ends with one git commit. If there are tool calls, the shared permission rules check each one: allow, ask or deny. Allowed calls run, their results are saved, and the loop takes the next step with the longer history. A call that needs approval pauses the turn until a person approves or denies it, later and even from another process, and then the turn resumes. A denied call never runs; the model gets the reason as its result. If the worker crashes, bakeoff resume rebuilds the turn from the saved log, and a tool whose result was saved never runs twice. Boxes with a violet-to-teal border are the loop's own code, A or B; grey boxes are shared.</desc>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+    <linearGradient id="ab" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" class="ga"/>
+      <stop offset="1" class="gb"/>
+    </linearGradient>
+  </defs>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+    .panel { fill: #FFFFFF; stroke: #D0D7DE; }
+    .box   { fill: #F6F8FA; stroke: #8C959F; stroke-width: 1.2; }
+    .lbox  { fill: #FFFFFF; stroke: url(#ab); stroke-width: 2.2; }
+    .note  { fill: none; stroke: #8C959F; stroke-width: 1.2; stroke-dasharray: 4 4; }
+    .ga    { stop-color: #6A3FD1; }
+    .gb    { stop-color: #0F7C86; }
+    .h     { font-size: 14.5px; font-weight: 600; fill: #1F2328; }
+    .s     { font-size: 12.5px; fill: #59636E; }
+    .lab   { font-size: 12px; font-weight: 600; fill: #59636E; }
+    .sec   { font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em; fill: #59636E; }
+    .line  { stroke: #8C959F; stroke-width: 1.8; fill: none; }
+    .dot   { stroke: #8C959F; stroke-width: 1.6; fill: none; stroke-dasharray: 2 5; stroke-linecap: round; }
+    .head  { fill: #8C959F; }
+    @media (prefers-color-scheme: dark) {
+      .panel { fill: #0D1117; stroke: #3D444D; }
+      .box   { fill: #161B22; stroke: #6E7681; }
+      .lbox  { fill: #0D1117; }
+      .note  { stroke: #6E7681; }
+      .ga    { stop-color: #A48AF0; }
+      .gb    { stop-color: #3AB7C1; }
+      .h     { fill: #E6EDF3; }
+      .s, .lab, .sec { fill: #9198A1; }
+      .line  { stroke: #6E7681; }
+      .dot   { stroke: #6E7681; }
+      .head  { fill: #6E7681; }
+    }
+  </style>
+
+  <rect class="panel" x="0.5" y="0.5" width="879" height="429" rx="12"/>
+
+  <!-- header + legend -->
+  <text class="sec" x="24" y="32">ONE TURN</text>
+  <rect class="lbox" x="584" y="21" width="24" height="14" rx="3"/>
+  <text class="s" x="616" y="32">the loop (A or B)</text>
+  <rect class="box" x="752" y="21" width="24" height="14" rx="3"/>
+  <text class="s" x="784" y="32">shared</text>
+
+  <!-- entry -->
+  <text class="s" x="103" y="55" text-anchor="middle">your message</text>
+  <line class="line" x1="103" y1="60" x2="103" y2="76" marker-end="url(#ah)"/>
+
+  <!-- row 1 -->
+  <rect class="lbox" x="24" y="80" width="158" height="64" rx="8"/>
+  <text class="h" x="103" y="107" text-anchor="middle">Build request</text>
+  <text class="s" x="103" y="127" text-anchor="middle">from the full history</text>
+  <line class="line" x1="182" y1="112" x2="206" y2="112" marker-end="url(#ah)"/>
+
+  <rect class="lbox" x="210" y="80" width="178" height="64" rx="8"/>
+  <text class="h" x="299" y="107" text-anchor="middle">Stream the model</text>
+  <text class="s" x="299" y="127" text-anchor="middle">text + tool calls</text>
+  <line class="line" x1="388" y1="112" x2="412" y2="112" marker-end="url(#ah)"/>
+
+  <rect class="box" x="416" y="80" width="162" height="64" rx="8"/>
+  <text class="h" x="497" y="107" text-anchor="middle">Save + emit</text>
+  <text class="s" x="497" y="127" text-anchor="middle">session log, events</text>
+
+  <line class="line" x1="578" y1="112" x2="672" y2="112" marker-end="url(#ah)"/>
+  <text class="lab" x="625" y="104" text-anchor="middle">no tool calls</text>
+
+  <rect class="box" x="676" y="80" width="180" height="64" rx="8"/>
+  <text class="h" x="766" y="107" text-anchor="middle">Turn ends</text>
+  <text class="s" x="766" y="127" text-anchor="middle">then one git commit</text>
+
+  <!-- row 2 -->
+  <line class="line" x1="497" y1="144" x2="497" y2="196" marker-end="url(#ah)"/>
+  <text class="lab" x="505" y="174">tool calls</text>
+
+  <rect class="box" x="416" y="200" width="162" height="64" rx="8"/>
+  <text class="h" x="497" y="227" text-anchor="middle">Permission check</text>
+  <text class="s" x="497" y="247" text-anchor="middle">allow · ask · deny</text>
+
+  <line class="line" x1="416" y1="232" x2="340" y2="232" marker-end="url(#ah)"/>
+  <text class="lab" x="377" y="224" text-anchor="middle">allow</text>
+
+  <rect class="box" x="146" y="200" width="190" height="64" rx="8"/>
+  <text class="h" x="241" y="227" text-anchor="middle">Run the tool</text>
+  <text class="s" x="241" y="247" text-anchor="middle">its result is saved too</text>
+
+  <path class="line" d="M146,232 H103 V148" marker-end="url(#ah)"/>
+  <text class="lab" x="95" y="196" text-anchor="end">next step</text>
+
+  <!-- row 3: approval -->
+  <line class="line" x1="497" y1="264" x2="497" y2="306" marker-end="url(#ah)"/>
+  <text class="lab" x="505" y="289">ask</text>
+
+  <rect class="box" x="416" y="310" width="162" height="64" rx="8"/>
+  <text class="h" x="497" y="337" text-anchor="middle">Pause</text>
+  <text class="s" x="497" y="357" text-anchor="middle">waits for a person</text>
+
+  <line class="line" x1="416" y1="342" x2="340" y2="342" marker-end="url(#ah)"/>
+
+  <rect class="box" x="146" y="310" width="190" height="64" rx="8"/>
+  <text class="h" x="241" y="337" text-anchor="middle">Approve or deny</text>
+  <text class="s" x="241" y="357" text-anchor="middle">later, from any process</text>
+
+  <line class="line" x1="241" y1="310" x2="241" y2="268" marker-end="url(#ah)"/>
+  <text class="lab" x="249" y="293">resume</text>
+
+  <!-- notes -->
+  <rect class="note" x="612" y="196" width="244" height="92" rx="8"/>
+  <text class="h" x="630" y="221">If the worker crashes</text>
+  <text class="s" x="630" y="242"><tspan class="mono">bakeoff resume</tspan> rebuilds the</text>
+  <text class="s" x="630" y="260">turn from the saved log; a saved</text>
+  <text class="s" x="630" y="278">tool result never runs twice</text>
+  <path class="dot" d="M672,196 C 672,168 614,160 582,148"/>
+
+  <rect class="note" x="612" y="302" width="244" height="76" rx="8"/>
+  <text class="h" x="630" y="327">If a call is denied</text>
+  <text class="s" x="630" y="348">it never runs; the model gets</text>
+  <text class="s" x="630" y="366">the reason as its result</text>
+  <line class="dot" x1="612" y1="342" x2="584" y2="342"/>
+
+  <text class="s" x="440" y="412" text-anchor="middle">Approval and crash resume are one code path: rebuild from the saved history, then carry on.</text>
+</svg>
