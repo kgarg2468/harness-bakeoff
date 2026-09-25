@@ -1,0 +1,59 @@
+[project]
+name = "harness-bakeoff"
+version = "0.1.0"
+description = "The same agent harness twice: once on pydantic-ai, once on a lean hand-written Python loop."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+# Runtime deps are pinned to the exact versions inside the RocketRide engine bundle,
+# so "our_version" adds nothing the engine does not already ship.
+dependencies = [
+    "httpx==0.28.1",
+    "jsonschema==4.26.0",
+]
+
+[project.optional-dependencies]
+# pydantic-ai 2.31.1 is the newest release that can share one environment with the
+# engine: 2.32+ needs openai>=3, but the engine's crewai node needs openai<3.
+# CI also runs the suite against the latest pydantic-ai (see .github/workflows/ci.yml).
+pydantic = [
+    "pydantic-ai-slim[openai,openrouter]==2.31.1",
+    "openai==2.54.0",
+    "pydantic==2.12.5",
+]
+
+[project.scripts]
+bakeoff = "bakeoff.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.16.9",
+    "coverage==7.16.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bakeoff"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "RUF"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.coverage.run]
+branch = true
+source = ["src/bakeoff"]
