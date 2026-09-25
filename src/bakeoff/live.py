@@ -2,8 +2,9 @@
 
 Same machinery as the scenarios (Runner, SessionLog, WorkCopy, ToolHost on MockEngine); only the
 model endpoint is real. The API key comes from the environment or an env file, lives only in
-memory, and is never printed or stored (the runner keeps the model config without it). The
-network guard allows loopback plus the endpoint's own host, nothing else.
+memory, and is never printed or stored (the runner keeps the model config without it). It is
+sent only over https to api.openai.com, or to a host the command line names with `--key-host`.
+The network guard allows loopback plus the endpoint's own host, nothing else.
 
 A live run writes `out/live/<run_id>/<impl>/` with log.sqlite, events.ndjson, wc/ and result.json.
 """
@@ -20,7 +21,7 @@ import signal
 import socket
 import sys
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TextIO
@@ -44,6 +45,7 @@ from bakeoff.shared.scenario import (
 )
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
+OPENAI_HOST = "api.openai.com"  # the one host that gets the key without --key-host
 KEY_NAME = "OPENAI_API_KEY"
 ENV_FILE_VAR = "BAKEOFF_ENV_FILE"
 LIVE_RULES = {"*": "allow"}
@@ -73,27 +75,44 @@ def is_loopback(url: str) -> bool:
 
 
 def read_env_key(path: Path, name: str = KEY_NAME) -> str | None:
-    """The value of `name` in a dotenv file (`KEY=value`, optional `export` and quotes), or
-    None. Only that one key is read; nothing is put into the environment."""
+    """The value of `name` in a dotenv file (`KEY=value`, optional `export`, quotes and a
+    trailing ` # comment`), or None. Only that one key is read; nothing is put into the
+    environment."""
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip().removeprefix("export ").lstrip()
         key, sep, value = line.partition("=")
         if line.startswith("#") or not sep or key.strip() != name:
             continue
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
+        quote = value[:1]
+        if quote in ("'", '"') and (end := value.find(quote, 1)) > 0:
+            value = value[1:end]  # a quoted value ends at its closing quote; a comment may follow
         else:
             value = value.split(" #", 1)[0].strip()
         return value or None
     return None
 
 
-def resolve_api_key(base_url: str, env_file: Path | None = None) -> str:
+def resolve_api_key(
+    base_url: str, env_file: Path | None = None, *, key_hosts: Sequence[str] = ()
+) -> str:
     """The key for `base_url`: a dummy for the local fake provider; otherwise `--env-file`, then
-    OPENAI_API_KEY in the environment, then the file named by BAKEOFF_ENV_FILE."""
+    OPENAI_API_KEY in the environment, then the file named by BAKEOFF_ENV_FILE.
+
+    A real key goes only over https, and only to api.openai.com or a host in `key_hosts` (from
+    the command line), so neither a typo in `--base-url` nor a session log that names another
+    endpoint can send it elsewhere. Raises LiveError otherwise."""
     if is_loopback(base_url):
         return "dummy"
+    parts = urlsplit(base_url)
+    host = (parts.hostname or "").lower()
+    if host != OPENAI_HOST and host not in {h.lower() for h in key_hosts}:
+        raise LiveError(
+            f"refusing to send {KEY_NAME} to {host or base_url!r}: it goes only to {OPENAI_HOST}"
+            f" unless the command says --key-host {host or '<host>'}"
+        )
+    if parts.scheme != "https":
+        raise LiveError(f"refusing to send {KEY_NAME} without https: {base_url}")
     key = read_env_key(env_file) if env_file is not None else None
     key = key or os.environ.get(KEY_NAME)
     if not key and (path := os.environ.get(ENV_FILE_VAR)):
@@ -222,18 +241,64 @@ class Printer:
             self._line(f"[commit {data['sha'][:10]}: {', '.join(data['files']) or 'no files'}]")
 
 
-def stdin_ask(out: TextIO) -> Ask:
-    """Prompt on `out` and read a line from stdin without blocking the event loop."""
+def stdin_ask(out: TextIO, stdin: TextIO | None = None) -> Ask:
+    """Prompt on `out` and read a line from stdin without blocking the event loop.
+
+    End of input and Ctrl-C at the prompt raise EOFError: the caller ends the chat (or the
+    approval) cleanly. The read is non-blocking (`add_reader`), so no thread is left stuck in
+    `readline()` that `asyncio.run` would wait for at exit."""
+    source = stdin or sys.stdin
+    pending = bytearray()  # bytes read past the last line, for the next prompt
 
     async def ask(prompt: str) -> str:
         out.write(prompt)
         out.flush()
-        line = await asyncio.to_thread(sys.stdin.readline)
-        if not line:
-            raise EOFError
-        return line.rstrip("\n")
+        aio = asyncio.get_running_loop()
+        stop = aio.create_future()
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            aio.add_signal_handler(signal.SIGINT, _wake, stop)
+        try:
+            return await _read_line(source.fileno(), pending, stop)
+        finally:
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                aio.remove_signal_handler(signal.SIGINT)
 
     return ask
+
+
+def _wake(future: asyncio.Future[None]) -> None:
+    if not future.done():
+        future.set_result(None)
+
+
+async def _read_line(fd: int, pending: bytearray, stop: asyncio.Future[None]) -> str:
+    """The next line from `fd` (without its newline). Raises EOFError at end of input or when
+    `stop` is set first."""
+    aio = asyncio.get_running_loop()
+    while b"\n" not in pending:
+        readable = aio.create_future()
+        try:
+            aio.add_reader(fd, _wake, readable)
+        except (NotImplementedError, OSError, ValueError):
+            # Regular files never block; elsewhere (Windows) a thread has to wait for input.
+            chunk = await asyncio.to_thread(os.read, fd, 4096)
+        else:
+            try:
+                await asyncio.wait({readable, stop}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                aio.remove_reader(fd)
+            if stop.done():
+                raise EOFError("interrupted")
+            chunk = os.read(fd, 4096)
+        if not chunk:
+            if not pending:
+                raise EOFError("end of input")
+            pending += b"\n"  # a last line without its newline
+            break
+        pending += chunk
+    line, _, rest = bytes(pending).partition(b"\n")
+    pending[:] = rest
+    return line.decode(errors="replace").rstrip("\r")
 
 
 # --- one live thread ---------------------------------------------------------------------------------
@@ -422,6 +487,22 @@ class LiveThread:
         finally:
             self.captured.append(captured)
 
+    async def finish(
+        self, run_id: str, prompt: str, started: float, error: str | None
+    ) -> dict[str, Any]:
+        """Close the loop, write result.json and close the log; also after a failure or an
+        interrupt, so every live run leaves its result. Returns the result."""
+        try:
+            try:
+                await self.close_loop()
+            finally:
+                duration_ms = round((time.perf_counter() - started) * 1000, 1)
+                result = self.result(run_id, prompt, duration_ms, error)
+                write_json(self.dir / "result.json", result)
+        finally:
+            self.ws.close()
+        return result
+
 
 def latency(events: list[dict[str, Any]]) -> dict[str, float | None]:
     """Time to first token (first model output of the first turn, from its start) and the total
@@ -449,10 +530,13 @@ async def run_live(
     ask: Ask | None = None,
 ) -> list[dict[str, Any]]:
     """Run `prompt` once per impl, one after the other, streaming to `term`. With `ask`,
-    writes need approval; without it, the rules allow everything. Returns the results."""
+    writes need approval; without it, the rules allow everything. Returns the results.
+    Raises LiveError before anything runs if a run directory already exists."""
+    impls = list(dict.fromkeys(impls))  # each loop once: its thread id is `live-<impl>`
+    directories = {impl: fresh_dir(out / "live" / run_id / impl) for impl in impls}
     results = []
     for impl in impls:
-        directory = out / "live" / run_id / impl
+        directory = directories[impl]
         term.write(f"\n== {impl} ({loops.REGISTRY[impl].target}) model {model.model}\n")
         term.write(f"   {directory}\n\n> {prompt}\n")
         term.flush()
@@ -460,21 +544,25 @@ async def run_live(
         thread = LiveThread(impl, directory, model, term, rules=rules, max_steps=max_steps)
         started, error = time.perf_counter(), None
         try:
-            try:
-                await thread.converse(prompt, ask)
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                term.write(f"\n[{impl} failed: {error}]\n")
-            finally:
-                await thread.close_loop()
-            duration_ms = round((time.perf_counter() - started) * 1000, 1)
-            result = thread.result(run_id, prompt, duration_ms, error)
+            await thread.converse(prompt, ask)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            term.write(f"\n[{impl} failed: {error}]\n")
+        except BaseException as exc:  # Ctrl-C: record the run so far, then stop
+            error = f"interrupted ({type(exc).__name__})"
+            raise
         finally:
-            thread.ws.close()
-        write_json(directory / "result.json", result)
-        results.append(result)
-    point_latest(out / "live", run_id)
+            results.append(await thread.finish(run_id, prompt, started, error))
+            point_latest(out / "live", run_id)
     return results
+
+
+def fresh_dir(directory: Path) -> Path:
+    """`directory`, which must not exist yet: a live run never overwrites an earlier one
+    (it cost real tokens) and never reuses its thread."""
+    if directory.exists():
+        raise LiveError(f"{directory} already exists: pick another --run-id")
+    return directory
 
 
 def format_side_by_side(results: list[dict[str, Any]]) -> str:
@@ -524,34 +612,31 @@ async def chat(
     max_steps: int = 12,
 ) -> dict[str, Any]:
     """An interactive REPL on one thread: each line is a user turn; writes ask for approval.
-    `/revert N` undoes turn N, `/compact TEXT` compacts, `/exit` (or EOF) quits."""
-    directory = out / "live" / run_id / impl
+    `/revert N` undoes turn N, `/compact TEXT` compacts, `/exit`, end of input or Ctrl-C at a
+    prompt quits (Ctrl-C during a turn cancels the turn)."""
+    directory = fresh_dir(out / "live" / run_id / impl)
     thread = LiveThread(impl, directory, model, term, rules=ASK_RULES, max_steps=max_steps)
     term.write(f"chat with {impl} on {model.model}; thread {thread.thread_id} in {directory}\n")
     term.write("/revert N, /compact TEXT, /exit\n")
-    started = time.perf_counter()
+    started, error = time.perf_counter(), None
     try:
-        try:
-            while True:
-                try:
-                    line = (await ask("\n> ")).strip()
-                except EOFError:
-                    break
+        while True:
+            try:
+                line = (await ask("\n> ")).strip()
                 if line in ("/exit", "/quit"):
                     break
                 if line:
-                    try:
-                        await _chat_line(thread, line, ask)
-                    except (RuntimeError, ValueError, KeyError, IndexError) as exc:
-                        term.write(f"[{exc}]\n")
-        finally:
-            await thread.close_loop()
-        duration_ms = round((time.perf_counter() - started) * 1000, 1)
-        result = thread.result(run_id, "(chat)", duration_ms, None)
+                    await _chat_line(thread, line, ask)
+            except EOFError:  # end of input, or Ctrl-C at a prompt
+                break
+            except (RuntimeError, ValueError, KeyError, IndexError) as exc:
+                term.write(f"[{exc}]\n")
+    except BaseException as exc:
+        error = f"interrupted ({type(exc).__name__})"
+        raise
     finally:
-        thread.ws.close()
-    write_json(directory / "result.json", result)
-    point_latest(out / "live", run_id)
+        result = await thread.finish(run_id, "(chat)", started, error)
+        point_latest(out / "live", run_id)
     return result
 
 

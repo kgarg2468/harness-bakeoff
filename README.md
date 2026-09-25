@@ -54,14 +54,18 @@ out/runs/latest -> <run_id>
 
 Live runs talk to a real OpenAI-compatible endpoint (OpenAI by default). The key is
 `OPENAI_API_KEY` from the environment, or from an env file (`--env-file` or `BAKEOFF_ENV_FILE`)
-that the code reads; it is never printed or stored. The network guard allows only loopback and
-the endpoint's host.
+that the code reads; it is never printed or stored. It goes only over https, and only to
+`api.openai.com` or a host named with `--key-host HOST` on the command line (never to a host that
+only a session log names). The network guard allows only loopback and the endpoint's host.
 
 ```bash
 bakeoff live --impl our,pydantic --model gpt-6-luna --reasoning none --max-steps 8 \
     --prompt "Build a chat pipeline, save it as chat.pipe, and validate it."
 bakeoff chat --impl our            # REPL: approvals prompted, /revert N, /compact TEXT, /exit
 ```
+
+In `chat`, Ctrl-C during a turn cancels the turn, and at a prompt it ends the chat. A run id is
+never reused: `out/live/<run_id>/<impl>` must not exist yet.
 
 `live` streams each loop's run (text inline, tool calls and results on one line each), then
 prints tokens, time to first token, total time and steps side by side, and writes

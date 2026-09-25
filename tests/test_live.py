@@ -3,9 +3,16 @@ network helpers, and CLI argument parsing."""
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import os
+import signal
 import socket
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +21,8 @@ import pytest
 from bakeoff import live, loops
 from bakeoff.cli import build_parser, main
 from bakeoff.fakeprov.server import FakeProvider
+from bakeoff.shared.contract import ModelConfig
+from bakeoff.shared.scenario import Workspace
 from bakeoff.shared.sessionlog import SessionLog
 
 PIPELINE = {
@@ -208,6 +217,10 @@ def test_read_env_key(tmp_path: Path) -> None:
     assert live.read_env_key(env) == "test-key-123"
     env.write_text("OPENAI_API_KEY=plain-value # trailing comment\n")
     assert live.read_env_key(env) == "plain-value"
+    env.write_text('OPENAI_API_KEY="quoted-value" # personal key\n')
+    assert live.read_env_key(env) == "quoted-value"
+    env.write_text("OPENAI_API_KEY='has # inside' # comment\n")
+    assert live.read_env_key(env) == "has # inside"
     env.write_text("OPENAI_API_KEY=\n")
     assert live.read_env_key(env) is None
 
@@ -228,10 +241,117 @@ def test_resolve_api_key_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert live.resolve_api_key(remote, explicit) == "from-env-file-option"
 
 
+def test_the_key_goes_only_to_openai_or_a_named_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "from-environment")
+    assert live.resolve_api_key("https://api.openai.com/v1") == "from-environment"
+    with pytest.raises(live.LiveError, match=r"refusing to send OPENAI_API_KEY to 'evil\.test'"):
+        live.resolve_api_key("https://evil.test/v1")
+    assert live.resolve_api_key("https://Evil.test/v1", key_hosts=["evil.TEST"]) == (
+        "from-environment"
+    )
+    with pytest.raises(live.LiveError, match="without https"):
+        live.resolve_api_key("http://api.openai.com/v1")
+
+
+def test_a_worker_never_sends_the_key_where_only_the_log_points(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "log.sqlite"
+    ws = Workspace(db)
+    model = ModelConfig(base_url="https://collector.example.test/v1", model="m")
+    ws.runner.new_thread(impl="our", system="s", rules={}, model=model, thread_id="t1")
+    ws.close()
+    monkeypatch.setenv("OPENAI_API_KEY", "test-secret-value-42")
+    assert main(["turn", "t1", "--db", str(db), "--user", "hi"]) == 1
+    err = capsys.readouterr().err
+    assert "refusing to send OPENAI_API_KEY to 'collector.example.test'" in err
+    assert "test-secret-value-42" not in err
+    log = SessionLog(db)
+    assert log.turns("t1") == []  # nothing ran
+    log.close()
+
+
+def test_a_run_id_is_never_reused(endpoint: str, tmp_path: Path) -> None:
+    argv = ["live", "--impl", "our,our", "--model", "fake-live", "--base-url", endpoint]
+    argv += [
+        "--prompt",
+        "Build chat.pipe and validate it.",
+        "--out",
+        str(tmp_path),
+        "--run-id",
+        "t1",
+    ]
+    assert build_parser().parse_args(argv).impl == ["our"]  # each loop once
+    assert main(argv) == 0
+    result = (tmp_path / "live" / "t1" / "our" / "result.json").read_bytes()
+    with pytest.raises(live.LiveError, match="already exists: pick another --run-id"):
+        live.fresh_dir(tmp_path / "live" / "t1" / "our")
+    assert main(argv) == 1  # refused before anything ran
+    assert (tmp_path / "live" / "t1" / "our" / "result.json").read_bytes() == result
+
+
+async def test_stdin_ask_reads_lines_without_a_thread(tmp_path: Path) -> None:
+    threads = threading.active_count()
+    read_fd, write_fd = os.pipe()
+    out = io.StringIO()
+    with os.fdopen(read_fd, "r") as stdin:
+        ask = live.stdin_ask(out, stdin)
+        os.write(write_fd, b"first\nsecond\nthi")
+        assert await ask("> ") == "first"
+        assert await ask("> ") == "second"
+        pending = asyncio.ensure_future(ask("> "))
+        await asyncio.sleep(0.05)
+        assert not pending.done()  # waits for the rest of the line, without blocking the loop
+        os.write(write_fd, b"rd\nlast line without newline")
+        assert await pending == "third"
+        os.close(write_fd)
+        assert await ask("> ") == "last line without newline"
+        with pytest.raises(EOFError):
+            await ask("> ")
+    assert out.getvalue() == "> " * 5
+    assert threading.active_count() == threads  # no reader thread left behind
+
+
+async def test_ctrl_c_at_the_prompt_ends_the_read(tmp_path: Path) -> None:
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "r") as stdin:
+        ask = live.stdin_ask(io.StringIO(), stdin)
+        pending = asyncio.ensure_future(ask("> "))
+        await asyncio.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGINT)
+        with pytest.raises(EOFError, match="interrupted"):
+            await asyncio.wait_for(pending, 5)
+    os.close(write_fd)
+
+
+def test_chat_exits_on_ctrl_c_at_the_prompt(endpoint: str, tmp_path: Path) -> None:
+    """Ctrl-C while `bakeoff chat` waits for input (stdin open, nothing typed) ends the chat
+    at once and still writes result.json."""
+    argv = [sys.executable, "-m", "bakeoff.cli", "chat", "--base-url", endpoint]
+    argv += ["--out", str(tmp_path / "out"), "--run-id", "c1"]
+    read_fd, write_fd = os.pipe()
+    proc = subprocess.Popen(
+        argv, stdin=read_fd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    os.close(read_fd)
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().startswith("chat with our on gpt-6-luna")
+        time.sleep(0.3)  # at the prompt
+        proc.send_signal(signal.SIGINT)
+        printed, err = proc.communicate(timeout=10)
+    finally:
+        os.close(write_fd)
+        proc.kill()
+    assert (proc.returncode, err) == (0, ""), printed
+    result = json.loads((tmp_path / "out" / "live" / "c1" / "our" / "result.json").read_text())
+    assert (result["stops"], result["error"], result["prompt"]) == ([], None, "(chat)")
+
+
 def test_the_key_is_never_stored(
     endpoint: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(live, "resolve_api_key", lambda url, env_file=None: "test-secret-value-42")
+    monkeypatch.setattr(live, "resolve_api_key", lambda *args, **kwargs: "test-secret-value-42")
     out = tmp_path / "out"
     assert (
         main(

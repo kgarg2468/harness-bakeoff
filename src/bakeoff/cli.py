@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from bakeoff.shared.sessionlog import SessionLog
 
 
 def _impls(value: str) -> list[str]:
-    names = [n.strip() for n in value.split(",") if n.strip()]
+    names = list(dict.fromkeys(n.strip() for n in value.split(",") if n.strip()))
     if unknown := [n for n in names if n not in loops.REGISTRY]:
         raise argparse.ArgumentTypeError(
             f"unknown loop {unknown}; known: {', '.join(loops.REGISTRY)}"
@@ -52,6 +53,17 @@ def _worker_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-steps", type=int, default=Limits().max_steps)
     parser.add_argument("--engine-delay-ms", type=int, default=0, help="MockEngine delay")
     parser.add_argument("--env-file", type=Path, help="env file with OPENAI_API_KEY (live threads)")
+    _key_host_arg(parser)
+
+
+def _key_host_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--key-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help=f"a host besides {live.OPENAI_HOST} that may receive {live.KEY_NAME} (repeatable)",
+    )
 
 
 def _model_args(parser: argparse.ArgumentParser, *, impl_default: str | None) -> None:
@@ -64,6 +76,7 @@ def _model_args(parser: argparse.ArgumentParser, *, impl_default: str | None) ->
     parser.add_argument("--max-steps", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--env-file", type=Path, help=f"env file with {live.KEY_NAME}")
+    _key_host_arg(parser)
     parser.add_argument(
         "--base-url",
         default=live.OPENAI_BASE_URL,
@@ -133,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         return _COMMANDS[args.command](args)
-    except (scenario.DriverError, live.LiveError, RuntimeError, ValueError) as exc:
+    except (scenario.DriverError, live.LiveError, RuntimeError, ValueError, sqlite3.Error) as exc:
         print(f"bakeoff {args.command}: error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -186,7 +199,7 @@ def _live_model(args: argparse.Namespace) -> live.LiveModel:
     return live.LiveModel(
         model=args.model,
         base_url=args.base_url,
-        api_key=live.resolve_api_key(args.base_url, args.env_file),
+        api_key=live.resolve_api_key(args.base_url, args.env_file, key_hosts=args.key_host),
         kind=args.kind,
         reasoning=args.reasoning,
         max_tokens=args.max_tokens,
@@ -262,6 +275,8 @@ def _worker(args: argparse.Namespace) -> int:
     if thread is None:
         raise scenario.DriverError(f"unknown thread {args.thread} in {args.db}")
     base_url = thread["meta"]["model"]["base_url"]
+    # The log names the endpoint; the key goes there only if this command line allows it.
+    api_key = live.resolve_api_key(base_url, args.env_file, key_hosts=args.key_host)
     live.guard_network(base_url)
     sinks = []
     user_text, resume = None, None
@@ -282,7 +297,7 @@ def _worker(args: argparse.Namespace) -> int:
         scenario.worker_turn(
             args.db,
             args.thread,
-            api_key=live.resolve_api_key(base_url, args.env_file),
+            api_key=api_key,
             user_text=user_text,
             resume=resume,
             max_steps=args.max_steps,
