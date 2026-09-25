@@ -348,6 +348,9 @@ class LiveModel:
     max_tokens: int = 4096
 
     def config(self, impl: str) -> ModelConfig:
+        reasoning = None if self.reasoning is None else {"effort": self.reasoning}
+        if reasoning and self.kind == "openai_responses" and self.reasoning != "none":
+            reasoning["summary"] = "auto"  # the Responses API streams no summary unless asked
         return ModelConfig(
             base_url=self.base_url.replace("{impl}", impl),
             model=self.model,
@@ -355,7 +358,7 @@ class LiveModel:
             kind=self.kind,
             max_tokens=self.max_tokens,
             temperature=None,  # reasoning models reject a temperature; use the model default
-            reasoning=None if self.reasoning is None else {"effort": self.reasoning},
+            reasoning=reasoning,
             timeout_s=180.0,
         )
 
