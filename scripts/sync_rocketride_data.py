@@ -200,21 +200,35 @@ def copy_examples(repo: Path, commit: str, out: Path) -> None:
 def copy_skills(repo: Path, commit: str, out: Path) -> int:
     """Replace `out/skills/` with the text files of `docs/agents/skills/`; return how many."""
     dest_root = out / "skills"
-    shutil.rmtree(dest_root, ignore_errors=True)  # generated: files removed upstream must go too
-    # -z: without it git quotes non-ASCII paths ("r\303\251sum\303\251.md"), which the suffix
-    # filter would silently drop. SKILL_SUFFIXES leaves out the skills' tools/*.py helpers.
-    paths = _git(repo, "ls-tree", "-r", "-z", "--name-only", commit, f"{SKILLS}/").split("\0")
-    copied = [path for path in paths if path.endswith(SKILL_SUFFIXES)]
-    for src in copied:
-        dest = dest_root / src.removeprefix(f"{SKILLS}/")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        # Bytes, not text: the copy stays byte-identical to the upstream blob.
-        blob = subprocess.run(
-            ["git", "-C", str(repo), "show", f"{commit}:{src}"], check=True, capture_output=True
-        ).stdout
-        dest.write_bytes(blob)
-    source = {"repo": UPSTREAM, "commit": commit, "path": SKILLS}
-    (dest_root / SKILLS_SOURCE).write_text(json.dumps(source, indent=1) + "\n", encoding="utf-8")
+    # Build the new bundle next to the old one and swap only when it is complete, so a failed
+    # git read or write never leaves the bundle missing or half-copied.
+    staging = out / ".skills.staging"
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        # -z: without it git quotes non-ASCII paths ("r\303\251sum\303\251.md"), which the suffix
+        # filter would silently drop. SKILL_SUFFIXES leaves out the skills' tools/*.py helpers.
+        paths = _git(repo, "ls-tree", "-r", "-z", "--name-only", commit, f"{SKILLS}/").split("\0")
+        copied = [path for path in paths if path.endswith(SKILL_SUFFIXES)]
+        for src in copied:
+            dest = staging / src.removeprefix(f"{SKILLS}/")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # Bytes, not text: the copy stays byte-identical to the upstream blob.
+            blob = subprocess.run(
+                ["git", "-C", str(repo), "show", f"{commit}:{src}"], check=True, capture_output=True
+            ).stdout
+            dest.write_bytes(blob)
+        source = {"repo": UPSTREAM, "commit": commit, "path": SKILLS}
+        (staging / SKILLS_SOURCE).write_text(json.dumps(source, indent=1) + "\n", encoding="utf-8")
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    # Generated: files removed upstream must go too, so the old bundle is replaced whole.
+    retired = out / ".skills.old"
+    shutil.rmtree(retired, ignore_errors=True)
+    if dest_root.exists():
+        dest_root.rename(retired)
+    staging.rename(dest_root)
+    shutil.rmtree(retired, ignore_errors=True)
     return len(copied)
 
 

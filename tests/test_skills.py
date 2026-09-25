@@ -248,11 +248,82 @@ async def test_load_skill_reference_files(host, name, file, path):
     assert f"Files of {name}: " in result.content
 
 
-def test_every_bundle_file_a_skill_mentions_loads_by_that_name():
-    """Guards the next sync: a new duplicate file name would break the skills' bare references."""
+# Where each bare file name a skill mentions resolves at the synced commit. Pinning the
+# destination (not just "it resolves") catches a later sync that silently changes a meaning,
+# e.g. a new local PIPELINE_ANTIPATTERNS.md shadowing the configuring skill's file.
+EXPECTED_REFERENCES = {
+    (
+        "rocketride-building-pipelines",
+        "GATE_PROTOCOL.md",
+    ): "rocketride-building-pipelines/GATE_PROTOCOL.md",
+    (
+        "rocketride-building-pipelines",
+        "LAYER1_NODE_INDEX.json",
+    ): "rocketride-designing-pipelines/LAYER1_NODE_INDEX.json",
+    (
+        "rocketride-building-pipelines",
+        "LAYER1_NODE_INDEX.meta.json",
+    ): "rocketride-designing-pipelines/LAYER1_NODE_INDEX.meta.json",
+    (
+        "rocketride-building-pipelines",
+        "PIPELINE_ANTIPATTERNS.md",
+    ): "rocketride-configuring-pipelines/PIPELINE_ANTIPATTERNS.md",
+    (
+        "rocketride-building-pipelines",
+        "PIPELINE_RULES_SUMMARY.md",
+    ): "rocketride-designing-pipelines/PIPELINE_RULES_SUMMARY.md",
+    (
+        "rocketride-building-pipelines",
+        "ROCKETRIDE_DOC_MAP.md",
+    ): "rocketride-building-pipelines/ROCKETRIDE_DOC_MAP.md",
+    (
+        "rocketride-building-pipelines",
+        "pipeline-patterns.md",
+    ): "rocketride-building-pipelines/pipeline-patterns.md",
+    (
+        "rocketride-configuring-pipelines",
+        "PIPELINE_ANTIPATTERNS.md",
+    ): "rocketride-configuring-pipelines/PIPELINE_ANTIPATTERNS.md",
+    (
+        "rocketride-debugging-pipelines",
+        "ERROR_TABLE.md",
+    ): "rocketride-debugging-pipelines/ERROR_TABLE.md",
+    (
+        "rocketride-debugging-pipelines",
+        "PIPELINE_ANTIPATTERNS.md",
+    ): "rocketride-configuring-pipelines/PIPELINE_ANTIPATTERNS.md",
+    (
+        "rocketride-designing-pipelines",
+        "FAILURE_SCENARIOS.md",
+    ): "rocketride-designing-pipelines/examples/FAILURE_SCENARIOS.md",
+    (
+        "rocketride-designing-pipelines",
+        "LAYER1_NODE_INDEX.json",
+    ): "rocketride-designing-pipelines/LAYER1_NODE_INDEX.json",
+    (
+        "rocketride-designing-pipelines",
+        "PIPELINE_RULES_SUMMARY.md",
+    ): "rocketride-designing-pipelines/PIPELINE_RULES_SUMMARY.md",
+    (
+        "rocketride-designing-pipelines",
+        "agentic-chat.pipe",
+    ): "rocketride-designing-pipelines/examples/agentic-chat.pipe",
+    (
+        "rocketride-designing-pipelines",
+        "document-ingestion.pipe",
+    ): "rocketride-designing-pipelines/examples/document-ingestion.pipe",
+    (
+        "rocketride-designing-pipelines",
+        "simple-chat-rag.pipe",
+    ): "rocketride-designing-pipelines/examples/simple-chat-rag.pipe",
+}
+
+
+def test_every_bundle_file_a_skill_mentions_loads_the_expected_file():
+    """Guards the next sync: every bare reference must keep resolving to the same file."""
     bundle = load_skills()
     names = {path.rpartition("/")[2] for path in bundle.paths}
-    checked = 0
+    found = {}
     for path in sorted(bundle.paths):
         skill = path.partition("/")[0]
         if skill not in bundle.skills:
@@ -261,9 +332,8 @@ def test_every_bundle_file_a_skill_mentions_loads_by_that_name():
         for mentioned in sorted(
             n for n in names if re.search(rf"(?<![\w./-]){re.escape(n)}", text)
         ):
-            skills.resolve(skill, mentioned)
-            checked += 1
-    assert checked > 10  # 17 at the synced commit: the scan itself still finds references
+            found[(skill, mentioned)] = skills.resolve(skill, mentioned)
+    assert found == EXPECTED_REFERENCES
 
 
 async def test_largest_file_is_not_truncated(host):
