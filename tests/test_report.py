@@ -243,7 +243,8 @@ def out(tmp_path: Path) -> Path:
             "base_url": "https://api.openai.com/v1",
             "final_text": f"answer from {impl}", "stops": ["end_turn"], "requests": 3, "tool_runs": {"c": 1},
             "usage": {"input_tokens": 1234, "output_tokens": 56, "cached_tokens": 0, "cost_usd": None,
-                      "cost_source": "none"}, "duration_ms": seconds * 1000, "error": None,
+                      "cost_source": "none"}, "duration_ms": seconds * 1000, "passed": True,
+            "error": None,
         })  # fmt: skip
     return out
 
@@ -571,6 +572,21 @@ def test_a_live_run_a_loop_did_not_finish_is_not_a_sample(out: Path) -> None:
     write_json(out / "live" / "L3" / "pydantic" / "result.json",
                {**live, "run_id": "L3", "impl": "pydantic", "stops": ["error"], "error": None,
                 "duration_ms": 40.0, "usage": {"input_tokens": 0}})  # fmt: skip
+    html = make(out)
+    assert "over 2 live runs" in html and "over 3 live runs" not in html
+
+
+def test_a_live_run_that_did_not_pass_is_not_a_sample(out: Path) -> None:
+    """A run can end with end_turn and still fail (an invariant broke): it is not an answer."""
+    live = json.loads((out / "live" / "L1" / "our" / "result.json").read_text())
+    for impl, seconds in (("our", 2.6), ("pydantic", 3.3)):  # a second, passed sample
+        write_json(out / "live" / "L2" / impl / "result.json",
+                   {**live, "run_id": "L2", "impl": impl, "duration_ms": seconds * 1000})  # fmt: skip
+    write_json(out / "live" / "L3" / "our" / "result.json",
+               {**live, "run_id": "L3", "impl": "our", "passed": False, "duration_ms": 40.0,
+                "invariants": {"I5": {"ok": False, "detail": "wrote to stderr"}}})  # fmt: skip
+    write_json(out / "live" / "L3" / "pydantic" / "result.json",
+               {**live, "run_id": "L3", "impl": "pydantic"})  # fmt: skip
     html = make(out)
     assert "over 2 live runs" in html and "over 3 live runs" not in html
 

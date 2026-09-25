@@ -1328,8 +1328,9 @@ def _per_step(result: dict[str, Any], value: Any) -> float | None:
 
 
 def _answered(result: dict[str, Any] | None) -> bool:
-    """The loop finished the live run: its last turn ended with end_turn and nothing failed."""
-    if not result or result.get("error"):
+    """The loop finished the live run: it passed, with no error, and its last turn ended with
+    end_turn. `passed` is required too: a run can end with end_turn while an invariant fails."""
+    if not result or result.get("error") or result.get("passed") is not True:
         return False
     stops = result.get("stops") or []
     return bool(stops) and stops[-1] == "end_turn"
@@ -1338,8 +1339,8 @@ def _answered(result: dict[str, Any] | None) -> bool:
 def _live_claims(page: Page) -> list[Claim]:
     """Latency and input tokens over the live runs every live loop answered: medians, and a win
     only with enough samples and a clear margin. A run counts only if every loop finished it
-    (last stop end_turn, no error): a loop that failed at once would otherwise look fast and
-    cheap."""
+    (passed, last stop end_turn, no error): a loop that failed at once would otherwise look fast
+    and cheap."""
     loops = [i for i in page.loops if any(i in run["results"] for run in page.live)]
     samples = [
         run["results"] for run in page.live if all(_answered(run["results"].get(i)) for i in loops)
