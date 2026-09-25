@@ -1,0 +1,166 @@
+"""Git working copy per thread: one commit per completed turn; a revert is a new commit."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import subprocess
+from contextlib import suppress
+from pathlib import Path
+
+# Fixed identity, no signing, and none of the user's global ignore or attributes files: git
+# reads those from ~/.config/git even when there is no global config file. Hooks and fsmonitor
+# are off so nothing the model writes into the working copy can make git run a command. No
+# automatic gc or maintenance: it may detach and keep running (with the thread's lock, which git
+# inherits) after the command that started it has returned.
+GIT_CONFIG = (
+    "-c",
+    "user.name=bakeoff",
+    "-c",
+    "user.email=bakeoff@localhost",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "core.excludesFile=/dev/null",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "maintenance.auto=false",
+)
+
+
+def git_env(root: Path) -> dict[str, str]:
+    """Environment for git in `root`: no system/global config, no inherited GIT_* variables
+    (e.g. GIT_DIR from a hook), and no walking up into an enclosing repository."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL="/dev/null",
+        GIT_CEILING_DIRECTORIES=str(root.parent),
+    )
+    return env
+
+
+def _failed(root: Path, args: tuple[str, ...], stderr: bytes) -> RuntimeError:
+    return RuntimeError(f"git {args[0]} failed in {root}: {stderr.decode().strip()}")
+
+
+class WorkCopy:
+    """A git repository at `root` on branch `main`, starting with an empty commit.
+
+    `lock_fd` is the descriptor of the thread's lock (see `runner._try_lock`). Every git process
+    inherits it, so the lock lasts until the last of them exits, even if the caller dies first.
+    """
+
+    def __init__(self, root: Path, lock_fd: int | None = None) -> None:
+        self.root = root.absolute()
+        self._env = git_env(self.root)
+        self._pass_fds = () if lock_fd is None else (lock_fd,)
+
+    async def _git(self, *args: str) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *GIT_CONFIG,
+            *args,
+            cwd=self.root,
+            env=self._env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            pass_fds=self._pass_fds,
+        )
+        try:
+            out, err = await proc.communicate()
+        except asyncio.CancelledError:
+            # Stop git before propagating, or it finishes on its own (e.g. a commit that no
+            # turn records). SIGTERM, not SIGKILL, so git removes its lock files.
+            with suppress(ProcessLookupError):
+                proc.terminate()
+            await proc.wait()
+            raise
+        if proc.returncode:
+            raise _failed(self.root, args, err)
+        return out.decode()
+
+    def _git_sync(self, *args: str, check: bool = True) -> str:
+        proc = subprocess.run(
+            ["git", *GIT_CONFIG, *args],
+            cwd=self.root,
+            env=self._env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+        )
+        if check and proc.returncode:
+            raise _failed(self.root, args, proc.stderr)
+        return proc.stdout.decode()
+
+    def init_sync(self) -> None:
+        """Create the repository with an empty initial commit (blocking).
+
+        Idempotent. It also repairs a repository whose initial commit never happened (a crash
+        right after `git init`), so every turn commit has a parent.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        if not (self.root / ".git").exists():
+            self._git_sync("init", "-q", "-b", "main")
+        if not self._git_sync("rev-parse", "--verify", "-q", "HEAD", check=False):
+            self._git_sync("commit", "-q", "--allow-empty", "-m", "init")
+
+    async def init(self) -> None:
+        """`init_sync` without blocking the event loop."""
+        await asyncio.to_thread(self.init_sync)
+
+    async def commit(self, message: str) -> tuple[str, list[str]]:
+        """Commit everything in the working tree (even if nothing changed)."""
+        await self._git("add", "-A")
+        await self._git("commit", "-q", "--allow-empty", "-m", message)
+        return await self._head_change()
+
+    async def revert(self, sha: str) -> tuple[str, list[str]]:
+        """Undo commit `sha` with a new commit; on a conflict, abort and raise."""
+        # `revert --no-commit` + `commit --allow-empty` also works for an empty commit,
+        # where a plain `git revert` fails with "nothing to commit".
+        try:
+            await self._git("revert", "--no-commit", sha)
+        except RuntimeError:
+            with suppress(RuntimeError):  # nothing to abort if the revert never started
+                await self._git("revert", "--abort")
+            raise
+        await self._git("commit", "-q", "--allow-empty", "--no-edit")
+        return await self._head_change()
+
+    async def recover(self, sha: str | None, *, keep: bool = True) -> None:
+        """Clean up after git: a worker that died while git ran, or a failed turn.
+
+        Removes a stale index lock and moves HEAD back to `sha` (None: the initial commit) if
+        commits landed after it that no turn recorded. With `keep`, their changes (and any
+        other changes) stay staged, so the next commit includes them; without it, a revert in
+        progress is aborted and the index and files are reset to `sha`, dropping them. Call it
+        only while holding the thread's lock: git processes inherit it, so then none of them
+        can still be running.
+        """
+        (self.root / ".git" / "index.lock").unlink(missing_ok=True)
+        target = sha or (await self._git("rev-list", "--max-parents=0", "HEAD")).split()[0]
+        if not keep:
+            with suppress(RuntimeError):  # fails if no revert is in progress
+                await self._git("revert", "--abort")
+            await self._git("reset", "-q", "--hard", target)
+        elif await self.head() != target:
+            await self._git("reset", "-q", "--soft", target)
+
+    async def head(self) -> str:
+        return (await self._git("rev-parse", "HEAD")).strip()
+
+    async def _head_change(self) -> tuple[str, list[str]]:
+        # With --always, diff-tree prints the commit id even when the commit changes nothing;
+        # --root lists the files of a root commit too.
+        out = await self._git("diff-tree", "-r", "--root", "--always", "--name-only", "-z", "HEAD")
+        sha, *files = out.rstrip("\0").split("\0")
+        return sha, files
