@@ -1,6 +1,7 @@
 """Tool building blocks: `Tool`, the context a tool runs in, and working-copy path rules.
 
-The tools themselves live in `engine_tools` and `file_tools`; `toolhost` puts them in order.
+The tools themselves live in `engine_tools`, `file_tools` and `skill_tools`; `toolhost` puts
+them in order.
 """
 
 from __future__ import annotations

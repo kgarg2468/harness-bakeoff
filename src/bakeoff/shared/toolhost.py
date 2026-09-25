@@ -19,11 +19,13 @@ from bakeoff.shared.engine.mock import MockEngine
 from bakeoff.shared.tools import PathError, Tool, ToolContext, ToolError, resolve_path
 from bakeoff.shared.tools.engine_tools import ENGINE_TOOLS
 from bakeoff.shared.tools.file_tools import FILE_TOOLS
+from bakeoff.shared.tools.skill_tools import SKILL_TOOLS
 
 MAX_OUTPUT = 30_000
 MAX_ERROR = 300  # schema messages quote the offending value, which can be a whole pipeline
 
-TOOLS: tuple[Tool, ...] = (*ENGINE_TOOLS, *FILE_TOOLS)  # DESIGN.md order; never reorder
+# DESIGN.md order; never reorder, and append new tools at the end.
+TOOLS: tuple[Tool, ...] = (*ENGINE_TOOLS, *FILE_TOOLS, *SKILL_TOOLS)
 _BY_NAME = {tool.spec.name: tool for tool in TOOLS}
 _VALIDATORS = {tool.spec.name: Draft202012Validator(tool.spec.parameters) for tool in TOOLS}
 
