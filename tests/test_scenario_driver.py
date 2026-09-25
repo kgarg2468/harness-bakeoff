@@ -859,3 +859,26 @@ async def test_two_matrices_with_one_run_id_cannot_both_start(tmp_path):
     assert sum(isinstance(o, DriverError) for o in outcomes) == 1
     assert any(isinstance(o, dict) for o in outcomes)
     assert (tmp_path / "runs" / "race" / "S01" / "our" / "result.json").is_file()
+
+
+async def test_a_provider_that_cannot_start_releases_the_run_id(tmp_path, monkeypatch):
+    """Greptile #4104055671: nothing ran, so the reservation is released and the same run id
+    can be retried."""
+    from bakeoff.fakeprov.server import FakeProvider
+    from bakeoff.shared.scenario import run_matrix
+
+    real_start = FakeProvider.start
+    calls = []
+
+    def failing_once(self):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("address already in use (simulated)")
+        return real_start(self)
+
+    monkeypatch.setattr(FakeProvider, "start", failing_once)
+    with pytest.raises(OSError, match="simulated"):
+        await run_matrix(["S01"], ["our"], out=tmp_path, run_id="retry")
+    assert not (tmp_path / "runs" / "retry").exists()
+    summary = await run_matrix(["S01"], ["our"], out=tmp_path, run_id="retry")
+    assert summary and (tmp_path / "runs" / "retry" / "S01" / "our" / "result.json").is_file()

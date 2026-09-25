@@ -959,7 +959,13 @@ async def run_matrix(
     runs = [(sid, impl) for sid in scenarios for impl in impls]
     results: list[dict[str, Any]] = []
     stopped = None
-    with FakeProvider(scenarios_dir, wire_dir=staging) as provider:
+    try:
+        provider = FakeProvider(scenarios_dir, wire_dir=staging).start()
+    except BaseException:
+        # Nothing ran: release the reservation so the same --run-id can be retried.
+        shutil.rmtree(out / "runs" / run_id, ignore_errors=True)
+        raise
+    try:
         for sid, impl in runs:
             before = asyncio.all_tasks()
             result = await run_scenario(sid, impl, out=out, run_id=run_id, provider=provider)
@@ -974,6 +980,8 @@ async def run_matrix(
                     f" {len(runs) - len(results)} of {len(runs)} runs did not start"
                 )
                 break
+    finally:
+        provider.stop()
     shutil.rmtree(staging, ignore_errors=True)
     summary = summarize(run_id, results, impls, stopped=stopped)
     write_json(out / "runs" / run_id / "summary.json", summary)
