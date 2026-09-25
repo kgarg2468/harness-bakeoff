@@ -58,14 +58,18 @@ def build_model(cfg: ModelConfig, event_hooks: EventHooks) -> Model:
             settings=OpenRouterModelSettings(**base, **_openrouter_settings(cfg)),
         )
     if cfg.kind == "openai_responses":
+        # The harness keeps the history (contract rule 2), so OpenAI stores nothing and a
+        # reasoning item goes back as its encrypted content. The library asks for that content
+        # (`include`) and replays it, with the item ids, for a reasoning profile.
+        settings = OpenAIResponsesModelSettings(**base, openai_store=False, **_effort(cfg))
+        if summary := (cfg.reasoning or {}).get("summary"):
+            settings["openai_reasoning_summary"] = summary  # the API sends none unless asked
+        reasons = cfg.compat.get("reasoning_param") != "none"
         return OpenAIResponsesModel(
             cfg.model,
             provider=OpenAIProvider(openai_client=client),
-            profile=_REASONING_PROFILE if cfg.reasoning else None,
-            # The harness keeps the history (contract rule 2), so OpenAI stores nothing and a
-            # reasoning item goes back as its encrypted content. The library asks for that
-            # content (`include`) and replays it, with the item ids, for a reasoning profile.
-            settings=OpenAIResponsesModelSettings(**base, openai_store=False, **_effort(cfg)),
+            profile=_REASONING_PROFILE if reasons else None,
+            settings=settings,
         )
     # pydantic-ai picks the profile from the model name, and a custom base URL does not change
     # that, so a non-OpenAI name loses thinking support. The documented `profile=` argument is
@@ -134,12 +138,15 @@ def _compat(cfg: ModelConfig) -> tuple[OpenAIModelProfile, OpenAIChatModelSettin
 
 # pydantic-ai picks the profile from the model name, and 2.31.1 predates gpt-6-luna: it would take
 # the model for one that does not reason, so it would drop the effort and replay no reasoning (and
-# no `phase`). A config that asks for reasoning says the model reasons; later releases agree.
+# no `phase`). The model reasons even with no `reasoning` config (at its default effort), so a
+# Responses model is taken to reason unless compat `reasoning_param` is "none". With these flags
+# 2.31.1 asks for, replays and configures reasoning as 2.50.0 does for gpt-6-luna.
 _REASONING_PROFILE = OpenAIModelProfile(
     supports_thinking=True,
     openai_supports_reasoning=True,
     openai_supports_encrypted_reasoning_content=True,
     openai_supports_phase=True,
+    openai_responses_supports_reasoning_context=True,
 )
 
 

@@ -24,6 +24,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.pydantic_version import PydanticLoop, mapping
 from bakeoff.pydantic_version import loop as loop_module
+from bakeoff.pydantic_version.model import build_model
 from bakeoff.shared.contract import (
     Decision,
     Event,
@@ -1172,12 +1173,12 @@ def responses_server(tmp_path: Path, *exchanges: dict[str, Any]) -> FakeProvider
 
 def responses_config(srv: FakeProvider, **kw: Any) -> ModelConfig:
     kw.setdefault("max_retries", 0)
+    kw.setdefault("reasoning", {"effort": "xhigh", "summary": "auto"})
     return ModelConfig(
         base_url=srv.base_url("R", "r1", "pydantic"),
         model="gpt-6-luna",
         kind="openai_responses",
         temperature=None,
-        reasoning={"effort": "xhigh"},
         **kw,
     )
 
@@ -1232,9 +1233,46 @@ async def test_responses_reasoning_goes_back_verbatim_and_stays_out_of_the_chat_
         {"role": "tool", "tool_call_id": "call_1", "content": "read_file ok"},
         {"role": "assistant", "content": "Done."},
     ]
+    # The summary streams because the config asks for one: the API sends none otherwise.
     assert [d["text"] for d in of(first, "reasoning.delta")] == ["Plan", "Go"]
+    request = json.loads(sent(tmp_path)[0])
+    assert request["reasoning"] == {"effort": "xhigh", "summary": "auto", "context": "all_turns"}
+    assert (request["store"], request["include"]) == (False, ["reasoning.encrypted_content"])
     assert of(first, "usage")[0]["reasoning_tokens"] == 6
     assert of(second, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+
+
+async def test_responses_without_a_reasoning_config_still_replays_reasoning(loop, tmp_path):
+    """gpt-6-luna reasons at its default effort with no `reasoning` config. Its encrypted
+    reasoning is asked for and replayed all the same (2.31.1 does not know the model by name),
+    and no summary is asked for (none streams)."""
+    call = {"id": "call_1", "name": "read_file", "arguments": {"path": "a"}}
+    stream = [{"reasoning_item": REASONING}, {"text": "Reading.", "phase": "commentary"}]
+    replayed = {"reasoning_replayed": ["rs_1"], "input_at": [{"index": 2, "phase": "commentary"}]}
+    exchanges = [
+        {"respond": {"stream": [*stream, {"tool_calls": [call]}, COMPLETED]}},
+        {"expect": replayed, "respond": {"stream": [{"text": "Done."}, COMPLETED]}},
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        events = await run(
+            loop, turn([user("go")], responses_config(srv, reasoning=None)), StubTools()
+        )
+
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+    request = json.loads(sent(tmp_path)[0])
+    assert (request["include"], request["reasoning"]) == (
+        ["reasoning.encrypted_content"],
+        {"context": "all_turns"},
+    )
+
+
+def test_a_responses_model_that_does_not_reason_is_marked_by_compat():
+    """compat `reasoning_param: "none"` leaves the model the library's name-based profile."""
+    for compat, reasons in (({}, True), ({"reasoning_param": "none"}, False)):
+        cfg = ModelConfig(
+            "http://127.0.0.1:9/v1", "gpt-4.1", kind="openai_responses", compat=compat
+        )
+        assert build_model(cfg, {}).profile.get("openai_supports_reasoning", False) is reasons
 
 
 @pytest.mark.parametrize("end", ["completed", "incomplete"])

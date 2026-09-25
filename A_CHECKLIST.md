@@ -23,16 +23,21 @@ If you'd do something differently, edit this file in a PR, and A will be changed
       ([models/openai, "OpenAI Responses API"](https://ai.pydantic.dev/models/openai/))
       *Done in `model.py`. The harness keeps the history, so `openai_store=False`; the effort is the
       unified `thinking` setting (`openai_reasoning_effort` for values it has no level for, as for
-      BYOK). What goes back is the library's own replay: for a reasoning model it asks for
-      `include: ["reasoning.encrypted_content"]` and, with `openai_send_reasoning_ids` at its
-      default (on for reasoning models), replays each reasoning item with its id and encrypted
-      content, messages with their `phase`, and calls with their ids. 2.31.1 predates `gpt-6-luna`:
+      BYOK), and `reasoning.summary` is `openai_reasoning_summary` (the API streams no summary
+      unless asked; `live --api responses --reasoning EFFORT` asks for `auto`). What goes back is
+      the library's own replay: for a reasoning model it asks for `include:
+      ["reasoning.encrypted_content"]` and, with `openai_send_reasoning_ids` at its default (on
+      for reasoning models), replays each reasoning item with its id and encrypted content,
+      messages with their `phase`, and calls with their ids. 2.31.1 predates `gpt-6-luna`:
       its name-based profile takes it for a model that does not reason, which would drop the
-      effort, the encrypted reasoning and the `phase`. So a config with `reasoning` passes the
-      documented `profile=` (`supports_thinking`, `openai_supports_reasoning`,
-      `openai_supports_encrypted_reasoning_content`, `openai_supports_phase`); 2.50.0 knows the
-      model and agrees. `Item.message` is the chat-shaped view without the reasoning items (it has
-      no field for them); the native replays them.*
+      effort, the encrypted reasoning and the `phase`. The model reasons even with no `reasoning`
+      config, so every Responses config passes the documented `profile=` (`supports_thinking`,
+      `openai_supports_reasoning`, `openai_supports_encrypted_reasoning_content`,
+      `openai_supports_phase`, `openai_responses_supports_reasoning_context`), unless compat
+      `reasoning_param` is `"none"` (a model that does not reason). 2.50.0 knows the model and
+      sends the same request, `reasoning.context: "all_turns"` included. `Item.message` is the
+      chat-shaped view without the reasoning items (it has no field for them); the native
+      replays them.*
 - [x] **Loop API**: `Agent.iter()` (or `run_stream_events()`), never `run_stream()`, which stops at the
       first final output. ([agents](https://ai.pydantic.dev/agents/))
       *`Agent.iter()` in its own task, `node.stream()` for request nodes and for tool nodes (its
@@ -122,8 +127,9 @@ If you'd do something differently, edit this file in a PR, and A will be changed
       such as `error`: below).*
 - [x] **Versions**: passes on 2.31.1 (fits the engine today) and on the latest release.
       *2.31.1 + openai 2.54.0 and 2.50.0 + openai 3.19.2 (httpx2; the latest on 2026-09-25), same
-      code, S01-S15 and R01-R05. On 2.50.0 the Responses request also carries
-      `reasoning.context: "all_turns"`, the library's default for the models it knows support it.*
+      code, S01-S15 and R01-R05. The Responses request carries `reasoning.context: "all_turns"`
+      on both: 2.50.0's default for the models it knows support it, and the profile's flag on
+      2.31.1. They differ on a response that ran out of `max_output_tokens` (below).*
 
 ## Code A had to add
 
