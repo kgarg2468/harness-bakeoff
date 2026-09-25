@@ -12,7 +12,8 @@
   <a href="#results-at-a-glance"><strong>Results</strong></a> ·
   <a href="DESIGN.md"><strong>Design</strong></a> ·
   <a href="FAIRNESS.md"><strong>Fairness rules</strong></a> ·
-  <a href="A_CHECKLIST.md"><strong>A checklist</strong></a>
+  <a href="A_CHECKLIST.md"><strong>A checklist</strong></a> ·
+  <a href="docs/learn/bakeoff-101.html"><strong>Bakeoff 101 (course)</strong></a>
 </p>
 
 <p align="center">
@@ -44,7 +45,9 @@
 
 `gpt-6-luna` takes tools together with reasoning only on `/v1/responses`, so both loops had to learn that API. pydantic-ai already speaks it, so A's first cut mostly wired settings: +46 lines against B's +140. Fixes found in review and by the scenarios (how a stream ends or fails, crash resume, reasoning summaries, a call cut off at the output limit) brought that to +97 against +156. That's a real advantage for A. There are only 2 Responses live runs per loop, and most of each step there is the model reasoning, so read their time per step as a hint rather than a measure of the loop. Which side each number favours, and by how much, is under [Where each wins](#where-each-wins).
 
-The full comparison is one page, `out/report.html`: a scorecard, the scenario matrix, a side-by-side replay of every scenario, a diff of what each loop sent to the model, the live runs, and where each loop wins. Build it with `bakeoff report` (see [Quick start](#quick-start)) and open it in a browser; it has no external assets.
+The full comparison is one page, `out/report.html`: a scorecard, the scenario matrix, a side-by-side replay of every scenario, a diff of what each loop sent to the model, the live runs, and where each loop wins. Build it with `bakeoff report` (see [Quick start](#quick-start)) and open it in a browser; it has no external assets. A copy built from the runs behind this README is committed as [`docs/report.html`](docs/report.html).
+
+New to the repo? [`docs/learn/bakeoff-101.html`](docs/learn/bakeoff-101.html) is an interactive course (45 short screens) that explains the whole thing from the machine up: which processes run, what goes over the network, then the contract, the shared harness and both loops with real code excerpts, and finally every number in this README and the report. GitHub shows HTML files as source, so download both pages (or clone the repo) and open them in a browser; neither loads anything from the internet.
 
 <details>
 <summary><strong>Where these numbers come from</strong></summary>
