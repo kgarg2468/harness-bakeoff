@@ -6,8 +6,10 @@ The repository is read with `git show` / `git ls-tree` only (never checked out o
 
     uv run python scripts/sync_rocketride_data.py [REPO]
 
-Writes `catalog.json` (one compact entry per node provider) and copies a few valid example
-pipelines plus all of `examples/incorrect/` into `src/bakeoff/data/examples/`.
+Writes `catalog.json` (one compact entry per node provider), copies a few valid example
+pipelines plus all of `examples/incorrect/` into `src/bakeoff/data/examples/`, and copies the
+agent skills' text files from `docs/agents/skills/` into `src/bakeoff/data/skills/` (with
+`SOURCE.json` naming the commit).
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +52,10 @@ FIELD_KEYS = (
     "conditional",
 )
 PROFILES_PLACEHOLDER = "*>preconfig.profiles.*.title"
+SKILLS = "docs/agents/skills"
+# Text the model can read. The skills' `tools/*.py` helpers are left out: nothing runs them here.
+SKILL_SUFFIXES = (".md", ".json", ".pipe")
+SKILLS_SOURCE = "SOURCE.json"
 
 
 def _remove_json_comments(content: str) -> str:
@@ -190,6 +197,25 @@ def copy_examples(repo: Path, commit: str, out: Path) -> None:
         dest.write_text(_git(repo, "show", f"{commit}:{src}"), encoding="utf-8")
 
 
+def copy_skills(repo: Path, commit: str, out: Path) -> int:
+    """Replace `out/skills/` with the text files of `docs/agents/skills/`; return how many."""
+    dest_root = out / "skills"
+    shutil.rmtree(dest_root, ignore_errors=True)  # generated: files removed upstream must go too
+    paths = _git(repo, "ls-tree", "-r", "--name-only", commit, f"{SKILLS}/").splitlines()
+    copied = [path for path in paths if path.endswith(SKILL_SUFFIXES)]
+    for src in copied:
+        dest = dest_root / src.removeprefix(f"{SKILLS}/")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Bytes, not text: the copy stays byte-identical to the upstream blob.
+        blob = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{commit}:{src}"], check=True, capture_output=True
+        ).stdout
+        dest.write_bytes(blob)
+    source = {"repo": UPSTREAM, "commit": commit, "path": SKILLS}
+    (dest_root / SKILLS_SOURCE).write_text(json.dumps(source, indent=1) + "\n", encoding="utf-8")
+    return len(copied)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -202,7 +228,9 @@ def main(argv: list[str] | None = None) -> int:
     text = json.dumps(catalog, indent=1, sort_keys=True, ensure_ascii=False) + "\n"
     (OUT / "catalog.json").write_text(text, encoding="utf-8")
     copy_examples(args.repo, commit, OUT)
+    skill_files = copy_skills(args.repo, commit, OUT)
     print(f"{len(catalog['providers'])} providers from {commit[:12]}, {len(text)} bytes")
+    print(f"{skill_files} skill files from {SKILLS}")
     return 0
 
 

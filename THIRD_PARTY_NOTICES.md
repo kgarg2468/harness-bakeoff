@@ -5,8 +5,11 @@ below. Each ported file names its source at the top.
 
 ## RocketRide (MIT)
 
-`src/bakeoff/data/` is generated from node definitions and example pipelines in
+`src/bakeoff/data/` is generated from node definitions, example pipelines and agent skills in
 [rocketride-org/rocketride-server](https://github.com/rocketride-org/rocketride-server).
+`src/bakeoff/data/skills/` is a verbatim copy of the text files (`SKILL.md` files and their
+reference files) under `docs/agents/skills/`; `src/bakeoff/data/skills/SOURCE.json` records the
+commit.
 Tool names, descriptions and argument schemas in `src/bakeoff/shared/tools/engine_tools.py`
 follow the engine's MCP tool registry.
 
