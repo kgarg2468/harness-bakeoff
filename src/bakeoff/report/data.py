@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 # Long texts are cut here; the page shows a shorter preview with an expand control.
 CARD_LIMIT = 6_000  # one transcript card (a tool result, an answer)
@@ -505,6 +505,16 @@ def build_replay(events: list[dict[str, Any]], turns: list[dict[str, Any]]) -> d
     return replay
 
 
+class _ToolEvent(NamedTuple):
+    """A tool.start or tool.end of one call, kept until the turn is walked (see `_runs`)."""
+
+    t: float
+    start: bool  # tool.start; else tool.end
+    late: bool  # from the turn row's `late` list: after the loop's turn.end
+    data: dict[str, Any]
+    eager: bool = False  # a start while the model still streamed its call's message
+
+
 class _TurnWalk:
     """Turns one turn's events into lane segments and cards (see `build_replay`). Each event
     type has an `on_<type>` handler; times are ms since the turn started."""
@@ -516,7 +526,7 @@ class _TurnWalk:
         self.stats: dict[str, int] = replay["stats"]
         self.req: dict | None = None  # the model request being streamed
         self.by_step: dict[Any, dict] = {}  # step -> its latest request (usage arrives late)
-        self.runs: dict[str, dict] = {}  # call id -> its one tool segment (see `_run`)
+        self.calls_seen: dict[str, list[_ToolEvent]] = {}  # call id -> its tool events
         self.tools: list[dict] = []
         self.usage = {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "cost_usd": 0.0}
         self.ended, self.stop = False, None
@@ -530,13 +540,8 @@ class _TurnWalk:
                 handler(_ms(event.get("t_us")), event.get("data") or {}, is_late)
         last = max([_ms(e.get("t_us")) for e, _ in stream] + [0.0])
         self.close(last, "open" if self.ended else "killed")
-        for seg in self.runs.values():
-            starts, ends = seg.pop("starts"), seg.pop("ends")
-            if ends < starts:  # a run that never ended: its process died
-                seg["t1"], seg["ok"] = last, None
-            if starts > 1:  # the same call ran again (I2 fails): the row says so
-                seg["starts"] = starts
-            self.tools.append(seg)
+        for call, tool_events in self.calls_seen.items():
+            self.tools += self._runs(call, tool_events, last)
         rows = _stack(self.tools)
         self.lanes["tools"].extend(sorted(self.tools, key=lambda s: (s["t0"], s["row"])))
         return {"ended": self.ended, "stop": self.stop, "rows": rows}
@@ -599,43 +604,60 @@ class _TurnWalk:
         if item.get("compaction"):
             self.lanes["git"].append({"turn": self.ti, "t": t, "kind": "compact"})
 
-    def _run(self, t: float, data: dict, is_late: bool) -> dict:
-        """The one segment of this call in this turn, stretched to cover `t`.
+    def _runs(self, call: str, events: list[_ToolEvent], last: float) -> list[dict]:
+        """One segment per run of `call` in this turn, so a call that ran twice shows twice,
+        with the gap between: each tool.start paired with the next tool.end, oldest open run
+        first.
 
-        Paired by call id, not by stored order: after turn.end a tool's events go to the turn
-        row's `late` list, where its tool.end can come before its tool.start. The segment spans
-        all of the call's events; `late` marks one that was not done by the loop's turn.end."""
-        call = data.get("call_id")
-        seg = self.runs.get(call)
-        if seg is None:
-            seg = self.runs[call] = {"turn": self.ti, "t0": t, "t1": t, "name": data.get("name"),
-                                     "call": call, "eager": False, "late": False, "ok": None,
-                                     "starts": 0, "ends": 0}  # fmt: skip
-        seg["t0"], seg["t1"] = min(seg["t0"], t), max(seg["t1"], t)
-        seg["name"] = seg["name"] or data.get("name")
-        seg["late"] = seg["late"] or is_late
-        return seg
+        Paired in time order, not stored order: after turn.end a tool's events go to the turn
+        row's `late` list, where its tool.end can come before its tool.start. A run that never
+        ended lasts to the turn's last event (its process died); a tool.end without a start in
+        this turn is a mark at its time. `late`: the run was not done by the loop's turn.end."""
+        segs: list[dict] = []
+        running: list[dict] = []  # started, not ended yet, oldest first
+
+        def new(e: _ToolEvent) -> dict:
+            seg = {"turn": self.ti, "t0": e.t, "t1": last, "name": e.data.get("name"),
+                   "call": call, "eager": e.eager, "late": e.late, "ok": None}  # fmt: skip
+            segs.append(seg)
+            return seg
+
+        # At one time a start sorts before an end, and the end closes the oldest open run: that
+        # is right whether the end is this start's (a run too short to measure) or an earlier's.
+        for e in sorted(events, key=lambda e: (e.t, not e.start)):
+            if e.start:
+                running.append(new(e))
+                continue
+            seg = running.pop(0) if running else new(e)  # no start in this turn: a mark
+            seg["t1"], seg["ok"] = e.t, bool(e.data.get("ok"))
+            seg["name"] = seg["name"] or e.data.get("name")
+            seg["late"] = seg["late"] or e.late
+        if len(segs) > 1:  # the same call ran again (I2 fails): each segment says which run
+            for k, seg in enumerate(segs, 1):
+                seg["run"], seg["runs"] = k, len(segs)
+        return segs
 
     def on_tool_start(self, t: float, data: dict, is_late: bool) -> None:
         self.stats["tool_runs"] += 1
-        seg = self._run(t, data, is_late)
-        if not seg["starts"]:  # a call's first start decides whether it was eager
-            # Eager: a read-only tool started while the model still streams the message that
-            # holds its call. A call saved in an earlier turn (it runs after an approval or a
-            # crash resume) or started after the stream ended is not eager, whatever its turn.
-            seg["eager"] = (
-                not is_late
-                and self.req is not None
-                and bool(data.get("read_only"))
-                and seg["call"] not in self.calls.saved
-            )
-            self.stats["eager"] += seg["eager"]
-        seg["starts"] += 1
+        call = data.get("call_id")
+        # Eager: a read-only tool started while the model still streams the message that holds
+        # its call. A call saved in an earlier turn (it runs after an approval or a crash
+        # resume) or started after the stream ended is not eager, whatever its turn.
+        eager = (
+            not is_late
+            and self.req is not None
+            and bool(data.get("read_only"))
+            and call not in self.calls.saved
+        )
+        seen = self.calls_seen.setdefault(call, [])
+        if not any(e.start for e in seen):  # the stats count calls: its first start decides
+            self.stats["eager"] += eager
+        seen.append(_ToolEvent(t, True, is_late, data, eager))
 
     def on_tool_end(self, t: float, data: dict, is_late: bool) -> None:
-        seg = self._run(t, data, is_late)
-        seg["ends"] += 1
-        seg["ok"] = bool(data.get("ok"))
+        self.calls_seen.setdefault(data.get("call_id"), []).append(
+            _ToolEvent(t, False, is_late, data)
+        )
 
     def on_permission_asked(self, t: float, data: dict, is_late: bool) -> None:
         call, name = data.get("call_id"), data.get("name")

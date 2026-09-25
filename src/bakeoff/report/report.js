@@ -197,7 +197,7 @@
       const style = seg.ok ? `fill:${fill};fill-opacity:.55` : seg.ok === false ? "fill:var(--bad);fill-opacity:.75" : "fill:var(--grey)";
       svg.append(s("rect", {
         x: x(t0), y: yTools + 2 + (seg.row || 0) * 9, width: Math.max(1.5, x(t1) - x(t0)), height: 7, rx: 1.5, style,
-        "data-tip": `${seg.name} (${seg.call})\nran ${fmtMs(t1 - t0)} · ${state}${seg.eager ? "\nread-only, started while the model was still streaming (eager)" : ""}${seg.late ? "\nnot done by the loop's turn.end (late)" : ""}${seg.starts > 1 ? `\nstarted ${seg.starts} times` : ""}`,
+        "data-tip": `${seg.name} (${seg.call})\nran ${fmtMs(t1 - t0)} · ${state}${seg.eager ? "\nread-only, started while the model was still streaming (eager)" : ""}${seg.late ? "\nnot done by the loop's turn.end (late)" : ""}${seg.runs > 1 ? `\nrun ${seg.run} of ${seg.runs} of this call: it ran more than once` : ""}`,
       }));
     }
     for (const p of lay.replay.lanes.perm) {

@@ -442,10 +442,10 @@ def test_parallel_tools_are_stacked_on_separate_rows() -> None:
     assert replay["turns"][0]["rows"] == 2
 
 
-def test_each_call_is_one_tool_run_whatever_the_order_of_its_events() -> None:
-    """After turn.end, c1's tool.end was stored before its tool.start (late events): one row, from
-    its first to its last event, finished and marked late. c2 started twice and ended once: one
-    row that never finished and says it started twice."""
+def test_each_run_of_a_call_is_one_segment_whatever_the_order_of_its_events() -> None:
+    """After turn.end, c1's tool.end was stored before its tool.start (late events): one run,
+    finished and marked late. c2 started twice and ended once: a finished run, then one that
+    never finished, each saying which run of the call it is."""
     t = "T.0"
     assistant = {"role": "assistant", "content": None,
                  "tool_calls": [call("c1", "read_file"), call("c2", "read_file")]}  # fmt: skip
@@ -465,12 +465,43 @@ def test_each_call_is_one_tool_run_whatever_the_order_of_its_events() -> None:
     turns = [{"id": t, "thread": "T", "idx": 0, "kind": "user", "status": "cancelled",
               "stop": "cancelled", "late": late}]  # fmt: skip
     replay = data.build_replay(events, turns)
-    runs = {s["call"]: s for s in replay["lanes"]["tools"]}
-    assert len(replay["lanes"]["tools"]) == 2 and replay["turns"][0]["rows"] == 2
-    c1, c2 = runs["c1"], runs["c2"]
-    assert (c1["t0"], c1["t1"], c1["ok"], c1["late"]) == (0.56, 0.61, True, True)
-    assert "starts" not in c1
-    assert (c2["t0"], c2["t1"], c2["ok"], c2["late"], c2["starts"]) == (0.3, 0.61, None, False, 2)
+    segs = [(s["call"], s["t0"], s["t1"], s["ok"], s["late"], s.get("run"), s.get("runs"))
+            for s in replay["lanes"]["tools"]]  # fmt: skip
+    assert segs == [
+        ("c2", 0.3, 0.4, True, False, 1, 2),
+        ("c2", 0.45, 0.61, None, False, 2, 2),  # never ended: lasts to the turn's last event
+        ("c1", 0.56, 0.61, True, True, None, None),
+    ]
+    assert replay["turns"][0]["rows"] == 2  # c1 overlaps c2's second run
+
+
+def test_a_call_that_ran_twice_shows_each_run_and_the_gap() -> None:
+    """c1 ran, then c2, then c1 again (its second run after turn.end, its tool.end stored
+    before its tool.start): c1 is two segments with c2 in the gap, not one bar across c2."""
+    t = "T.0"
+    events = [
+        env("T", t, 1, 0, "turn.start", turn_id=t),
+        env("T", t, 2, 100, "tool.start", call_id="c1", name="read_file", read_only=True),
+        env("T", t, 3, 200, "tool.end", call_id="c1", name="read_file", ok=True),
+        env("T", t, 4, 250, "tool.start", call_id="c2", name="list_files", read_only=True),
+        env("T", t, 5, 300, "tool.end", call_id="c2", name="list_files", ok=True),
+        env("T", t, 6, 320, "turn.end", stop="cancelled", steps=1),
+    ]
+    late = [
+        {"t_us": 400, "type": "tool.end", "data": {"call_id": "c1", "name": "read_file", "ok": False}},
+        {"t_us": 350, "type": "tool.start", "data": {"call_id": "c1", "name": "read_file"}},
+    ]  # fmt: skip
+    turns = [{"id": t, "thread": "T", "idx": 0, "kind": "user", "status": "cancelled",
+              "stop": "cancelled", "late": late}]  # fmt: skip
+    replay = data.build_replay(events, turns)
+    segs = [(s["call"], s["t0"], s["t1"], s["ok"], s["late"], s.get("run"), s["row"])
+            for s in replay["lanes"]["tools"]]  # fmt: skip
+    assert segs == [
+        ("c1", 0.1, 0.2, True, False, 1, 0),
+        ("c2", 0.25, 0.3, True, False, None, 0),
+        ("c1", 0.35, 0.4, False, True, 2, 0),
+    ]
+    assert replay["turns"][0]["rows"] == 1 and replay["stats"]["tool_runs"] == 3
 
 
 def test_registry_skips_loops_that_are_missing_or_empty(monkeypatch: pytest.MonkeyPatch) -> None:
