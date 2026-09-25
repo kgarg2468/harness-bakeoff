@@ -161,6 +161,13 @@ _OPS = {  # chat completions
     "stall": _op("stall", {"const": True}),
 }
 _ERROR = _obj({"code": _STR, "message": _STR}, "message")
+_RESPONSES_USAGE = {
+    "input_tokens": _INT0,
+    "output_tokens": _INT0,
+    "cached_tokens": _INT0,
+    "cache_write_tokens": _INT0,
+    "reasoning_tokens": _INT0,
+}
 # `done: false` cuts the stream before the item is done: its done events are never sent.
 _RESPONSES_OPS = {
     "text": _op(
@@ -178,16 +185,12 @@ _RESPONSES_OPS = {
         done=_BOOL,
     ),
     "tool_calls": _op("tool_calls", _CALLS, pieces=_INT1),
-    "completed": _op(
-        "completed",
+    "completed": _op("completed", _obj(_RESPONSES_USAGE, "input_tokens", "output_tokens")),
+    # max_output_tokens ran out (say, while the model reasoned): the response ends with usage.
+    "incomplete": _op(
+        "incomplete",
         _obj(
-            {
-                "input_tokens": _INT0,
-                "output_tokens": _INT0,
-                "cached_tokens": _INT0,
-                "cache_write_tokens": _INT0,
-                "reasoning_tokens": _INT0,
-            },
+            {**_RESPONSES_USAGE, "reason": {"enum": ["max_output_tokens", "content_filter"]}},
             "input_tokens",
             "output_tokens",
         ),
@@ -197,7 +200,7 @@ _RESPONSES_OPS = {
     "stall": _op("stall", {"const": True}),
 }
 # The ops that end a Responses stream: every stream has exactly one, as its last op.
-_RESPONSES_ENDS = ("completed", "error", "failed", "stall")
+_RESPONSES_ENDS = ("completed", "incomplete", "error", "failed", "stall")
 
 _STEPS = {
     "user": _obj({"user": _STR, "cancel_after_ms": _INT0}, "user"),
@@ -428,10 +431,11 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
             if ends != [len(ops) - 1]:
                 fail(f"{where}.stream", f"must end with one of {', '.join(_RESPONSES_ENDS)}")
             for i, op in enumerate(ops[:-1]):
-                # An item cut short is the last one of a stream that fails or stalls.
+                # An item cut short is the last one of a stream that fails, stalls or runs out
+                # of output tokens.
                 if op.get("done") is False and (i != len(ops) - 2 or "completed" in ops[-1]):
-                    fail(f"{where}.stream[{i}]", "done: false must come right before the error,"
-                         " failed or stall that ends the stream")  # fmt: skip
+                    fail(f"{where}.stream[{i}]", "done: false must come right before the"
+                         " incomplete, error, failed or stall that ends the stream")  # fmt: skip
             reasoning_ids += [op["reasoning_item"]["id"] for op in ops if "reasoning_item" in op]
         call_ids += [call["id"] for op in ops for call in op.get("tool_calls", [])]
     for what, ids in (("tool call", call_ids), ("reasoning", reasoning_ids)):
@@ -804,9 +808,9 @@ class _Stream:
 # Scenarios with model kind "openai_responses" answer on `POST <base_url>/responses`, as OpenAI's
 # Responses API does (API reference, "Streaming events"): named SSE events (`event: <type>` and
 # `data: {"type": <type>, "sequence_number": n, ...}`), no `data: [DONE]`. The response object in
-# `response.created` / `.completed` / `.failed` does not echo the request, so every loop gets the
-# same bytes. Item ids are fixed: reasoning ids come from the script, function calls are
-# `fc_<call id without "call_">`, messages `msg_<scenario>_<NNN>_<output index>`.
+# `response.created` / `.completed` / `.incomplete` / `.failed` does not echo the request, so
+# every loop gets the same bytes. Item ids are fixed: reasoning ids come from the script,
+# function calls are `fc_<call id without "call_">`, messages `msg_<scenario>_<NNN>_<output index>`.
 
 _OBFUSCATION = string.ascii_letters + string.digits
 _SYSTEM_ROLES = ("system", "developer")
@@ -1003,7 +1007,7 @@ class _ResponsesStream:
         self.obfuscate = obfuscate
         self.seq = 0  # sequence_number of the next event
         self.started = 0  # output items started (the next output_index)
-        self.output: list[dict[str, Any]] = []  # done items, for response.completed / .failed
+        self.output: list[dict[str, Any]] = []  # done items, for the response that ends it
 
     def render(self, ops: list[dict[str, Any]]) -> list[Op]:
         created = self._response("in_progress")
@@ -1029,6 +1033,11 @@ class _ResponsesStream:
         if "completed" in op:
             usage = _responses_usage(op["completed"])
             return [self._event("response.completed", response=self._response("completed", usage))]
+        if "incomplete" in op:
+            spec = op["incomplete"]
+            response = self._response("incomplete", _responses_usage(spec))
+            response["incomplete_details"] = {"reason": spec.get("reason", "max_output_tokens")}
+            return [self._event("response.incomplete", response=response)]
         if "error" in op:
             error = {"code": "server_error", **op["error"]}
             return [self._event("error", code=error["code"], message=error["message"], param=None)]
