@@ -18,6 +18,21 @@ If you'd do something differently, edit this file in a PR, and A will be changed
       `openai_chat_supports_max_completion_tokens`, `openai_system_prompt_role`); thinking uses the
       unified `thinking` setting. `stream_usage: false` has no profile flag, so `extra_body` drops
       `stream_options` with the SDK's `omit`.*
+- [x] **Responses API** (`kind: openai_responses`): `OpenAIResponsesModel` +
+      `OpenAIProvider(openai_client=AsyncOpenAI(base_url=...))` with `OpenAIResponsesModelSettings`.
+      ([models/openai, "OpenAI Responses API"](https://ai.pydantic.dev/models/openai/))
+      *Done in `model.py`. The harness keeps the history, so `openai_store=False`; the effort is the
+      unified `thinking` setting (`openai_reasoning_effort` for values it has no level for, as for
+      BYOK). What goes back is the library's own replay: for a reasoning model it asks for
+      `include: ["reasoning.encrypted_content"]` and, with `openai_send_reasoning_ids` at its
+      default (on for reasoning models), replays each reasoning item with its id and encrypted
+      content, messages with their `phase`, and calls with their ids. 2.31.1 predates `gpt-6-luna`:
+      its name-based profile takes it for a model that does not reason, which would drop the
+      effort, the encrypted reasoning and the `phase`. So a config with `reasoning` passes the
+      documented `profile=` (`supports_thinking`, `openai_supports_reasoning`,
+      `openai_supports_encrypted_reasoning_content`, `openai_supports_phase`); 2.50.0 knows the
+      model and agrees. `Item.message` is the chat-shaped view without the reasoning items (it has
+      no field for them); the native replays them.*
 - [x] **Loop API**: `Agent.iter()` (or `run_stream_events()`), never `run_stream()`, which stops at the
       first final output. ([agents](https://ai.pydantic.dev/agents/))
       *`Agent.iter()` in its own task, `node.stream()` for request nodes and for tool nodes (its
@@ -95,11 +110,14 @@ If you'd do something differently, edit this file in a PR, and A will be changed
 - [x] **Quiet**: `PYDANTIC_AI_NO_BANNER=1`, instrumentation off (nothing may write to stdout/stderr
       inside the engine).
       *`pydantic_ai.BANNER_ENABLED = False` (the in-code switch), instrumentation is off by default,
-      and two library warnings are filtered: "dropped temperature for a reasoning model" and
-      `CostNotFoundWarning` (a cost limit with no known price; the usage events say `none`).*
+      and three library warnings are filtered: "dropped temperature for a reasoning model",
+      `CostNotFoundWarning` (a cost limit with no known price; the usage events say `none`) and
+      "Handling of this event type is not yet implemented" (a Responses event with no handler,
+      such as `error`: below).*
 - [x] **Versions**: passes on 2.31.1 (fits the engine today) and on the latest release.
       *2.31.1 + openai 2.54.0 and 2.50.0 + openai 3.19.2 (httpx2; the latest on 2026-09-25), same
-      code.*
+      code, S01-S15 and R01-R05. On 2.50.0 the Responses request also carries
+      `reasoning.context: "all_turns"`, the library's default for the models it knows support it.*
 
 ## Code A had to add
 
@@ -122,10 +140,19 @@ The library has no mechanism for these, so A has its own code (counted like ever
   only when the whole batch is done.
 - **Waiting for the runner before each request** (`await out.join()`, 1 line; the same wait
   orders `tool.start`).
-- **Importing the SDK's chat resources at module import** (`model.py`, 1 line): the first
-  `OpenAIChatModel` loads them lazily, which blocked the event loop for about 0.3 s inside the
-  first turn on openai 2.x. What remains of the first turn's setup (about 40 ms, 16 ms for later
-  endpoints) is building the model: the OpenAI client and its SSL context.
+- **Retrying a Responses stream that failed** (3 lines in `_run`, and the warning filter). The
+  library ends the stream as if it were done after an `error` event (it has no handler for it)
+  or a `response.failed`, so the partial answer would be the final one. A stream that brought
+  no usage never reached `response.completed` (or `.incomplete`): A raises it as a
+  `ModelAPIError`, and the retry above takes over.
+- **The chat-shaped view of a Responses response** (2 lines in `mapping._assistant`, and a
+  `responses_api` flag from `_Turn` through `to_openai`): `Item.message` leaves the reasoning
+  items out; without this they would look like BYOK thinking fields.
+- **Importing the SDK's chat and responses resources at module import** (`model.py`, 2 lines):
+  the first `OpenAIChatModel` (`OpenAIResponsesModel`) loads them lazily, which blocked the event
+  loop for about 0.3 s (0.09 s) inside the first turn on openai 2.x. What remains of the first
+  turn's setup (about 40 ms, 16 ms for later endpoints) is building the model: the OpenAI client
+  and its SSL context.
 
 ## Library bugs and behaviors (worked around or recorded)
 
@@ -140,6 +167,18 @@ The library has no mechanism for these, so A has its own code (counted like ever
 - **Worked around**: errors the library does not wrap: on openai 2.x a connection that drops
   mid-stream raises raw `httpx.RemoteProtocolError`, and on `OpenAIChatModel` (BYOK) an
   `{"error": ...}` event mid-stream raises raw `openai.APIError`.
+- **Worked around** (gap): the Responses `error` event has no handler (2.31.1 and 2.50.0). The
+  library warns with the event (to stderr, unless filtered) and ends the stream as if it were
+  done, so its code and message are lost: A's retry reason and error say only "the stream failed
+  before response.completed". The OpenAI SDK raises only for an event with a top-level `error`
+  object, not for the documented flat `{"type": "error", "code", "message"}` shape.
+- **Worked around** (bug): the segment behind a streamed response knows that a Responses stream
+  ended without a terminal event (state `incomplete`), but the continuation wrapper that
+  `node.stream()` returns reports every finished stream as `complete`, so A reads the missing
+  usage instead (above).
+- **Recorded**: on 2.31.1 a `response.failed` or `response.incomplete` sets no finish reason (2.50.0
+  maps them to `error` and `length`), so A tells a failed stream by its missing usage, the same
+  on both. A `response.failed` that does carry usage is taken for a finished response.
 - **Worked around**: a `cost_limit` drops the response that crosses it from history (above).
 - **Worked around**: `DeferredToolResults` needs an answer for every open call, so there is no
   partial approval (above).
