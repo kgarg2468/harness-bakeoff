@@ -175,6 +175,20 @@ own history uses it). Requests go to `POST <base>/responses` and are recorded ve
 chat requests. The body must be a JSON object with `stream: true` and `input`: a non-empty list
 of item objects, or a string (one user message, as the API reads it); else 400.
 
+Each input item must have the shape the API requires of its type, else 400 in the API's error
+shape, `param` naming the field (e.g. `Missing required parameter: 'input[3].output'.`, code
+`missing_required_parameter`; or `invalid_type`, `invalid_value`), whatever the script says:
+
+- `message` (`type` may be left out): `role` (`user`, `assistant`, `system`, `developer`) and
+  `content`, a string or parts (`input_text`, `input_image`, `input_file`; for `assistant`,
+  `output_text` or `refusal`); a text part has a string `text`;
+- `function_call`: strings `call_id`, `name` and `arguments`;
+- `function_call_output`: a string `call_id` and `output`, a string or input parts;
+- `reasoning`: a string `id`, a `summary` list of `summary_text` parts, and `encrypted_content`
+  a string or null if present.
+
+Other item types get 400 as well: the fake serves only these four.
+
 **Stream.** Named SSE events, one per HTTP chunk:
 `event: <type>\ndata: {"type": <type>, "sequence_number": n, ...}\n\n`, numbered from 0. There
 is no `data: [DONE]`: the stream ends after its last event. It always starts with

@@ -504,6 +504,8 @@ def reply(
         return rejected(400, f"request body is not JSON: {exc}")
     if problem := (_chat_body_problem if api == "chat" else _responses_body_problem)(body):
         return rejected(400, problem)
+    if api == "responses" and (malformed := _malformed_item(_input_items(body))):
+        return rejected(400, *malformed)
     if body.get("stream") is not True:
         return rejected(400, "the fake provider only serves stream=true")
     if index >= len(scenario.exchanges):
@@ -830,6 +832,110 @@ def _responses_body_problem(body: object) -> str | None:
     if not all(isinstance(item, dict) for item in items):
         return "every input item must be an object"
     return None
+
+
+type _Problem = tuple[str, str, str]  # (message, param, code) of the API's 400
+
+# The input item types this fake serves, with their required fields and those fields' JSON types.
+# The API checks these before anything else, so a malformed item is 400 whatever the script says.
+_ITEM_FIELDS: dict[str, dict[str, tuple[type, ...]]] = {
+    "message": {"role": (str,), "content": (str, list)},
+    "function_call": {"call_id": (str,), "name": (str,), "arguments": (str,)},
+    "function_call_output": {"call_id": (str,), "output": (str, list)},
+    "reasoning": {"id": (str,), "summary": (list,)},
+}
+_ROLES = ("user", "assistant", "system", "developer")
+_INPUT_PARTS = ("input_text", "input_image", "input_file")
+_OUTPUT_PARTS = ("output_text", "refusal")  # an assistant message's, replayed
+_JSON_TYPES: dict[type, str] = {
+    dict: "an object",
+    list: "an array",
+    str: "a string",
+    bool: "a boolean",
+    int: "an integer",
+    float: "a number",
+    type(None): "null",
+}
+
+
+def _malformed_item(items: list[dict[str, Any]]) -> _Problem | None:
+    """The API's 400 for the first input item whose shape it refuses, naming the field as it
+    does (`input[3].output`). Item types other than the four this fake serves are refused too."""
+    for n, item in enumerate(items):
+        at, kind = f"input[{n}]", _item_type(item)
+        if kind is None:
+            return _missing(f"{at}.type")
+        if not isinstance(kind, str) or kind not in _ITEM_FIELDS:
+            return _invalid_value(kind, tuple(_ITEM_FIELDS), f"{at}.type")
+        for key, types in _ITEM_FIELDS[kind].items():
+            if problem := _field_problem(item, key, types, at):
+                return problem
+        problem = None
+        match kind:
+            case "message" if item["role"] not in _ROLES:
+                problem = _invalid_value(item["role"], _ROLES, f"{at}.role")
+            case "message":
+                # Replayed assistant text must be output_text: input_text there is refused.
+                parts = _OUTPUT_PARTS if item["role"] == "assistant" else _INPUT_PARTS
+                problem = _malformed_parts(item["content"], parts, f"{at}.content")
+            case "function_call_output":
+                problem = _malformed_parts(item["output"], _INPUT_PARTS, f"{at}.output")
+            case "reasoning":
+                encrypted = item.get("encrypted_content")
+                if encrypted is not None and not isinstance(encrypted, str):
+                    problem = _invalid_type(f"{at}.encrypted_content", (str,), encrypted)
+                else:
+                    problem = _malformed_parts(item["summary"], ("summary_text",), f"{at}.summary")
+        if problem:
+            return problem
+    return None
+
+
+def _malformed_parts(parts: str | list[Any], types: tuple[str, ...], at: str) -> _Problem | None:
+    """The first content part the API refuses (a string is plain text, never refused)."""
+    for i, part in enumerate(parts if isinstance(parts, list) else []):
+        where = f"{at}[{i}]"
+        if not isinstance(part, dict):
+            return _invalid_type(where, (dict,), part)
+        if problem := _field_problem(part, "type", (str,), where):
+            return problem
+        if part["type"] not in types:
+            return _invalid_value(part["type"], types, where)
+        if part["type"].endswith("_text") and (
+            problem := _field_problem(part, "text", (str,), where)
+        ):
+            return problem
+    return None
+
+
+def _field_problem(
+    obj: dict[str, Any], key: str, types: tuple[type, ...], at: str
+) -> _Problem | None:
+    """The API's 400 if field `key` of the object at `at` is missing or of the wrong JSON type."""
+    if key not in obj:
+        return _missing(f"{at}.{key}")
+    if not isinstance(obj[key], types):
+        return _invalid_type(f"{at}.{key}", types, obj[key])
+    return None
+
+
+def _missing(param: str) -> _Problem:
+    return f"Missing required parameter: '{param}'.", param, "missing_required_parameter"
+
+
+def _invalid_type(param: str, types: tuple[type, ...], got: object) -> _Problem:
+    names = [_JSON_TYPES[t] for t in types]
+    want = names[0] if len(names) == 1 else "one of " + " or ".join(names)
+    message = (
+        f"Invalid type for '{param}': expected {want}, but got {_JSON_TYPES[type(got)]} instead."
+    )
+    return message, param, "invalid_type"
+
+
+def _invalid_value(got: object, supported: tuple[str, ...], param: str) -> _Problem:
+    *rest, last = [f"'{value}'" for value in supported]
+    listed = f"{', '.join(rest)}{',' if len(rest) > 1 else ''} and {last}" if rest else last
+    return f"Invalid value: '{got}'. Supported values are: {listed}.", param, "invalid_value"
 
 
 def _input_items(body: dict[str, Any]) -> list[dict[str, Any]]:
