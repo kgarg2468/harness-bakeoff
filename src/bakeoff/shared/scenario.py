@@ -919,12 +919,13 @@ def failing(result: dict[str, Any]) -> set[str]:
 
 
 def status(result: dict[str, Any]) -> str:
-    """pass; xfail: it fails exactly as documented (`loops.KnownFailure`); XPASS: a documented
-    failure passed; FAIL: anything else, including a documented cell that fails differently."""
+    """pass; xfail: it fails exactly as documented (`loops.KnownFailure`: the same checks, and
+    the documented driver error or none); XPASS: a documented failure passed; FAIL: anything
+    else, including a documented cell that fails differently."""
     known = loops.known_failure(result["impl"], result["scenario"])
     if result["passed"]:
         return "XPASS" if known else "pass"
-    if known and result["error"] is None and failing(result) == known.checks:
+    if known and known.matches(failing(result), result["error"]):
         return "xfail"
     return "FAIL"
 
@@ -1007,6 +1008,7 @@ def summarize(
             "reason": reason(r),
             "expected_failure": None if known is None else known.why,
             "expected_checks": None if known is None else sorted(known.checks),
+            "expected_error": None if known is None else known.error,
             "duration_ms": r["duration_ms"],
         }
     sha, dirty = git_state()

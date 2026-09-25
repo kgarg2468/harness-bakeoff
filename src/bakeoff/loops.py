@@ -21,10 +21,18 @@ from bakeoff.shared.contract import Loop
 @dataclass(frozen=True, slots=True)
 class KnownFailure:
     """A documented failure of one scenario: the checks that fail (final `expect` keys and
-    invariant names, e.g. {"tool_runs"}), and why."""
+    invariant names, e.g. {"tool_runs"}), and why. If the failure also stops the driver (e.g.
+    an `approve` step that finds no paused turn), `error` is a part of the run's error."""
 
     checks: frozenset[str]
     why: str
+    error: str | None = None
+
+    def matches(self, failing: set[str], error: str | None) -> bool:
+        """Whether a run failed exactly as documented: these checks, and this error or none."""
+        if failing != self.checks:
+            return False
+        return error is None if self.error is None else error is not None and self.error in error
 
 
 @dataclass(frozen=True, slots=True)

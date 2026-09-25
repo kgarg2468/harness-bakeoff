@@ -631,6 +631,7 @@ async def test_run_matrix_writes_the_summary_and_latest(
         "reason": cells["X02"]["reason"],
         "expected_failure": None,
         "expected_checks": None,
+        "expected_error": None,
         "duration_ms": cells["X02"]["duration_ms"],
     }
     assert cells["X02"]["reason"].startswith("text_contains: missing 'Goodbye' in 'Hello")
@@ -765,6 +766,30 @@ sys.exit(main(["scenario", "S01", "S13", "--impl", "our", "--out", {str(out)!r},
     )
     summary = json.loads((out / "runs" / "k1" / "summary.json").read_text())
     assert list(summary["matrix"]) == ["S01"] and summary["stopped"].startswith("S01/our left")
+
+
+def test_a_documented_failure_may_name_the_driver_error_it_causes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stops = frozenset({"stops"})
+    known = {
+        "X01": loops.KnownFailure(stops, "never pauses", "has no paused turn"),
+        "X02": loops.KnownFailure(stops, "wrong stop"),
+    }
+    monkeypatch.setitem(loops.REGISTRY, "our", replace(loops.REGISTRY["our"], known_failures=known))
+
+    def result(sid: str, error: str | None, *failed: str) -> dict[str, Any]:
+        expect = {key: {"ok": key not in failed, "detail": ""} for key in ("stops", "requests")}
+        return {"impl": "our", "scenario": sid, "passed": False, "error": error,
+                "expect": expect, "invariants": {}}  # fmt: skip
+
+    no_pause = "DriverError: step 2 {...}: thread X01-our has no paused turn (last turn is error)"
+    assert scenario.status(result("X01", no_pause, "stops")) == "xfail"
+    assert scenario.status(result("X01", None, "stops")) == "FAIL"  # the error did not come
+    assert scenario.status(result("X01", "DriverError: other", "stops")) == "FAIL"
+    assert scenario.status(result("X01", no_pause, "stops", "requests")) == "FAIL"
+    assert scenario.status(result("X02", None, "stops")) == "xfail"
+    assert scenario.status(result("X02", no_pause, "stops")) == "FAIL"  # an undocumented error
 
 
 def test_unexpected_lists_failures_and_passes_of_documented_failures() -> None:
