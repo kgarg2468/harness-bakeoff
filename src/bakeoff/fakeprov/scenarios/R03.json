@@ -5,7 +5,7 @@
   "model": {
     "kind": "openai_responses",
     "model": "gpt-6-luna",
-    "reasoning": {"effort": "xhigh"},
+    "reasoning": {"effort": "xhigh", "summary": "auto"},
     "temperature": null
   },
   "rules": {"*": "allow", "write_file": "ask", "edit_file": "ask"},

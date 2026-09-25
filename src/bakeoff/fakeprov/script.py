@@ -538,6 +538,7 @@ def reply(
             model=scenario.model["model"],
             effort=(scenario.model.get("reasoning") or {}).get("effort"),
             obfuscate=options.get("include_obfuscation") is not False,
+            summarize=_asks_summary(body),
         )
     else:
         prefix = "gen" if style == "openrouter" else "chatcmpl"
@@ -868,10 +869,19 @@ def _split_system(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     return "\n".join(t for t in system if t), items[n:]
 
 
-def _done_reasoning(spec: dict[str, Any]) -> dict[str, Any]:
+def _asks_summary(body: dict[str, Any]) -> bool:
+    """Whether a request asks for reasoning summaries (`reasoning.summary`): the API streams
+    none, and its reasoning items have an empty `summary`, unless it does."""
+    reasoning = body.get("reasoning")
+    return isinstance(reasoning, dict) and bool(reasoning.get("summary"))
+
+
+def _done_reasoning(spec: dict[str, Any], summarized: bool) -> dict[str, Any]:
     """The done reasoning item of a scripted `reasoning_item`: what `response.output_item.done`
-    sends, and exactly what a request must replay (`reasoning_replayed`)."""
-    summary = [{"type": "summary_text", "text": text} for text in spec.get("summary", [])]
+    sends (with its summary if the request asked for one), and exactly what a request must
+    replay (`reasoning_replayed`)."""
+    texts = spec.get("summary", []) if summarized else []
+    summary = [{"type": "summary_text", "text": text} for text in texts]
     return {
         "id": spec["id"],
         "type": "reasoning",
@@ -961,7 +971,9 @@ def _input_failures(expect: dict[str, Any], body: dict[str, Any], scenario: Scen
             failures.append(f"input item {i} lacks {check['contains']!r}")
     scripted = _scripted_reasoning(scenario)
     for rid in expect.get("reasoning_replayed", []):
-        sent = _done_reasoning(scripted[rid]["reasoning_item"])
+        # A thread's model config is fixed, so this request asks for summaries if the one that
+        # got the item did.
+        sent = _done_reasoning(scripted[rid]["reasoning_item"], _asks_summary(body))
         found = [
             item for item in items if _item_type(item) == "reasoning" and item.get("id") == rid
         ]
@@ -998,11 +1010,12 @@ class _ResponsesStream:
     """Renders one scripted response as the Responses API's named SSE events."""
 
     def __init__(
-        self, *, response_id: str, model: str, effort: str | None, obfuscate: bool
+        self, *, response_id: str, model: str, effort: str | None, obfuscate: bool, summarize: bool
     ) -> None:
         self.response_id = response_id
         self.model = model
         self.effort = effort
+        self.summarize = summarize  # stream reasoning summaries (the request asked for them)
         # Delta events carry an `obfuscation` pad by default (`stream_options.include_obfuscation`).
         self.obfuscate = obfuscate
         self.seq = 0  # sequence_number of the next event
@@ -1097,7 +1110,7 @@ class _ResponsesStream:
         frames: list[Op] = [
             self._event("response.output_item.added", output_index=index, item=added)
         ]
-        summary = spec.get("summary", [])
+        summary = spec.get("summary", []) if self.summarize else []
         for n, text in enumerate(summary):
             part_at = {**at, "summary_index": n}
             frames.append(
@@ -1125,7 +1138,7 @@ class _ResponsesStream:
             ]
         if op.get("done") is False:
             return frames
-        done = _done_reasoning(spec)
+        done = _done_reasoning(spec, self.summarize)
         self.output.append(done)
         return [*frames, self._event("response.output_item.done", output_index=index, item=done)]
 

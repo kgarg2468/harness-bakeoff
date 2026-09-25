@@ -194,10 +194,10 @@ A scenario with model kind `openai_responses` speaks OpenAI's Responses API inst
 (`response.created`, `response.output_item.added`/`.done`, `response.output_text.delta`,
 `response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`,
 `response.completed` with `usage`, the `error` event, ...), no `[DONE]`. Its primitives are
-reasoning items (`encrypted_content`, optional summary deltas; the added item's
-`encrypted_content` is incomplete, as the API documents), messages (with `phase`), function
-calls, `completed` (usage), `incomplete` (usage; out of `max_output_tokens`), `error` and
-`failed` mid-stream, `stall`, and items cut short before their done events. Its strict mode
+reasoning items (`encrypted_content`, summary deltas if the request asks for them; the added
+item's `encrypted_content` is incomplete, as the API documents), messages (with `phase`),
+function calls, `completed` (usage), `incomplete` (usage; out of `max_output_tokens`), `error`
+and `failed` mid-stream, `stall`, and items cut short before their done events. Its strict mode
 `reject_unencrypted_reasoning` answers as the API does with `store: false`: a replayed reasoning
 item without its `encrypted_content` is 404, one whose `encrypted_content` is not what its done
 event sent is 400. Its `expect` checks read `input` (e.g. `input_len`, `last_type`,
@@ -229,7 +229,7 @@ recordings and the session log, never from what a loop says about itself.
 | S13 | BYOK thinking: `openai_compat` endpoint, non-OpenAI model name, reasoning requested | the reasoning parameter reaches the wire |
 | S14 | BYOK strict endpoint: 400 if body has `reasoning`, `reasoning_effort` or `stream_options` (configured via compat flags) | the turn finishes |
 | S15 | compaction hand-off: runner appends a summary item; loop sends [system, summary, new user] | prefix resets only at the compaction boundary |
-| R01 | Responses API (`gpt-6-luna`, effort `xhigh`): text only | `store: false`, `include` has `reasoning.encrypted_content`, Responses tools; exact text; usage from `response.completed` |
+| R01 | Responses API (`gpt-6-luna`, effort `xhigh`, summary `auto`): text only | `store: false`, `include` has `reasoning.encrypted_content`, `reasoning.summary` sent, Responses tools; exact text; usage from `response.completed` |
 | R02 | reasoning + one function call + its `function_call_output`, then the answer | the reasoning item replayed exactly as sent; tool ran once |
 | R03 | commentary + 3 function calls in one response; `write_file` asks; approve in a new process | as S05; the resumed request replays reasoning, commentary (`phase`) and all calls |
 | R04 | 429 with `retry-after: 1`, then OK; next turn an `error` event mid-stream, then OK | waited per Retry-After; nothing of the failed attempt is replayed |

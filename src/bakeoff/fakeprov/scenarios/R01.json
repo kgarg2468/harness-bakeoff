@@ -5,7 +5,7 @@
   "model": {
     "kind": "openai_responses",
     "model": "gpt-6-luna",
-    "reasoning": {"effort": "xhigh"},
+    "reasoning": {"effort": "xhigh", "summary": "auto"},
     "temperature": null
   },
   "rules": {"*": "allow"},
@@ -18,7 +18,7 @@
   "driver": [{"user": "Say hello to the RocketRide team."}],
   "exchanges": [
     {
-      "note": "The request shape: Responses tools, xhigh effort, store false, encrypted reasoning included. A reasoning item with a summary, then the answer.",
+      "note": "The request shape: Responses tools, xhigh effort with a reasoning summary (the API streams none unless asked), store false, encrypted reasoning included. A reasoning item with a summary, then the answer.",
       "expect": {
         "model": "gpt-6-luna",
         "body_has": ["tools"],
@@ -27,6 +27,7 @@
           "stream": true,
           "store": false,
           "reasoning.effort": "xhigh",
+          "reasoning.summary": "auto",
           "tools.0.type": "function",
           "tools.0.name": "list_components"
         },
