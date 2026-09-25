@@ -1497,6 +1497,24 @@ async def test_the_event_that_ends_a_responses_stream_is_read_across_chunks(eol)
         assert (b"".join(passed), state.event) == (body, "response.failed")
 
 
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n", b"\r"], ids=["LF", "CRLF", "CR"])
+async def test_an_event_name_belongs_to_its_own_record_only(eol):
+    """Greptile #4106536163: a named non-terminal record followed by an unnamed completion must
+    not leave the earlier name behind (an unnamed record reads as None, a valid end), wherever
+    the bytes are cut, including a CRLF split across two chunks."""
+    body = b"event: response.output_text.delta" + eol + b'data: {"delta": "hi"}' + eol * 2
+    body += b'data: {"type": "response.completed"}' + eol * 2
+    for size in range(1, len(body) + 1):
+
+        async def chunks(size: int = size) -> AsyncIterator[bytes]:
+            for start in range(0, len(body), size):
+                yield body[start : start + size]
+
+        state = loop_module._Turn("t", StubTools(), 1, set(), set(), responses_api=True)
+        passed = [chunk async for chunk in loop_module._note_events(chunks(), state)]
+        assert (b"".join(passed), state.event) == (body, None), size
+
+
 def responses_bytes(tmp_path: Path, stream: list[dict[str, Any]]) -> bytes:
     """The bytes fakeprov streams for one Responses exchange with these ops."""
     with responses_server(tmp_path, {"respond": {"stream": stream}}) as srv:

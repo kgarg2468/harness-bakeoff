@@ -630,14 +630,30 @@ async def _on_response(response: Any) -> None:
 
 
 async def _note_events(chunks: AsyncIterator[bytes], turn: _Turn) -> AsyncIterator[bytes]:
-    """Pass a Responses stream's bytes on, noting each SSE event's name in `turn.event`: the
-    library gives a failed response no status (2.31.1), so only its event tells it apart."""
+    """Pass a Responses stream's bytes on, noting the name of each dispatched SSE record in
+    `turn.event` (None for an unnamed one): the library gives a failed response no status
+    (2.31.1), so only its event tells it apart. As in the SSE spec, an `event:` field names only
+    its own record, which a blank line dispatches."""
     line = b""  # the start of the line the next bytes continue
+    name: str | None = None  # the event name of the record being read
+    data = False  # whether that record has a data field (only then is it dispatched)
+    after_cr = False  # the last chunk ended with CR: a leading LF finishes that CRLF
     async for chunk in chunks:
-        *lines, rest = _LINE_END.split(line + chunk)
+        buf = line + chunk
+        if after_cr and not line and buf.startswith(b"\n"):
+            buf = buf[1:]  # not an empty line: the second half of a CRLF split across chunks
+        after_cr = chunk.endswith(b"\r")
+        *lines, rest = _LINE_END.split(buf)
         line = rest[:64]  # a line's field and event name are all that is read
         for full in lines:
-            name, _, value = full.partition(b":")
-            if name == b"event":
-                turn.event = value.strip().decode()
+            if not full:  # a blank line dispatches the record
+                if data:
+                    turn.event = name
+                name, data = None, False
+                continue
+            field, _, value = full.partition(b":")
+            if field == b"event":
+                name = value.strip().decode()
+            elif field == b"data":
+                data = True
         yield chunk
