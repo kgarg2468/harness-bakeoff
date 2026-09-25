@@ -4,7 +4,8 @@ The native `ModelMessage` JSON is the source of truth for this loop's history. E
 the native JSON of exactly what it shows: a model response, or one part of a request (a tool
 result or a prompt). pydantic-ai merges consecutive requests again before it sends them, so the
 split never reaches the wire, and a crash between two items of one tool batch loses nothing that
-was saved. `Item.message` is the OpenAI-shaped view, as the model puts it on the wire.
+was saved. `Item.message` is the OpenAI-shaped view, as the model puts it on the wire (for the
+Responses API, the chat-shaped view of it, without the reasoning items).
 """
 
 from __future__ import annotations
@@ -60,11 +61,11 @@ def to_history(items: list[Item]) -> list[ModelMessage]:
     return history
 
 
-def to_openai(message: ModelMessage) -> list[dict[str, Any]]:
+def to_openai(message: ModelMessage, responses_api: bool = False) -> list[dict[str, Any]]:
     """The OpenAI chat messages for one native message: one per tool result or prompt, one per
     response, none for a response with nothing to send (the model skips those too)."""
     if isinstance(message, ModelResponse):
-        assistant = _assistant(replayable([message])[0])
+        assistant = _assistant(replayable([message])[0], responses_api)
         return [assistant] if assistant is not None else []
     out: list[dict[str, Any]] = []
     for part in message.parts:
@@ -175,15 +176,18 @@ def _tool(call_id: str, content: str) -> dict[str, Any]:
     return {"role": "tool", "tool_call_id": call_id, "content": content}
 
 
-def _assistant(response: ModelResponse) -> dict[str, Any] | None:
+def _assistant(response: ModelResponse, responses_api: bool) -> dict[str, Any] | None:
     """The assistant message OpenRouterModel / OpenAIChatModel sends for a response, or None
-    (the library's "auto" rules for thinking; text pieces are joined with a blank line)."""
+    (the library's "auto" rules for thinking; text pieces are joined with a blank line). A
+    Responses API reasoning item has no chat field: only the native replays it (encrypted)."""
     texts: list[str] = []
     details: list[dict[str, Any]] = []
     fields: dict[str, list[str]] = {}
     for part in response.parts:
         if isinstance(part, TextPart):
             texts.append(part.content)
+        elif isinstance(part, ThinkingPart) and responses_api:
+            continue
         elif isinstance(part, ThinkingPart) and part.provider_name == "openrouter":
             details.append(_reasoning_detail(part))
         elif isinstance(part, ThinkingPart) and part.id not in (None, "content"):

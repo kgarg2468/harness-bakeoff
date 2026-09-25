@@ -82,14 +82,6 @@ REGISTRY: dict[str, LoopEntry] = {
             "pydantic",
             "bakeoff.pydantic_version:PydanticLoop",
             ("pydantic-ai-slim", "openai", "httpx"),
-            # It sends chat completions, which a Responses scenario answers with 404.
-            _no_responses_api(
-                R01=_NOT_ANSWERED | {"usage"},
-                R02=_NO_TOOLS | {"usage"},
-                R03=_NO_TOOLS | {"files"},
-                R04=_NOT_ANSWERED | {"requests"},
-                R05=_NOT_ANSWERED,
-            ),
         ),
         LoopEntry(
             "hybrid", "bakeoff.hybrid_version:HybridLoop", ("pydantic-ai-slim", "openai", "httpx")

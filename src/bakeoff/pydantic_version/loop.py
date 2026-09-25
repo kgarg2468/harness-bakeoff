@@ -61,7 +61,7 @@ from pydantic_ai import (
     UsageLimits,
 )
 from pydantic_ai.capabilities import Hooks, ProcessHistory
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models import Model
 from pydantic_ai.toolsets import ApprovalRequiredToolset, FunctionToolset
 from pydantic_ai.usage import RunUsage
 
@@ -109,6 +109,7 @@ class _Turn:
     max_steps: int
     decided: set[str]  # the calls the user answered in this resume
     read_only: set[str]  # tool names
+    responses_api: bool  # the model speaks OpenAI's Responses API
     out: asyncio.Queue[Event | None] = field(default_factory=asyncio.Queue)
     steps: int = 0
     attempt: int = 0  # of the current step
@@ -181,7 +182,7 @@ class _Turn:
                     if id(part := piece.parts[0]) in self.emitted:
                         continue
                     self.emitted[id(part)] = part
-                for openai_message in mapping.to_openai(piece):
+                for openai_message in mapping.to_openai(piece, self.responses_api):
                     item = Item(
                         id=uuid.uuid4().hex,
                         turn_id=self.turn_id,
@@ -206,15 +207,17 @@ class PydanticLoop:
     name = "pydantic"
 
     def __init__(self) -> None:
-        # Nothing may reach stdout/stderr (rule 1): newer releases print a first-run banner, the
-        # library warns each time it drops `temperature` for a reasoning model (it drops it
-        # correctly either way), and it warns at the end of a run with a cost limit that no
-        # price is known for (the usage events already say cost_source="none").
+        # Nothing may reach stdout/stderr (rule 1). Newer releases print a first-run banner, and
+        # the library warns: each time it drops `temperature` for a reasoning model (it drops it
+        # correctly either way); at the end of a run with a cost limit that no price is known for
+        # (the usage events already say cost_source="none"); and for a Responses event it has no
+        # handler for, such as `error` (`_run` retries the stream that event cut short).
         pydantic_ai.BANNER_ENABLED = False
         warnings.filterwarnings("ignore", "Sampling parameters", UserWarning, "pydantic_ai")
+        warnings.filterwarnings("ignore", "Handling of this event type", UserWarning, "pydantic_ai")
         warnings.filterwarnings("ignore", category=CostNotFoundWarning)
         self._agents: dict[str, Agent[_Turn, str | DeferredToolRequests]] = {}
-        self._models: dict[str, OpenAIChatModel] = {}
+        self._models: dict[str, Model] = {}
 
     async def run_turn(
         self, turn: TurnInput, tools: ToolHost, cancel: asyncio.Event
@@ -224,7 +227,8 @@ class PydanticLoop:
         decisions = turn.resume.decisions if turn.resume else {}
         decided = {cid for cid, d in decisions.items() if d in ("allow", "deny")}
         read_only = {spec.name for spec in tools.specs() if spec.read_only}
-        state = _Turn(turn.turn_id, tools, turn.limits.max_steps, decided, read_only)
+        responses_api = turn.model.kind == "openai_responses"
+        state = _Turn(turn.turn_id, tools, turn.limits.max_steps, decided, read_only, responses_api)
         task = asyncio.create_task(self._drive(turn, state, cancel))
         try:
             while (event := await state.out.get()) is not None:
@@ -344,6 +348,12 @@ class PydanticLoop:
                             try:
                                 async for event in stream:
                                     state.stream_event(event)
+                                if state.responses_api and not stream.response.usage.has_values():
+                                    # Usage comes with `response.completed` (or `.incomplete`).
+                                    # The library ends a stream as if it were done after an
+                                    # `error` event (which it skips) or a `response.failed`.
+                                    failed = "the stream failed before response.completed"
+                                    raise ModelAPIError(model.model_name, failed)
                             except Exception as exc:
                                 # No tool runs before a response is complete, so a retry is safe.
                                 if _retry_reason(exc) and state.attempt <= turn.model.max_retries:
@@ -397,7 +407,7 @@ class PydanticLoop:
             )
         return agent
 
-    def _model(self, cfg: ModelConfig) -> OpenAIChatModel:
+    def _model(self, cfg: ModelConfig) -> Model:
         key = json.dumps(asdict(replace(cfg, session_id=None)), sort_keys=True)
         if (model := self._models.get(key)) is None:
             hooks = {"request": [_on_request], "response": [_on_response]}

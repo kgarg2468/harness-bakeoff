@@ -12,6 +12,7 @@ import uuid
 import warnings
 from collections import defaultdict
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,6 +21,7 @@ from pydantic_ai import ModelRequest, ModelResponse, TextPart, ToolCallPart, Too
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.pydantic_version import PydanticLoop, mapping
 from bakeoff.pydantic_version import loop as loop_module
 from bakeoff.shared.contract import (
@@ -679,14 +681,16 @@ async def test_threads_share_one_model_and_send_their_own_session_id(loop):
     assert sent == [("thread-a", ephemeral), ("thread-b", ephemeral), (None, ephemeral)]
 
 
-def test_the_first_model_imports_nothing_inside_a_turn():
+@pytest.mark.parametrize("kind", ["openrouter", "openai_compat", "openai_responses"])
+def test_the_first_model_imports_nothing_inside_a_turn(kind):
     """Building a model must not import (and block the event loop, ~0.3 s on openai 2.x): the
-    module pays for the SDK's lazily loaded chat resources at import. Needs a fresh process."""
+    module pays for the SDK's lazily loaded chat and responses resources at import. Needs a
+    fresh process."""
     script = (
         "import sys; import bakeoff.pydantic_version.loop; before = set(sys.modules); "
         "from bakeoff.pydantic_version.model import build_model; "
         "from bakeoff.shared.contract import ModelConfig; "
-        "build_model(ModelConfig(base_url='http://127.0.0.1:9/v1', model='anthropic/x'), {}); "
+        f"build_model(ModelConfig('http://127.0.0.1:9/v1', 'anthropic/x', kind='{kind}'), {{}}); "
         "print(sorted(m for m in set(sys.modules) - before if m.startswith('openai')))"
     )
     out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
@@ -1141,3 +1145,109 @@ async def test_only_an_explicit_allow_approves_an_ask_protected_call(loop, decis
     assert tools.runs == []
     assert of(second, "turn.end")[0]["stop"] == "paused"
     assert of(second, "turn.end")[0]["pending"] == ["c1"]
+
+
+RESPONSES_SCENARIO = {
+    "title": "PydanticLoop on the Responses API",
+    "system": "SYS",
+    "model": {"kind": "openai_responses", "model": "gpt-6-luna"},
+    "rules": {"*": "allow"},
+    "limits": {"max_steps": 4},
+    "engine": {"delay_ms": 0},
+    "strict": {"reject_unencrypted_reasoning": True},
+    "driver": [{"user": "hi"}],
+    "expect": {"stops": ["end_turn"]},
+}
+REASONING = {"id": "rs_1", "encrypted_content": "gAAAAB-rs_1-encrypted", "summary": ["Plan", "Go"]}
+COMPLETED = {"completed": {"input_tokens": 20, "output_tokens": 9, "reasoning_tokens": 6}}
+
+
+def responses_server(tmp_path: Path, *exchanges: dict[str, Any]) -> FakeProvider:
+    """fakeprov in Responses API mode, scripted with these exchanges (scenario "R")."""
+    scenario = {**RESPONSES_SCENARIO, "id": "R", "exchanges": list(exchanges)}
+    (tmp_path / "R.json").write_text(json.dumps(scenario))
+    return FakeProvider(tmp_path, tmp_path / "wire")
+
+
+def responses_config(srv: FakeProvider, **kw: Any) -> ModelConfig:
+    kw.setdefault("max_retries", 0)
+    return ModelConfig(
+        base_url=srv.base_url("R", "r1", "pydantic"),
+        model="gpt-6-luna",
+        kind="openai_responses",
+        temperature=None,
+        reasoning={"effort": "xhigh"},
+        **kw,
+    )
+
+
+async def test_responses_reasoning_goes_back_verbatim_and_stays_out_of_the_chat_view(
+    loop, tmp_path
+):
+    """The chat-shaped `Item.message` has no field for a Responses reasoning item, so it shows
+    only the text and the calls; the native replays the item exactly as its done event sent it,
+    in the same run and in a new turn rebuilt from the saved items."""
+    call = {"id": "call_1", "name": "read_file", "arguments": {"path": "a"}}
+    replayed = {"reasoning_replayed": ["rs_1"], "input_at": [{"index": 2, "phase": "commentary"}]}
+    exchanges = [
+        {
+            "respond": {
+                "stream": [
+                    {"reasoning_item": REASONING},
+                    {"text": "Reading it.", "phase": "commentary"},
+                    {"tool_calls": [call]},
+                    COMPLETED,
+                ]
+            }
+        },
+        {"expect": replayed, "respond": {"stream": [{"text": "Done."}, COMPLETED]}},
+        {
+            "expect": {**replayed, "input_len": 7},
+            "respond": {"stream": [{"text": "Hi."}, COMPLETED]},
+        },
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        first = await run(loop, turn([user("go")], responses_config(srv)), StubTools())
+        history = [user("go"), *items(first), user("again")]
+        second = await run(loop, turn(history, responses_config(srv)), StubTools())
+
+    assert [i.message for i in items(first)] == [
+        {
+            "role": "assistant",
+            "content": "Reading it.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "read_file ok"},
+        {"role": "assistant", "content": "Done."},
+    ]
+    assert [d["text"] for d in of(first, "reasoning.delta")] == ["Plan", "Go"]
+    assert of(first, "usage")[0]["reasoning_tokens"] == 6
+    assert of(second, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+
+
+@pytest.mark.parametrize("failure", ["error", "failed"])
+async def test_responses_failed_stream_on_the_last_attempt_ends_the_turn_quietly(
+    tmp_path, capfd, failure
+):
+    """The library ends a stream as if it were done after an `error` event (it has no handler
+    for it and warns) or a `response.failed`. The loop takes a stream that brought no usage for
+    a failed one, and the warning never reaches stderr (rule 1)."""
+    cut = {"respond": {"stream": [{"text": "Hal", "done": False}, {failure: {"message": "boom"}}]}}
+    with warnings.catch_warnings(record=True) as caught, responses_server(tmp_path, cut) as srv:
+        loop = PydanticLoop()
+        events = await run(loop, turn([user("hi")], responses_config(srv)), StubTools())
+        await loop.aclose()
+
+    [error] = of(events, "error")
+    assert error["retryable"] is True
+    assert error["message"].endswith("the stream failed before response.completed")
+    # The last attempt's partial text is kept, as a cancelled one would be.
+    assert [(i.status, i.message["content"]) for i in items(events)] == [("incomplete", "Hal")]
+    assert of(events, "turn.end")[0]["stop"] == "error"
+    assert (caught, capfd.readouterr()) == ([], ("", ""))
