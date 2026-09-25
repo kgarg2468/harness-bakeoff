@@ -1,0 +1,167 @@
+{
+  "id": "S02",
+  "title": "Pipe build: describe, write, validate (lane error), edit fix, validate, answer",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [
+    {
+      "user": "Build agent.pipe: a chat source feeding a CrewAI agent that can call a sub-pipeline tool (prompt -> LLM -> answers). Validate it and fix any errors."
+    }
+  ],
+  "exchanges": [
+    {
+      "note": "Bad arguments: `name` is missing. The loop must feed back an error and continue.",
+      "expect": {"last_role": "user", "messages_len": 2, "body_has": ["tools"]},
+      "respond": {
+        "stream": [
+          {"text": "I'll look up the tool node first.", "chunks": 2},
+          {
+            "tool_calls": [
+              {
+                "id": "call_S02_1",
+                "name": "describe_component",
+                "arguments": {"component": "tool_pipe"}
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "expect": {"last_role": "tool", "messages_len": 4, "tool_result_contains": {"call_S02_1": "name"}},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S02_2",
+                "name": "describe_component",
+                "arguments": {"name": "tool_pipe"}
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "Writes the shape of examples/incorrect/incorrect-data-fed-tool-pipe.pipe.",
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 6,
+        "tool_result_contains": {"call_S02_2": "Pipeline Tool"}
+      },
+      "respond": {
+        "stream": [
+          {"text": "Writing the pipeline now.", "chunks": 2},
+          {
+            "tool_calls": [
+              {
+                "id": "call_S02_3",
+                "name": "write_file",
+                "arguments": {
+                  "path": "agent.pipe",
+                  "content": "{\n  \"project_id\": \"e1000005-0000-4000-8000-000000000005\",\n  \"source\": \"chat_1\",\n  \"components\": [\n    {\"id\": \"chat_1\", \"provider\": \"chat\", \"name\": \"Chat\", \"config\": {}},\n    {\"id\": \"agent_1\", \"provider\": \"agent_crewai\", \"name\": \"CrewAI\", \"config\": {\"advanced_mode\": false, \"agent_description\": \"\", \"instructions\": [\"Call the run_pipe tool once, then return its result.\"]}, \"input\": [{\"lane\": \"questions\", \"from\": \"chat_1\"}]},\n    {\"id\": \"agent_1_llm\", \"provider\": \"llm_openai_api\", \"name\": \"OpenAI-Compatible API\", \"config\": {\"profile\": \"custom\", \"custom\": {\"model\": \"${ROCKETRIDE_OLLAMA_MODEL}\", \"base_url\": \"${ROCKETRIDE_OLLAMA_BASE_URL}\", \"apikey\": \"ollama\", \"modelTotalTokens\": 32768}}, \"control\": [{\"classType\": \"llm\", \"from\": \"agent_1\"}]},\n    {\"id\": \"pipe_tool_1\", \"provider\": \"tool_pipe\", \"name\": \"Pipeline Tool\", \"config\": {\"profile\": \"default\", \"default\": {\"tool_description\": \"Runs a sub-pipeline.\", \"return_type\": \"answers\"}}, \"control\": [{\"classType\": \"tool\", \"from\": \"agent_1\"}], \"input\": [{\"lane\": \"questions\", \"from\": \"chat_1\"}]},\n    {\"id\": \"sub_a\", \"provider\": \"prompt\", \"name\": \"Prompt\", \"config\": {\"instructions\": [\"Sub A.\"]}, \"input\": [{\"lane\": \"text\", \"from\": \"pipe_tool_1\"}]},\n    {\"id\": \"sub_llm\", \"provider\": \"llm_openai_api\", \"name\": \"OpenAI-Compatible API\", \"config\": {\"profile\": \"custom\", \"custom\": {\"model\": \"${ROCKETRIDE_OLLAMA_MODEL}\", \"base_url\": \"${ROCKETRIDE_OLLAMA_BASE_URL}\", \"apikey\": \"ollama\", \"modelTotalTokens\": 32768}}, \"input\": [{\"lane\": \"questions\", \"from\": \"sub_a\"}]},\n    {\"id\": \"sub_resp\", \"provider\": \"response_answers\", \"name\": \"Return Answers\", \"config\": {}, \"input\": [{\"lane\": \"answers\", \"from\": \"sub_llm\"}]},\n    {\"id\": \"response_1\", \"provider\": \"response_answers\", \"name\": \"Return Answers\", \"config\": {}, \"input\": [{\"lane\": \"answers\", \"from\": \"agent_1\"}]}\n  ]\n}\n"
+                }
+              }
+            ],
+            "pieces": 4
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "expect": {"last_role": "tool", "messages_len": 8, "tool_result_contains": {"call_S02_3": ""}},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S02_4",
+                "name": "validate_pipeline",
+                "arguments": {"path": "agent.pipe"}
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "The engine reports: Component pipe_tool_1 input lane questions not found.",
+      "expect": {"last_role": "tool", "messages_len": 10, "tool_result_contains": {"call_S02_4": "lane"}},
+      "respond": {
+        "stream": [
+          {
+            "text": "tool_pipe is invoke-only, so it cannot take a data input. Removing that input.",
+            "chunks": 3
+          },
+          {
+            "tool_calls": [
+              {
+                "id": "call_S02_5",
+                "name": "edit_file",
+                "arguments": {
+                  "path": "agent.pipe",
+                  "old_string": "\"control\": [{\"classType\": \"tool\", \"from\": \"agent_1\"}], \"input\": [{\"lane\": \"questions\", \"from\": \"chat_1\"}]}",
+                  "new_string": "\"control\": [{\"classType\": \"tool\", \"from\": \"agent_1\"}]}"
+                }
+              }
+            ],
+            "pieces": 3
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "expect": {"last_role": "tool", "messages_len": 12, "tool_result_contains": {"call_S02_5": ""}},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S02_6",
+                "name": "validate_pipeline",
+                "arguments": {"path": "agent.pipe"}
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "expect": {"last_role": "tool", "messages_len": 14, "tool_result_contains": {"call_S02_6": "true"}},
+      "respond": {
+        "stream": [
+          {
+            "text": "agent.pipe validates: chat_1 feeds agent_1, which calls pipe_tool_1's sub-pipeline (sub_a -> sub_llm -> sub_resp) as a tool.",
+            "chunks": 3
+          },
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn"],
+    "requests": 7,
+    "commits": 1,
+    "files": {"agent.pipe": "{\"classType\": \"tool\", \"from\": \"agent_1\"}]},"},
+    "tool_runs": {"call_S02_2": 1, "call_S02_3": 1, "call_S02_4": 1, "call_S02_5": 1, "call_S02_6": 1},
+    "text_contains": "agent.pipe validates"
+  }
+}

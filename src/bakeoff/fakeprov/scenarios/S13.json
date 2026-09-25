@@ -1,0 +1,39 @@
+{
+  "id": "S13",
+  "title": "BYOK thinking: openai_compat endpoint, non-OpenAI model, reasoning requested",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {
+    "kind": "openai_compat",
+    "model": "qwen3-32b",
+    "reasoning": {"effort": "low"},
+    "compat": {"reasoning_param": "reasoning_effort"}
+  },
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [{"user": "In one sentence: where does a RocketRide pipeline start?"}],
+  "exchanges": [
+    {
+      "note": "The reasoning parameter must reach the wire; the reply streams reasoning_content.",
+      "expect": {
+        "model": "qwen3-32b",
+        "body_has": ["reasoning_effort"],
+        "last_role": "user",
+        "messages_len": 2
+      },
+      "respond": {
+        "stream": [
+          {
+            "reasoning": "Short question; answer directly.",
+            "chunks": 2,
+            "field": "reasoning_content"
+          },
+          {"text": "A pipeline starts at its source component, e.g. chat_1.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 180, "completion_tokens": 30, "reasoning_tokens": 12}}
+        ]
+      }
+    }
+  ],
+  "expect": {"stops": ["end_turn"], "requests": 1, "commits": 1, "text_contains": "source component"}
+}

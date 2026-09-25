@@ -1,0 +1,33 @@
+{
+  "id": "S12b",
+  "title": "Cost metering on a BYOK (OpenAI-compatible) endpoint: usage only when asked, no provider cost",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openai_compat", "model": "gpt-5.4-mini"},
+  "style": "openai",
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [{"user": "Summarize a chat -> llm -> response pipeline in one line."}],
+  "exchanges": [
+    {
+      "note": "OpenAI style: usage arrives in a trailing choices:[] chunk only if stream_options.include_usage was sent, and it carries no cost.",
+      "expect": {"last_role": "user", "messages_len": 2, "body_equals": {"stream_options.include_usage": true}},
+      "respond": {
+        "stream": [
+          {"text": "chat -> llm_openai_api -> response_answers.", "chunks": 2},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1310, "completion_tokens": 11, "cached_tokens": 1280}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn"],
+    "requests": 1,
+    "commits": 1,
+    "text_contains": "response_answers",
+    "usage": {"input_tokens": 1310, "output_tokens": 11, "cached_tokens": 1280},
+    "cost_usd": 0,
+    "cost_source": "none"
+  }
+}

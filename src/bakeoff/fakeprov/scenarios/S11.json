@@ -1,0 +1,55 @@
+{
+  "id": "S11",
+  "title": "Step cap: the model calls tools forever; stop at max_steps",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 3},
+  "engine": {"delay_ms": 0},
+  "driver": [{"user": "Keep listing the working copy until a file appears."}],
+  "exchanges": [
+    {
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [{"id": "call_S11_1", "name": "list_files", "arguments": {"path": "."}}]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "expect": {"last_role": "tool", "messages_len": 4, "tool_result_contains": {"call_S11_1": ""}},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [{"id": "call_S11_2", "name": "list_files", "arguments": {"path": "."}}]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "The third and last request allowed by max_steps=3.",
+      "expect": {"last_role": "tool", "messages_len": 6, "tool_result_contains": {"call_S11_2": ""}},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [{"id": "call_S11_3", "name": "list_files", "arguments": {"path": "."}}]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["max_steps"],
+    "requests": 3,
+    "commits": 1,
+    "tool_runs": {"call_S11_1": 1, "call_S11_2": 1, "call_S11_3": 0}
+  }
+}
