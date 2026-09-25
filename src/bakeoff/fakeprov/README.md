@@ -27,9 +27,11 @@ uv run python -m bakeoff.fakeprov --port 8787  # serve until Ctrl-C
   answered by exchange *n*, whatever happens to it (strict rejection, failed expect, 429, ...).
   Past the last exchange: HTTP 500 `{"error": {"message": "script exhausted"}}`.
 - **Server-side rejections** (bad body, strict mode, failed expect, exhausted script, broken
-  scenario file) carry `x-should-retry: false`, which the OpenAI SDK honours.
-- A client that disconnects (cancel, SIGKILL) only closes its own connection. `stop()` ends
+  scenario file, failed recording) carry `x-should-retry: false`, which the OpenAI SDK honours.
+- A client that disconnects (cancel, SIGKILL) only closes its own connection. A body cut short
+  that way is neither answered nor recorded and does not move the cursor. `stop()` ends
   stalled streams and idle keep-alive connections.
+- The listen backlog is 128, so every scenario and loop can connect at the same time.
 
 ## Wire recording
 
@@ -41,9 +43,11 @@ Every chat request is recorded under `<wire_dir>/<scenario>/<run>/<impl>/`:
   the connection was reused); `t_us` is microseconds since `start()`, taken when the body has
   been read.
 
-Headers are never recorded. The first request of a cursor deletes whatever an older server
-left in that directory, so a recording always belongs to one server run. `GET /models` and
-requests to unknown routes are not recorded.
+Headers are never recorded. The first `base_url()` call for a cursor (or its first request,
+if the URL was built by hand) empties that directory, so a recording always belongs to one
+server run, including a run that sends no request. Two servers must not share a cursor
+directory. If a recording cannot be written, the request is answered with 500 `recording
+failed: ...` instead. `GET /models` and requests to unknown routes are not recorded.
 
 ## Scenario files
 

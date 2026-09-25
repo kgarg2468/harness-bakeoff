@@ -65,6 +65,7 @@ class FakeProvider:
         self._lock = threading.Lock()
         self._scenarios: dict[str, Scenario] = {}
         self._cursors: dict[tuple[str, str, str], int] = {}
+        self._claimed: set[tuple[str, str, str]] = set()
         self._conn_ids = itertools.count(1)
         self._conns: set[socket.socket] = set()
         self._stopping = threading.Event()
@@ -78,8 +79,9 @@ class FakeProvider:
         self._server.provider = self
         self.port = self._server.server_address[1]
         self._t0_ns = time.monotonic_ns()
+        # stop() waits up to one poll interval for serve_forever() to notice.
         threading.Thread(
-            target=self._server.serve_forever, args=(0.05,), name="fakeprov", daemon=True
+            target=self._server.serve_forever, args=(0.01,), name="fakeprov", daemon=True
         ).start()
         return self
 
@@ -98,10 +100,11 @@ class FakeProvider:
         server.server_close()
 
     def base_url(self, scenario: str, run: str, impl: str) -> str:
-        """The OpenAI-compatible base URL of one cursor."""
+        """The OpenAI-compatible base URL of one cursor. Claims its recording folder."""
         for segment in (scenario, run, impl):
             if not re.fullmatch(_SEGMENT, segment):
                 raise ValueError(f"invalid URL segment: {segment!r}")
+        self._claim((scenario, run, impl))
         return f"http://{self.host}:{self.port}/s/{scenario}/{run}/{impl}/v1"
 
     def __enter__(self) -> Self:
@@ -125,16 +128,23 @@ class FakeProvider:
                 self._scenarios[name] = load_scenario(self.scenarios_dir / f"{name}.json")
             return self._scenarios[name]
 
+    def _claim(self, key: tuple[str, str, str]) -> Path:
+        """The recording folder of one cursor. The first claim in this server run empties it,
+        so no file from an older run survives, even when this run sends no request."""
+        wire = self.wire_dir.joinpath(*key)
+        with self._lock:
+            if key not in self._claimed:
+                shutil.rmtree(wire, ignore_errors=True)
+                wire.mkdir(parents=True)
+                self._claimed.add(key)
+        return wire
+
     def _chat(self, key: tuple[str, str, str], raw: bytes, meta: dict[str, Any]) -> Reply:
         """Answer one chat request from its cursor and record it as NNN.json + NNN.meta.json."""
         t_us = (time.monotonic_ns() - self._t0_ns) // 1000
-        wire = self.wire_dir.joinpath(*key)
         with self._lock:
             index = self._cursors.get(key, 0)
             self._cursors[key] = index + 1
-            if index == 0:  # a new cursor owns its recording: drop files from an older server
-                shutil.rmtree(wire, ignore_errors=True)
-                wire.mkdir(parents=True)
         try:
             answer = reply(self._scenario(key[0]), index, raw)
         except ScenarioError as exc:
@@ -142,13 +152,19 @@ class FakeProvider:
         meta |= {"t_us": t_us, "status": answer.status}
         if answer.error:
             meta["error"] = answer.error
-        wire.joinpath(f"{index + 1:03d}.json").write_bytes(raw)
-        wire.joinpath(f"{index + 1:03d}.meta.json").write_text(json.dumps(meta) + "\n")
+        try:
+            wire = self._claim(key)
+            wire.joinpath(f"{index + 1:03d}.json").write_bytes(raw)
+            wire.joinpath(f"{index + 1:03d}.meta.json").write_text(json.dumps(meta) + "\n")
+        except OSError as exc:  # an unrecorded request must fail loudly, not look answered
+            return rejected(500, f"recording failed: {exc}")
         return answer
 
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
+    # The default backlog (5) resets connects when every scenario and loop starts at once.
+    request_queue_size = 128
     provider: FakeProvider
 
     def server_bind(self) -> None:
@@ -195,6 +211,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True  # the body's end is unknown, so the connection is lost
             return self._send(rejected(411, "Content-Length is required"))
         raw = self.rfile.read(int(length))
+        if len(raw) < int(length):  # the client died mid-send: answer and record nothing
+            self.close_connection = True
+            return
         route = _ROUTE.fullmatch(self.path)
         if route is None or route["endpoint"] != "chat/completions":
             return self._send(rejected(404, f"no route for POST {self.path}"))

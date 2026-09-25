@@ -1,4 +1,7 @@
+import asyncio
+import contextlib
 import json
+import shutil
 import socket
 import subprocess
 import sys
@@ -73,17 +76,14 @@ def text_of(chunks: list[Any]) -> str:
 
 @pytest.fixture
 def serve(tmp_path: Path) -> Iterator[Callable[..., FakeProvider]]:
-    providers: list[FakeProvider] = []
+    with contextlib.ExitStack() as stack:
 
-    def start(*scenarios: dict[str, Any]) -> FakeProvider:
-        for s in scenarios:
-            (tmp_path / f"{s['id']}.json").write_text(json.dumps(s))
-        providers.append(FakeProvider(tmp_path, tmp_path / "wire").start())
-        return providers[-1]
+        def start(*scenarios: dict[str, Any]) -> FakeProvider:
+            for s in scenarios:
+                (tmp_path / f"{s['id']}.json").write_text(json.dumps(s))
+            return stack.enter_context(FakeProvider(tmp_path, tmp_path / "wire"))
 
-    yield start
-    for provider in providers:
-        provider.stop()
+        yield start
 
 
 def chat(provider: FakeProvider, body: Any, sid: str = "T", run: str = "r1", impl: str = "our"):
@@ -216,14 +216,20 @@ def test_sse_error_ends_the_stream_after_http_200(serve):
     ]
 
 
-def test_stall_survives_a_client_that_gives_up(serve):
-    stalled = {"respond": {"stream": [{"text": "Let me"}, {"stall": True}]}}
-    provider = serve(scenario("T", stalled, says("done")))
+SLOW = [{"text": "x" * 10, "chunks": 10, "delay_ms": 20}]  # still writing when the client leaves
+
+
+@pytest.mark.parametrize("stream", [[{"text": "Let me"}, {"stall": True}], SLOW])
+def test_server_survives_a_client_that_gives_up(serve, capfd, stream):
+    provider = serve(scenario("T", {"respond": {"stream": stream}}, says("done")))
     url = provider.base_url("T", "r1", "our") + "/chat/completions"
     with httpx.Client() as client, client.stream("POST", url, json=request()) as response:
         assert next(response.iter_lines()).startswith("data: ")
     # the client closed mid-stream; the server carries on with the next exchange
     assert text_of(frames(chat(provider, request()))) == "done"
+    time.sleep(0.25)  # outlast SLOW, so its handler writes into the closed socket before stop()
+    provider.stop()  # joins the handler of the abandoned stream
+    assert capfd.readouterr().err == ""
 
 
 def test_server_survives_a_killed_client_process(serve):
@@ -245,8 +251,9 @@ def test_server_survives_a_killed_client_process(serve):
     assert text_of(frames(chat(provider, request()))) == "done"
 
 
-def test_stop_ends_a_stalled_stream_promptly(serve):
-    provider = serve(scenario("T", {"respond": {"stream": [{"stall": True}]}}))
+@pytest.mark.parametrize("op", [{"stall": True}, {"text": "late", "delay_ms": 60_000}])
+def test_stop_ends_a_waiting_stream_promptly(serve, op):
+    provider = serve(scenario("T", {"respond": {"stream": [op]}}))
     url = provider.base_url("T", "r1", "our") + "/chat/completions"
     with httpx.Client() as client, client.stream("POST", url, json=request()) as response:
         started = time.monotonic()
@@ -344,6 +351,53 @@ def test_wire_recording_is_verbatim_and_headerless(serve):
     assert all(secret not in p.read_text() for p in stale.parent.iterdir())
 
 
+def test_base_url_claims_the_recording_even_without_requests(serve):
+    provider = serve(scenario("T", says("one"), says("two")))
+    folder = provider.wire_dir / "T" / "r1" / "our"
+    folder.mkdir(parents=True)
+    (folder / "001.json").write_text("from an older server")
+    provider.base_url("T", "r1", "our")
+    assert list(folder.iterdir()) == []  # a run that sends nothing leaves nothing stale
+    chat(provider, request())
+    provider.base_url("T", "r1", "our")  # later calls keep this run's recording
+    assert sorted(p.name for p in folder.iterdir()) == ["001.json", "001.meta.json"]
+
+
+def test_a_failed_recording_answers_500(serve):
+    provider = serve(scenario("T", says("one")))
+    url = provider.base_url("T", "r1", "our") + "/chat/completions"
+    shutil.rmtree(provider.wire_dir)  # e.g. deleted under a running server
+    response = httpx.post(url, json=request())
+    assert response.status_code == 500
+    assert response.json()["error"]["message"].startswith("recording failed: ")
+
+
+def test_a_body_cut_short_is_not_answered_recorded_or_counted(serve):
+    provider = serve(scenario("T", says("one"), says("two")))
+    path = httpx.URL(provider.base_url("T", "r1", "our")).path + "/chat/completions"
+    body = json.dumps(request()).encode()
+    with socket.create_connection(("127.0.0.1", provider.port)) as sock:
+        head = f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {len(body)}\r\n\r\n"
+        sock.sendall(head.encode() + body[: len(body) // 2])
+        sock.shutdown(socket.SHUT_WR)  # the client dies mid-send
+        assert sock.recv(65536) == b""  # the server hangs up without an answer
+    assert text_of(frames(chat(provider, request()))) == "one"
+    folder = provider.wire_dir / "T" / "r1" / "our"
+    assert sorted(p.name for p in folder.iterdir()) == ["001.json", "001.meta.json"]
+
+
+async def test_many_simultaneous_connections_are_all_served(serve):
+    provider = serve(scenario("T", says("ok")))
+    urls = [provider.base_url("T", f"r{n}", "our") + "/chat/completions" for n in range(64)]
+    started = time.monotonic()
+    async with httpx.AsyncClient() as client:  # one new connection per request
+        responses = await asyncio.gather(*(client.post(url, json=request()) for url in urls))
+    # A full listen backlog drops connects: they reset, or the client resends its SYN after 1 s.
+    assert time.monotonic() - started < 1
+    assert [text_of(frames(r)) for r in responses] == ["ok"] * 64
+    assert len({meta(provider, 1, run=f"r{n}")["conn_id"] for n in range(64)}) == 64
+
+
 def test_cursors_are_independent_per_run_and_impl(serve):
     provider = serve(scenario("T", says("first"), says("second")))
     for run, impl in [("r1", "our"), ("r1", "pydantic"), ("r2", "our")]:
@@ -380,6 +434,11 @@ def test_bad_requests_and_models_endpoint(serve):
     url = provider.base_url("T", "r1", "our")
     assert httpx.post(url + "/chat/completions", content=b"{not json").status_code == 400
     assert chat(provider, {**request(), "stream": False}).status_code == 400
+    assert chat(provider, {**request(), "messages": []}).status_code == 400
+    assert chat(provider, {**request(), "messages": ["hi"]}).status_code == 400
+    assert httpx.post(url + "/chat/completions", content=iter([b"{}"])).status_code == 411
+    assert httpx.post(url + "/embeddings", json=request()).status_code == 404
+    assert httpx.get(url + "/chat/completions").status_code == 404
     assert httpx.get(url + "/models").json()["data"][0]["id"] == MODEL
     assert httpx.get(provider.base_url("Nope", "r1", "our") + "/models").status_code == 404
     with pytest.raises(ValueError):
