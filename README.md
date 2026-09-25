@@ -32,16 +32,21 @@ uv run bakeoff scenario --all --impl our   # the scenario matrix, with a one-lin
 ## CLI
 
 Scenarios run offline against the fake model server (`fakeprov`), with the real runner, session
-log, git working copy and tools. Loops that are not built yet are skipped.
+log, git working copy and tools. Loops that are not built yet are skipped; a loop that exists
+but fails to import is an error (exit 1), so it never drops out of a comparison unnoticed.
 
 ```bash
 bakeoff scenario S01 S05 --impl our,pydantic   # or --all; --out out (default), --run-id ID
 ```
 
+A run id is never reused: `out/runs/<run_id>` must not exist yet (the default is a new
+timestamped id).
+
 It prints a matrix and exits 1 on any `FAIL` or `XPASS`. `xfail` is a failure that the loop's
 registry entry (`bakeoff/loops.py`) documents, with exactly the checks it documents; a documented
 cell that fails any other way is a `FAIL`. `XPASS` means a documented failure is fixed, so its
-entry must go. Each run writes:
+entry must go. A loop that leaves a task running even after it was cancelled stops the command
+after that run (exit 1; `stopped` in summary.json says which). Each run writes:
 
 ```
 out/runs/<run_id>/summary.json                   matrix + one-line reasons, git sha, loop versions
@@ -64,14 +69,16 @@ bakeoff live --impl our,pydantic --model gpt-6-luna --reasoning none --max-steps
 bakeoff chat --impl our            # REPL: approvals prompted, /revert N, /compact TEXT, /exit
 ```
 
-In `chat`, Ctrl-C during a turn cancels the turn, and at a prompt it ends the chat. A run id is
-never reused: `out/live/<run_id>/<impl>` must not exist yet.
+In `chat`, Ctrl-C during a turn cancels the turn, and at a prompt it ends the chat. `chat` exits 1
+if any turn stopped short (error, max_steps, budget, cancelled) or an invariant failed, else 0.
+A run id is never reused: `out/live/<run_id>/<impl>` must not exist yet.
 
 `live` streams each loop's run (text inline, tool calls and results on one line each), then
 prints tokens, time to first token, total time and steps side by side, and writes
 `out/live/<run_id>/<impl>/` (same files as a scenario run; `result.json` adds `model`, `prompt`,
-`final_text`, `latency`). `--interactive` asks before each write; `--base-url` points it at
-another endpoint (`{impl}` in the URL is replaced by the loop name).
+`final_text`, `latency`). A run that fails, is interrupted or cannot even start (say, git fails)
+still writes its `result.json`, with the error. `--interactive` asks before each write;
+`--base-url` points it at another endpoint (`{impl}` in the URL is replaced by the loop name).
 
 The commands below act on one thread of a session log from a separate process. The scenario
 driver uses them for the cross-process steps (approve in a new process, crash and resume):

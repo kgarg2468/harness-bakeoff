@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -154,14 +155,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _usable(names: list[str]) -> list[str]:
-    """The loops that import here; says which requested ones are skipped and why."""
-    usable = []
+    """The loops that import here. One that is not built or installed yet is skipped (with a
+    note); one that exists but fails to import is an error, because skipping it would let the
+    command succeed without the comparison it was asked for."""
+    usable, broken = [], []
     for name in names:
         try:
             loops.load(name)
             usable.append(name)
         except loops.LoopUnavailable as exc:
+            if not exc.missing:
+                broken.append(str(exc))
+                continue
             print(f"skipping {exc}", file=sys.stderr)
+    if broken:
+        raise RuntimeError(f"broken loop {'; '.join(broken)} (fix it, or leave it out of --impl)")
     return usable
 
 
@@ -186,11 +194,20 @@ def _scenario(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    summary = asyncio.run(
-        scenario.run_matrix(ids, impls, out=args.out, run_id=args.run_id, on_result=progress)
-    )
-    print(scenario.format_matrix(summary))
-    print(f"results: {args.out / 'runs' / summary['run_id']}")
+    # Not asyncio.run: at exit it cancels the tasks still running and waits for them, which
+    # never ends if a loop left one that ignores cancellation (see the stop below).
+    with asyncio.Runner() as runner:
+        summary = runner.run(
+            scenario.run_matrix(ids, impls, out=args.out, run_id=args.run_id, on_result=progress)
+        )
+        print(scenario.format_matrix(summary))
+        print(f"results: {args.out / 'runs' / summary['run_id']}")
+        if summary["stopped"]:
+            sys.stdout.flush()
+            print(f"bakeoff scenario: stopped: {summary['stopped']}", file=sys.stderr, flush=True)
+            # The leaked tasks already ignored a cancel. Everything is written: end the process
+            # without waiting for them.
+            os._exit(1)
     return 1 if scenario.unexpected(summary) else 0
 
 
@@ -248,7 +265,14 @@ def _chat(args: argparse.Namespace) -> int:
     )
     term.write(f"\nresults: {args.out / 'live' / result['run_id'] / args.impl}\n")
     _close(term)
-    return 0
+    if result["passed"]:  # also a chat ended at a prompt (Ctrl-C, /exit) before any turn
+        return 0
+    failed = [f"; {n} failed" for n, c in result["invariants"].items() if not c["ok"]]
+    print(
+        f"bakeoff chat: not every turn ended well: stops {result['stops']}{''.join(failed)}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _close(term: Any) -> None:

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.shared.contract import ModelConfig
 from bakeoff.shared.scenario import Workspace
 from bakeoff.shared.sessionlog import SessionLog
+from bakeoff.shared.workcopy import WorkCopy
 
 PIPELINE = {
     "source": "chat_1",
@@ -214,6 +216,57 @@ async def test_chat_asks_before_writing(tmp_path: Path) -> None:
     assert "?? write_file(path='notes.md', content='# Notes') needs approval" in term.getvalue()
 
 
+def fail_git_init(monkeypatch: pytest.MonkeyPatch, thread: str) -> None:
+    """Make creating `thread`'s working copy fail, as a broken git would."""
+    init_sync = WorkCopy.init_sync
+
+    def failing(self: WorkCopy) -> None:
+        if self.root.name == thread:
+            raise RuntimeError(f"git init failed in {self.root}: simulated")
+        init_sync(self)
+
+    monkeypatch.setattr(WorkCopy, "init_sync", failing)
+
+
+def test_a_live_run_that_cannot_start_records_why(
+    endpoint: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fail_git_init(monkeypatch, "live-our")
+    out = tmp_path / "out"
+    argv = ["live", "--impl", "our,pydantic", "--model", "fake-live", "--base-url", endpoint]
+    argv += ["--prompt", "Build chat.pipe and validate it.", "--out", str(out), "--run-id", "t1"]
+    assert main(argv) == 1
+    printed = capsys.readouterr().out
+    directory = out / "live" / "t1" / "our"
+    result = json.loads((directory / "result.json").read_text())
+    error = f"RuntimeError: git init failed in {directory / 'wc' / 'live-our'}: simulated"
+    assert (result["passed"], result["error"], result["stops"]) == (False, error, [])
+    assert (result["impl"], result["prompt"], result["thread"]) == ("our", argv[-5], None)
+    assert f"[our failed: {error}]" in printed
+    # The other loop still ran, and both show up side by side.
+    assert json.loads((out / "live" / "t1" / "pydantic" / "result.json").read_text())["passed"]
+    assert "invariants      -" in printed
+
+
+async def test_a_chat_that_cannot_start_records_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_git_init(monkeypatch, "live-our")
+
+    async def ask(prompt: str) -> str:
+        raise AssertionError("no prompt before the chat has started")
+
+    model = live.LiveModel(model="m", base_url="http://127.0.0.1:9/v1")
+    with pytest.raises(RuntimeError, match="simulated"):
+        await live.chat("our", model, out=tmp_path, run_id="c1", term=io.StringIO(), ask=ask)
+    result = json.loads((tmp_path / "live" / "c1" / "our" / "result.json").read_text())
+    assert (result["passed"], result["prompt"]) == (False, "(chat)")
+    assert result["error"].startswith("RuntimeError: git init failed in ")
+
+
 # --- key and network ---------------------------------------------------------------------------
 
 
@@ -356,6 +409,53 @@ def test_chat_exits_on_ctrl_c_at_the_prompt(endpoint: str, tmp_path: Path) -> No
     assert (result["stops"], result["error"], result["prompt"]) == ([], None, "(chat)")
 
 
+@pytest.mark.parametrize(
+    ("exchanges", "lines", "extra", "code", "stops"),
+    [
+        ([says("Hi.")], ["hello"], [], 0, ["end_turn"]),
+        # Any turn that stops short counts, not only the last one.
+        (
+            [{"respond": {"status": 400}}, says("Hi.")],
+            ["hello", "again"],
+            [],
+            1,
+            ["error", "end_turn"],
+        ),
+        (
+            [calls({"id": "call_C2_1", "name": "list_files", "arguments": {}})],
+            ["hello"],
+            ["--max-steps", "1"],
+            1,
+            ["max_steps"],
+        ),
+    ],
+    ids=["answered", "a-turn-errors", "max-steps"],
+)
+def test_chat_exits_1_if_a_turn_stopped_short(
+    exchanges: list[dict[str, Any]],
+    lines: list[str],
+    extra: list[str],
+    code: int,
+    stops: list[str],
+    tmp_path: Path,
+) -> None:
+    write_scenario(tmp_path / "scenarios", "C2", exchanges)
+    with FakeProvider(tmp_path / "scenarios", tmp_path / "wire") as provider:
+        argv = [sys.executable, "-m", "bakeoff.cli", "chat", "--model", "fake-live"]
+        argv += ["--base-url", provider.base_url("C2", "r1", "our"), *extra]
+        argv += ["--out", str(tmp_path / "out"), "--run-id", "c1"]
+        stdin = "".join(f"{line}\n" for line in [*lines, "/exit"])
+        proc = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=60)
+    result = json.loads((tmp_path / "out" / "live" / "c1" / "our" / "result.json").read_text())
+    assert (proc.returncode, result["stops"], result["passed"]) == (code, stops, code == 0), (
+        proc.stdout + proc.stderr
+    )
+    if code:
+        assert f"bakeoff chat: not every turn ended well: stops {stops}" in proc.stderr
+    else:
+        assert proc.stderr == ""
+
+
 def test_the_key_is_never_stored(
     endpoint: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -473,6 +573,43 @@ def test_cli_scenario_prints_the_matrix(tmp_path: Path, capsys: pytest.CaptureFi
     assert printed.out.splitlines()[:3] == ["scenario  our", "S01       pass", "S13       pass"]
     assert "S01   our       pass" in printed.err
     assert json.loads((tmp_path / "runs" / "c1" / "summary.json").read_text())["run_id"] == "c1"
+
+
+def test_a_broken_loop_fails_the_command_and_a_missing_one_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A loop that exists but does not import must not silently drop out of the comparison."""
+    (tmp_path / "broken_loop.py").write_text("raise ImportError('pydantic_ai renamed Agent')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    broken = replace(loops.REGISTRY["pydantic"], target="broken_loop:PydanticLoop")
+    monkeypatch.setitem(loops.REGISTRY, "pydantic", broken)
+    monkeypatch.setitem(loops.REGISTRY, "probe", loops.LoopEntry("probe", "not_built:Loop", ()))
+    out = tmp_path / "out"
+    assert main(["scenario", "S01", "--impl", "our,pydantic", "--out", str(out)]) == 1
+    err = capsys.readouterr().err
+    assert "error: broken loop pydantic: ImportError: pydantic_ai renamed Agent" in err
+    argv = ["live", "--impl", "our,pydantic", "--prompt", "p", "--out", str(out)]
+    assert main([*argv, "--base-url", "http://127.0.0.1:9/v1"]) == 1
+    assert "error: broken loop pydantic" in capsys.readouterr().err
+    assert not out.exists()  # refused before anything ran
+    # A loop that is not built yet is only skipped.
+    argv = ["scenario", "S01", "--impl", "our,probe", "--out", str(out), "--run-id", "m1"]
+    assert main(argv) == 0
+    assert "skipping probe: not installed" in capsys.readouterr().err
+    assert list(json.loads((out / "runs" / "m1" / "summary.json").read_text())["loops"]) == ["our"]
+
+
+def test_cli_scenario_never_reuses_a_run_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["scenario", "S01", "--impl", "our", "--out", str(tmp_path), "--run-id", "c1"]
+    assert main(argv) == 0
+    run = tmp_path / "runs" / "c1"
+    saved = {p: p.read_bytes() for p in (run / "summary.json", run / "S01" / "our" / "result.json")}
+    capsys.readouterr()
+    assert main(argv) == 1
+    assert f"{run} already exists: pick another --run-id" in capsys.readouterr().err
+    assert {p: p.read_bytes() for p in saved} == saved
 
 
 def test_cli_worker_errors_are_reported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
