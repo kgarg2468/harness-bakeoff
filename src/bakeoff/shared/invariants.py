@@ -1,6 +1,7 @@
 """Invariant checks over wire recordings and the session log (DESIGN.md, "Invariants").
 
-Each check is a small function that returns a `Check`; none of them raises on bad data.
+Each check is a small function that returns a `Check`. Scenario tests assert `ok`; the
+report shows `detail` and `info`.
 """
 
 from __future__ import annotations
