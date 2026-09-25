@@ -41,9 +41,12 @@ _LOCK_POLL_S = 0.02
 _STATUS = {"end_turn": "done", "max_steps": "done", "budget": "done", "cancelled": "cancelled"}
 _DEFAULT_LIMITS = Limits()
 _THREAD_ID = re.compile(r"[\w-]+")
-# A revert waits while the last turn has changes that no commit holds (see `Runner.revert`).
+# While the last git turn is paused, its pending calls must be answered first: a new user
+# message or a summary between a call and its result breaks the history (see `Runner.turn`).
+_PAUSED = {"paused": "is paused: resolve the pending approval first"}
+# A revert also waits while the last turn has changes that no commit holds (see `Runner.revert`).
 _REVERT_WAITS = {
-    "paused": "is paused: resolve the pending approval first",
+    **_PAUSED,
     "error": "failed to commit its changes: run a turn first, its commit includes them",
 }
 logger = logging.getLogger(__name__)
@@ -270,7 +273,7 @@ class NdjsonMirror:
 class Runner:
     """Runs turns of any `Loop` against the session log and one git working copy per thread.
 
-    Each turn and revert holds the thread's OS lock (see `_try_lock`) while it runs.
+    Each turn, revert and compaction holds the thread's OS lock (see `_try_lock`) while it runs.
     A resume (approval or crash) waits up to `lock_wait_s` seconds for it: it follows the end of
     the turn before it, whose worker, or that worker's last git process, may still hold it.
     Anything else raises ThreadBusy at once.
@@ -331,6 +334,10 @@ class Runner:
     ) -> dict[str, Any]:
         """Run one turn: a new user message, or a resume (approval or crash).
 
+        While the last turn is paused, a new user message is refused: the pending calls need an
+        approval resume first (it may deny them, with a reason), since a user message between a
+        call and its result breaks the history.
+
         Returns `{"turn_id", "stop", "pending", "commit"}`. A loop exception ends the turn with
         stop="error" instead of raising. `asyncio.CancelledError` propagates and leaves the turn
         "running", like a crash; resume it with `Resume(kind="crash")`. Any other failure (git,
@@ -374,6 +381,8 @@ class Runner:
         lock_fd: int | None,
     ) -> dict[str, Any]:
         kind = resume.kind if resume else "user"
+        if resume is None:
+            self._refuse_while(thread_id, "start a user turn", _PAUSED)
         row = self.log.start_turn(thread_id, kind)  # raises if a turn is running (unless crash)
         turn_id = row["id"]
         wc = WorkCopy(self.workdir(thread_id), lock_fd)
@@ -476,11 +485,7 @@ class Runner:
         # Held until the revert is fully recorded: while its row says "running", a crash resume
         # that got the lock would take git's revert commit for one that no turn recorded.
         with _exclusive(self._lock_path(thread_id)) as lock_fd:
-            last = self._git_turns(thread_id)[-1]  # there is one: the target
-            if last["status"] in _REVERT_WAITS and not last["commit_sha"]:
-                raise RuntimeError(
-                    f"cannot revert: turn {last['id']} {_REVERT_WAITS[last['status']]}"
-                )
+            self._refuse_while(thread_id, "revert", _REVERT_WAITS)
             row = self.log.start_turn(thread_id, "revert")
             wc = WorkCopy(self.workdir(thread_id), lock_fd)
             try:
@@ -507,10 +512,12 @@ class Runner:
         """Append a compaction item (contract rule 8) as its own "compact" turn.
 
         The item and the finished row are recorded in one transaction, or nothing is.
-        Compaction changes no files, so the turn has no commit.
+        Compaction changes no files, so the turn has no commit. It is refused while the last
+        turn is paused: the summary would come between the pending calls and their results.
         """
         thread = self._thread(thread_id)
         with _exclusive(self._lock_path(thread_id)):
+            self._refuse_while(thread_id, "compact", _PAUSED)
             row = self.log.start_turn(thread_id, "compact")
             item = Item(
                 id=f"{row['id']}:compact",
@@ -564,6 +571,14 @@ class Runner:
             logger.exception("discarding turn %s failed", turn_id)
             with _logged_failure(f"recording turn {turn_id} as an error"):
                 self.log.set_turn_status(turn_id, "error")
+
+    def _refuse_while(self, thread_id: str, what: str, waits: dict[str, str]) -> None:
+        """Raise if the thread's last git turn has no commit and a status in `waits`: it left
+        something that must be resolved before `what`."""
+        turns = self._git_turns(thread_id)
+        last = turns[-1] if turns else None
+        if last is not None and last["status"] in waits and not last["commit_sha"]:
+            raise RuntimeError(f"cannot {what}: turn {last['id']} {waits[last['status']]}")
 
     def _git_turns(self, thread_id: str) -> list[dict[str, Any]]:
         """The thread's turns that use the working copy (all but compactions), in order."""

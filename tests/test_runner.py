@@ -624,8 +624,8 @@ async def test_a_paused_turn_the_log_cannot_finish_stays_paused(
     else:  # still "running": a crash resume takes over and asks again
         assert turn["status"] == "running"
         resume = Resume(kind="crash")
-        with pytest.raises(RuntimeError, match="running turn"):
-            await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="next")
+    with pytest.raises(RuntimeError, match=r"is paused|running turn"):  # the call is not lost
+        await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="next")
     summary = await runner.turn(FakeLoop(ask), tid, model=MODEL, resume=resume)
     assert summary["stop"] == "paused"
 
@@ -965,6 +965,37 @@ async def test_revert_waits_for_a_paused_turn(runner, log, tid):
         check_commits(log, tid, wd),
     ):
         assert check.ok, check.detail
+
+
+async def test_a_user_turn_or_compaction_waits_for_a_paused_turn(runner, log, tid):
+    async def ask(turn, tools, cancel):
+        call = write_call(turn, "a.txt")
+        yield item(turn, "a", assistant(call))
+        yield Event("turn.end", {"stop": "paused", "steps": 1, "pending": [call.id]})
+
+    async def deny(turn, tools, cancel):
+        (call_id,) = turn.resume.decisions
+        denied = ToolResult(call_id, False, f"Denied by user: {turn.resume.reason}")
+        yield tool_item(turn, denied)
+        yield Event("turn.end", {"stop": "end_turn", "steps": 1})
+
+    paused = await runner.turn(FakeLoop(ask), tid, model=MODEL, user_text="write a.txt")
+    # Either would put a user item between the pending call and its result.
+    with pytest.raises(RuntimeError, match=r"cannot start a user turn: turn .*\.0 is paused"):
+        await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="never mind")
+    with pytest.raises(RuntimeError, match=r"cannot compact: turn .*\.0 is paused"):
+        runner.compact(tid, "asked for a.txt")
+    assert [t["kind"] for t in log.turns(tid)] == ["user"]
+
+    call_id = paused["pending"][0]
+    resume = Resume(kind="approval", decisions={call_id: "deny"}, reason="never mind")
+    await runner.turn(FakeLoop(deny), tid, model=MODEL, resume=resume)
+    runner.compact(tid, "the user declined a.txt")
+    await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="b.pipe then")
+    roles = [i.message["role"] for i in log.items(tid)]
+    assert roles == ["user", "assistant", "tool", "user", "user", "assistant", "tool"]
+    check = check_tool_results(log.items(tid), log.events(tid), log.turns(tid))
+    assert check.ok, check.detail
 
 
 async def test_revert_waits_for_a_turn_that_failed_to_commit(runner, log, tid):
