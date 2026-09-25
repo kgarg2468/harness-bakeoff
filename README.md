@@ -47,7 +47,7 @@
 
 The full comparison is one page, `out/report.html`: a scorecard, the scenario matrix, a side-by-side replay of every scenario, a diff of what each loop sent to the model, the live runs, and where each loop wins. Build it with `bakeoff report` (see [Quick start](#quick-start)) and open it in a browser; it has no external assets. A copy built from the runs behind this README is committed as [`docs/report.html`](docs/report.html).
 
-New to the repo? [`docs/learn/bakeoff-101.html`](docs/learn/bakeoff-101.html) is an interactive course (45 short screens) that explains the whole thing from the machine up: which processes run, what goes over the network, then the contract, the shared harness and both loops with real code excerpts, and finally every number in this README and the report. GitHub shows HTML files as source, so download both pages (or clone the repo) and open them in a browser; neither loads anything from the internet.
+New to the repo? [`docs/learn/bakeoff-101.html`](docs/learn/bakeoff-101.html) is an interactive course (45 short screens) that explains the whole thing from the machine up: which processes run, what goes over the network, then the contract, the shared harness and both loops with real code excerpts, and finally every number in this README and the report. GitHub shows HTML files as source, so clone the repo (or download the whole `docs/` folder, keeping `docs/learn/` inside it, since the course links to `../report.html`) and open them in a browser; neither loads anything from the internet.
 
 <details>
 <summary><strong>Where these numbers come from</strong></summary>
