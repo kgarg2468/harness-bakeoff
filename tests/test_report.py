@@ -539,6 +539,21 @@ def test_timings_need_a_clear_margin_and_live_runs_more_than_one_sample(out: Pat
     assert "median B 1,234 vs A 1,234 over 2 live runs, within 10%" in html  # equal tokens
 
 
+def test_a_live_run_a_loop_did_not_finish_is_not_a_sample(out: Path) -> None:
+    """A loop that failed at once (stop error, 0 tokens, 40 ms) must not look fast and cheap:
+    that run is left out of the medians."""
+    live = json.loads((out / "live" / "L1" / "our" / "result.json").read_text())
+    for impl, seconds in (("our", 2.6), ("pydantic", 3.3)):  # a second, finished sample
+        write_json(out / "live" / "L2" / impl / "result.json",
+                   {**live, "run_id": "L2", "impl": impl, "duration_ms": seconds * 1000})  # fmt: skip
+    write_json(out / "live" / "L3" / "our" / "result.json", {**live, "run_id": "L3", "impl": "our"})
+    write_json(out / "live" / "L3" / "pydantic" / "result.json",
+               {**live, "run_id": "L3", "impl": "pydantic", "stops": ["error"], "error": None,
+                "duration_ms": 40.0, "usage": {"input_tokens": 0}})  # fmt: skip
+    html = make(out)
+    assert "over 2 live runs" in html and "over 3 live runs" not in html
+
+
 def test_metrics_errors_are_shown_not_hidden_or_fatal(out: Path) -> None:
     metrics = json.loads((out / "metrics.json").read_text())
     metrics["bench"]["loops"] = {

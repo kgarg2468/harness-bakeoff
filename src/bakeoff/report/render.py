@@ -1321,14 +1321,22 @@ def _claims(page: Page) -> list[Claim]:
     return claims
 
 
+def _answered(result: dict[str, Any] | None) -> bool:
+    """The loop finished the live run: its last turn ended with end_turn and nothing failed."""
+    if not result or result.get("error"):
+        return False
+    stops = result.get("stops") or []
+    return bool(stops) and stops[-1] == "end_turn"
+
+
 def _live_claims(page: Page) -> list[Claim]:
     """Latency and input tokens over the live runs every live loop answered: medians, and a win
-    only with enough samples and a clear margin."""
+    only with enough samples and a clear margin. A run counts only if every loop finished it
+    (last stop end_turn, no error): a loop that failed at once would otherwise look fast and
+    cheap."""
     loops = [i for i in page.loops if any(i in run["results"] for run in page.live)]
     samples = [
-        run["results"]
-        for run in page.live
-        if all(i in run["results"] and not run["results"][i].get("error") for i in loops)
+        run["results"] for run in page.live if all(_answered(run["results"].get(i)) for i in loops)
     ]
     if len(loops) < 2 or not samples:
         return []
