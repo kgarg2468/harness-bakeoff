@@ -418,6 +418,28 @@ async def test_event_data_that_is_not_json_ends_the_turn_with_error(runner, log,
     assert check_seq(log.events(tid), log.items(tid)).ok
 
 
+@pytest.mark.parametrize(
+    ("bad", "error"),
+    [
+        (
+            lambda turn: Item(f"{turn.turn_id}:s", turn.turn_id, {}, compaction=True),
+            "is a compaction item: only the runner compacts",
+        ),
+        (lambda turn: Item("x", "other.0", {"role": "assistant"}), "belongs to turn 'other.0'"),
+    ],
+    ids=["compaction", "another-turn"],
+)
+async def test_a_loop_item_must_be_an_ordinary_item_of_its_turn(runner, log, tid, bad, error):
+    async def script(turn, tools, cancel):
+        yield Event("item", {"item": bad(turn)})
+        yield Event("turn.end", {"stop": "end_turn", "steps": 1})
+
+    summary = await runner.turn(FakeLoop(script), tid, model=MODEL, user_text="go")
+    assert summary["stop"] == "error"
+    assert error in log.events(tid)[2]["data"]["message"]
+    assert [i.id for i in log.items(tid)] == [f"{tid}.0:user"]
+
+
 async def test_events_are_recorded_as_emitted(runner, log, tid, published):
     async def mutates(turn, tools, cancel):
         event = usage(0.01)

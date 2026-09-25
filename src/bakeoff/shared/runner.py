@@ -116,6 +116,15 @@ async def _wait_lock(lock_path: Path, wait_s: float) -> int | None:
             await asyncio.sleep(_LOCK_POLL_S)
 
 
+def _check_loop_item(item: Any, turn_id: str) -> None:
+    """A loop's items belong to its own turn, and only the runner writes compaction items
+    (contract rule 8): a loop cannot make history before an item of its own disappear."""
+    if getattr(item, "compaction", False):
+        raise ValueError(f"item {item.id!r} is a compaction item: only the runner compacts")
+    if getattr(item, "turn_id", turn_id) != turn_id:
+        raise ValueError(f"item {item.id!r} belongs to turn {item.turn_id!r}, not {turn_id!r}")
+
+
 @contextmanager
 def _logged_failure(what: str) -> Iterator[None]:
     """Log a failure instead of raising it, while another error is on its way up."""
@@ -453,6 +462,8 @@ class Runner:
                 async for event in events:
                     if event.type == "request.start":
                         steps.add(event.data.get("step"))
+                    elif event.type == "item":
+                        _check_loop_item(event.data.get("item"), turn_input.turn_id)
                     pub.emit(event.type, event.data)
                     if event.type == "turn.end":
                         end = event.data

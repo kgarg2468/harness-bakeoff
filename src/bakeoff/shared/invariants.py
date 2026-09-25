@@ -49,15 +49,23 @@ def load_wire(directory: Path) -> list[tuple[bytes, dict[str, Any]]]:
 # I1 --------------------------------------------------------------------------------------
 
 
-def check_prefix(bodies: Sequence[bytes], items: Sequence[Item] = ()) -> Check:
+def check_prefix(
+    bodies: Sequence[bytes], items: Sequence[Item] = (), turns: Sequence[dict[str, Any]] = ()
+) -> Check:
     """I1: each request's `messages` are a prefix of the next request's.
 
     `ok` is semantic equality; byte equality of the raw message elements is reported in
     `info["byte_prefix"]`. A prefix may reset only at a new compaction summary, placed right
-    after the unchanged system messages (contract rule 8). Only the messages of the log's
-    compaction `items` count as summaries, so a look-alike message cannot fake a reset.
+    after the unchanged system messages (contract rule 8). Only the compaction `items` of
+    the runner's "compact" turns (`turns`, as `SessionLog.turns` returns them) count as
+    summaries, so neither a look-alike message nor a loop's own item can fake a reset.
     """
-    summaries = [_semantic(item.message) for item in items if item.compaction]
+    compact_turns = {t["id"] for t in turns if t["kind"] == "compact"}
+    summaries = [
+        _semantic(item.message)
+        for item in items
+        if item.compaction and item.turn_id in compact_turns
+    ]
     requests: list[tuple[list[dict[str, Any]], list[bytes]]] = []
     for i, body in enumerate(bodies):
         try:

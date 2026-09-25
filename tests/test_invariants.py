@@ -133,6 +133,7 @@ def test_prefix_violations(later):
 
 SUMMARY = {"role": "user", "content": "[harness] Conversation summary: wrote a.pipe"}
 COMPACTION = [Item("t.1:compact", "t.1", SUMMARY, compaction=True)]
+TURNS = [{"id": "t.0", "kind": "user"}, {"id": "t.1", "kind": "compact"}]
 
 
 def test_reset_only_at_a_new_compaction_summary():
@@ -141,42 +142,47 @@ def test_reset_only_at_a_new_compaction_summary():
     check = check_prefix(
         [before, after, encode(SYSTEM, SUMMARY, {"role": "user", "content": "next"}, ANSWER)],
         COMPACTION,
+        TURNS,
     )
     assert check.ok, check.detail
     assert check.info["resets"] == [1]
     assert check.info["byte_prefix"]
     # The same summary again is not a new compaction, so the prefix must hold.
     dropped = encode(SYSTEM, SUMMARY, ANSWER)
-    assert not check_prefix([before, after, dropped], COMPACTION).ok
+    assert not check_prefix([before, after, dropped], COMPACTION, TURNS).ok
     # A summary that is not first after the system prompt is no reset.
-    assert not check_prefix([before, encode(SYSTEM, USER, SUMMARY)], COMPACTION).ok
+    assert not check_prefix([before, encode(SYSTEM, USER, SUMMARY)], COMPACTION, TURNS).ok
     # The reset keeps the system messages exactly as they were.
     changed = {"role": "system", "content": "changed"}
     for later in [(changed, SUMMARY), (SUMMARY,), (SYSTEM, changed, SUMMARY)]:
-        assert not check_prefix([before, encode(*later)], COMPACTION).ok, later
+        assert not check_prefix([before, encode(*later)], COMPACTION, TURNS).ok, later
 
 
 def test_only_a_compaction_item_of_the_log_resets_the_prefix():
     before = encode(SYSTEM, USER, CALL, RESULT, ANSWER)
     after = encode(SYSTEM, SUMMARY, {"role": "user", "content": "next"})
     # The loop dropped history behind an ordinary user message that looks like a summary.
-    assert not check_prefix([before, after], items(USER, SUMMARY)).ok
+    assert not check_prefix([before, after], items(USER, SUMMARY), TURNS).ok
     assert not check_prefix([before, after]).ok
     edited = {**SUMMARY, "content": SUMMARY["content"] + " and b.pipe"}
-    assert not check_prefix([before, after], [Item("x", "t.1", edited, compaction=True)]).ok
-    assert check_prefix([before, after], COMPACTION).ok
+    assert not check_prefix([before, after], [Item("x", "t.1", edited, compaction=True)], TURNS).ok
+    assert check_prefix([before, after], COMPACTION, TURNS).ok
+    # A compaction item that no "compact" turn wrote (e.g. a loop's own) does not count either.
+    own = [Item("t.0:sum", "t.0", SUMMARY, compaction=True)]
+    assert not check_prefix([before, after], own, TURNS).ok
+    assert not check_prefix([before, after], COMPACTION).ok  # without the turns: no reset
 
 
 def test_a_reset_still_compares_the_system_bytes():
     before = encode(SYSTEM, USER, ANSWER)
     # The frozen system prompt is serialized differently after the reset.
     respaced = body(SYSTEM, SUMMARY, separators=(",", ":")).encode()
-    check = check_prefix([before, respaced], COMPACTION)
+    check = check_prefix([before, respaced], COMPACTION, TURNS)
     assert check.ok, check.detail  # the same messages, so the reset itself is valid
     assert check.info["resets"] == [1]
     assert not check.info["byte_prefix"]
     assert check.info["byte_mismatches"] == [{"request": 1, "message": 0}]
-    assert check_prefix([before, encode(SYSTEM, SUMMARY)], COMPACTION).info["byte_prefix"]
+    assert check_prefix([before, encode(SYSTEM, SUMMARY)], COMPACTION, TURNS).info["byte_prefix"]
 
 
 def test_unreadable_body_fails():
