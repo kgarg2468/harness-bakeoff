@@ -890,12 +890,25 @@ def reason(result: dict[str, Any]) -> str:
 # --- the matrix ------------------------------------------------------------------------------------
 
 
+def failing(result: dict[str, Any]) -> set[str]:
+    """The final `expect` keys and invariants a result fails."""
+    return {
+        key
+        for group in ("expect", "invariants")
+        for key, check in result.get(group, {}).items()
+        if not check["ok"]
+    }
+
+
 def status(result: dict[str, Any]) -> str:
-    """pass, FAIL, xfail (a documented failure) or XPASS (a documented failure that passed)."""
-    expected = loops.known_failure(result["impl"], result["scenario"]) is not None
+    """pass; xfail: it fails exactly as documented (`loops.KnownFailure`); XPASS: a documented
+    failure passed; FAIL: anything else, including a documented cell that fails differently."""
+    known = loops.known_failure(result["impl"], result["scenario"])
     if result["passed"]:
-        return "XPASS" if expected else "pass"
-    return "xfail" if expected else "FAIL"
+        return "XPASS" if known else "pass"
+    if known and result["error"] is None and failing(result) == known.checks:
+        return "xfail"
+    return "FAIL"
 
 
 async def run_matrix(
@@ -932,11 +945,13 @@ def summarize(
     """summary.json: scenario x impl -> passed + one-line reason, plus git sha and loop versions."""
     matrix: dict[str, dict[str, Any]] = {}
     for r in results:
+        known = loops.known_failure(r["impl"], r["scenario"])
         matrix.setdefault(r["scenario"], {})[r["impl"]] = {
             "passed": r["passed"],
             "status": status(r),
             "reason": reason(r),
-            "expected_failure": loops.known_failure(r["impl"], r["scenario"]),
+            "expected_failure": None if known is None else known.why,
+            "expected_checks": None if known is None else sorted(known.checks),
             "duration_ms": r["duration_ms"],
         }
     sha, dirty = git_state()
@@ -971,7 +986,11 @@ def format_matrix(summary: dict[str, Any]) -> str:
             cell = row.get(impl)
             cells.append(("-" if cell is None else cell["status"]).ljust(width))
             if cell is not None and cell["status"] != "pass":
-                why = cell["expected_failure"] if cell["status"] == "XPASS" else cell["reason"]
+                why = cell["reason"]
+                if cell["status"] == "XPASS":
+                    why = f"passed, but documented to fail: {cell['expected_failure']}"
+                elif cell["status"] == "FAIL" and cell["expected_checks"]:
+                    why += f" [documented to fail only {', '.join(cell['expected_checks'])}]"
                 notes.append(f"  {sid}/{impl} {cell['status']}: {why}")
         lines.append(f"{sid:<10}" + "".join(cells).rstrip())
     totals = []
@@ -986,12 +1005,13 @@ def format_matrix(summary: dict[str, Any]) -> str:
 
 
 def unexpected(summary: dict[str, Any]) -> list[str]:
-    """The cells that failed without a documented reason."""
+    """The cells that did not do what was expected: FAIL, and XPASS (a documented failure is
+    gone, so its entry in `loops.REGISTRY` must go too)."""
     return [
         f"{sid}/{impl}"
         for sid, row in summary["matrix"].items()
         for impl, cell in row.items()
-        if cell["status"] == "FAIL"
+        if cell["status"] in ("FAIL", "XPASS")
     ]
 
 

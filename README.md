@@ -38,8 +38,10 @@ log, git working copy and tools. Loops that are not built yet are skipped.
 bakeoff scenario S01 S05 --impl our,pydantic   # or --all; --out out (default), --run-id ID
 ```
 
-It prints a matrix (`pass`, `FAIL`, `xfail` for a failure the loop's registry entry documents,
-`XPASS` when such a failure is fixed) and exits 1 on any unexpected failure. Each run writes:
+It prints a matrix and exits 1 on any `FAIL` or `XPASS`. `xfail` is a failure that the loop's
+registry entry (`bakeoff/loops.py`) documents, with exactly the checks it documents; a documented
+cell that fails any other way is a `FAIL`. `XPASS` means a documented failure is fixed, so its
+entry must go. Each run writes:
 
 ```
 out/runs/<run_id>/summary.json                   matrix + one-line reasons, git sha, loop versions

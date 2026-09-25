@@ -577,20 +577,25 @@ async def test_run_matrix_writes_the_summary_and_latest(
 ) -> None:
     copy_scenario(tmp_path, "S01", "X01")
     wrong = {"stops": ["end_turn"], "text_contains": "Goodbye"}
-    copy_scenario(tmp_path, "S01", "X02", expect=wrong)
-    copy_scenario(tmp_path, "S01", "X03", expect=wrong)
-    documented = replace(loops.REGISTRY["our"], known_failures={"X03": "says hello, not goodbye"})
-    monkeypatch.setitem(loops.REGISTRY, "our", documented)
+    for sid in ("X02", "X03", "X05"):
+        copy_scenario(tmp_path, "S01", sid, expect=wrong)
+    copy_scenario(tmp_path, "S01", "X04", expect=wrong | {"requests": 2})
+    goodbye = loops.KnownFailure(frozenset({"text_contains"}), "says hello, not goodbye")
+    known = {"X03": goodbye, "X04": goodbye, "X01": goodbye} | {
+        "X05": loops.KnownFailure(frozenset({"I5"}), "prints")
+    }
+    monkeypatch.setitem(loops.REGISTRY, "our", replace(loops.REGISTRY["our"], known_failures=known))
     out, seen = tmp_path / "out", []
+    ids = ["X01", "X02", "X03", "X04", "X05"]
     summary = await run_matrix(
-        ["X01", "X02", "X03"],
+        ids,
         ["our"],
         out=out,
         run_id="m1",
         on_result=lambda r: seen.append(r["scenario"]),
         scenarios_dir=tmp_path / "scenarios",
     )
-    assert seen == ["X01", "X02", "X03"]
+    assert seen == ids
     runs = out / "runs"
     assert json.loads((runs / "m1" / "summary.json").read_text()) == summary
     assert (runs / "latest").is_symlink() and os.readlink(runs / "latest") == "m1"
@@ -599,39 +604,90 @@ async def test_run_matrix_writes_the_summary_and_latest(
     assert summary["loops"]["our"]["target"] == "bakeoff.our_version:OurLoop"
     assert summary["loops"]["our"]["versions"]["httpx"]
     assert summary["git_sha"] is None or len(summary["git_sha"]) == 40
-    cells = {sid: summary["matrix"][sid]["our"] for sid in ("X01", "X02", "X03")}
-    assert cells["X01"] == {
-        "passed": True,
-        "status": "pass",
-        "reason": "ok",
+    cells = {sid: summary["matrix"][sid]["our"] for sid in ids}
+    assert cells["X02"] == {
+        "passed": False,
+        "status": "FAIL",
+        "reason": cells["X02"]["reason"],
         "expected_failure": None,
-        "duration_ms": cells["X01"]["duration_ms"],
+        "expected_checks": None,
+        "duration_ms": cells["X02"]["duration_ms"],
     }
-    assert (cells["X02"]["status"], cells["X02"]["expected_failure"]) == ("FAIL", None)
     assert cells["X02"]["reason"].startswith("text_contains: missing 'Goodbye' in 'Hello")
     assert (cells["X03"]["status"], cells["X03"]["expected_failure"]) == (
         "xfail",
         "says hello, not goodbye",
     )
-    assert unexpected(summary) == ["X02/our"]
+    assert cells["X03"]["expected_checks"] == ["text_contains"]
+    # Documented, but it fails one more check (X04) or another one (X05): not an xfail.
+    assert cells["X04"]["status"] == cells["X05"]["status"] == "FAIL"
+    assert cells["X01"]["status"] == "XPASS"  # a documented failure that passes
+    assert unexpected(summary) == ["X01/our", "X02/our", "X04/our", "X05/our"]
     lines = format_matrix(summary).splitlines()
-    assert lines[:4] == ["scenario  our", "X01       pass", "X02       FAIL", "X03       xfail"]
-    assert lines[4].startswith("  X02/our FAIL: text_contains: missing 'Goodbye'")
-    assert lines[-1] == "our 1/3 pass, 1 FAIL, 1 xfail"
+    assert lines[:6] == [
+        "scenario  our",
+        "X01       XPASS",
+        "X02       FAIL",
+        "X03       xfail",
+        "X04       FAIL",
+        "X05       FAIL",
+    ]
+    assert lines[6] == "  X01/our XPASS: passed, but documented to fail: says hello, not goodbye"
+    assert lines[7].startswith("  X02/our FAIL: text_contains: missing 'Goodbye'")
+    assert lines[8].startswith("  X03/our xfail: text_contains: missing 'Goodbye'")
+    assert lines[9].startswith("  X04/our FAIL: text_contains: missing 'Goodbye'")
+    assert lines[9].endswith(" (+1 more) [documented to fail only text_contains]")
+    assert lines[10].endswith(" [documented to fail only I5]")
+    assert lines[-1] == "our 0/5 pass, 3 FAIL, 1 XPASS, 1 xfail"
 
     await run_matrix(["X01"], ["our"], out=out, run_id="m2", scenarios_dir=tmp_path / "scenarios")
     assert os.readlink(runs / "latest") == "m2"
 
 
-def test_unexpected_lists_only_undocumented_failures() -> None:
+def test_unexpected_lists_failures_and_passes_of_documented_failures() -> None:
     cell = {"passed": False, "reason": "x", "expected_failure": None, "duration_ms": 1.0}
     summary = {
         "matrix": {
             "S01": {"our": cell | {"status": "FAIL"}},
+            "S02": {"our": cell | {"status": "pass", "passed": True}},
+            "S03": {"our": cell | {"status": "XPASS", "passed": True}},
             "S11": {"our": cell | {"status": "xfail"}},
         }
     }
-    assert unexpected(summary) == ["S01/our"]
+    assert unexpected(summary) == ["S01/our", "S03/our"]
+
+
+# --- the loop registry -------------------------------------------------------------------------
+
+
+def test_load_tells_missing_loops_from_broken_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    modules = {
+        "fake_loop_class_absent": "class Other: pass\n",
+        "fake_loop_extra_absent": "import no_such_dependency_xyz\n",  # an extra not installed
+        "fake_loop_renamed_submodule": "import httpx.no_such_submodule\n",  # a library change
+        "fake_loop_bad_first_party": "import bakeoff.no_such_module\n",
+        "fake_loop_raises": "raise RuntimeError('boom')\n",
+    }
+    for name, source in modules.items():
+        (tmp_path / f"{name}.py").write_text(source)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    expected = {
+        "fake_loop_not_there": True,  # the loop's own module is not built yet
+        "fake_loop_class_absent": True,
+        "fake_loop_extra_absent": True,
+        "fake_loop_renamed_submodule": False,
+        "fake_loop_bad_first_party": False,
+        "fake_loop_raises": False,
+    }
+    for module, missing in expected.items():
+        entry = loops.LoopEntry("probe", f"{module}:ProbeLoop", ())
+        monkeypatch.setitem(loops.REGISTRY, "probe", entry)
+        with pytest.raises(loops.LoopUnavailable) as info:
+            loops.load("probe")
+        assert info.value.missing is missing, (module, info.value.reason)
+        assert loops.available(["probe"]) == {}
 
 
 def test_scenario_ids_are_every_file_in_order() -> None:

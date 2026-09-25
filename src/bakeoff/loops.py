@@ -2,18 +2,29 @@
 
 A loop that is not built yet (its package is empty, or its optional dependencies are not
 installed) is reported as missing instead of breaking everything else. Each entry also lists the
-scenarios the loop is known to fail, with the reason, so the scenario matrix records reality
-(`xfail` in tests, `xfail` in `bakeoff scenario`) instead of hiding it.
+scenarios the loop is known to fail: exactly which checks fail, and why. The scenario matrix
+records that reality (`xfail` in tests and in `bakeoff scenario`) instead of hiding it, and any
+other failure in the same cell still counts as a failure.
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import importlib.util
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from bakeoff.shared.contract import Loop
+
+
+@dataclass(frozen=True, slots=True)
+class KnownFailure:
+    """A documented failure of one scenario: the checks that fail (final `expect` keys and
+    invariant names, e.g. {"tool_runs"}), and why."""
+
+    checks: frozenset[str]
+    why: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,8 +34,8 @@ class LoopEntry:
     name: str  # the loop's `name` and the thread's `impl`
     target: str  # "module:Class"
     packages: tuple[str, ...]  # distributions whose versions describe the loop
-    # scenario id -> why this loop fails it (documented, e.g. in A_CHECKLIST.md)
-    known_failures: Mapping[str, str] = field(default_factory=dict)
+    # scenario id -> how and why this loop fails it (documented, e.g. in A_CHECKLIST.md)
+    known_failures: Mapping[str, KnownFailure] = field(default_factory=dict)
 
 
 REGISTRY: dict[str, LoopEntry] = {
@@ -37,8 +48,11 @@ REGISTRY: dict[str, LoopEntry] = {
             known_failures={
                 # The step cap is checked before the next request, after the capped step's
                 # calls ran; a read-only call even starts while its response streams.
-                "S11": "runs call_S11_3, the call of the step that hits max_steps, whose"
-                " result can never be sent (S11 expects it not to run)",
+                "S11": KnownFailure(
+                    frozenset({"tool_runs"}),
+                    "runs call_S11_3, the call of the step that hits max_steps, whose result"
+                    " can never be sent (S11 expects it not to run)",
+                ),
             },
         ),
         LoopEntry(
@@ -70,16 +84,26 @@ def load(name: str) -> type[Loop]:
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:
-        # Missing: the loop package itself, or a third-party dependency (an extra that is not
-        # installed). Anything else means the package exists but is broken, which must be seen.
         absent = getattr(exc, "name", None) if isinstance(exc, ModuleNotFoundError) else None
-        missing = absent is not None and (absent == module_name or not absent.startswith("bakeoff"))
+        missing = absent is not None and (absent == module_name or not _installed(absent))
         reason = f"not installed ({exc})" if missing else f"{type(exc).__name__}: {exc}"
         raise LoopUnavailable(name, reason, missing=missing) from exc
     cls = getattr(module, attr, None)
     if cls is None:
         raise LoopUnavailable(name, f"{entry.target} is not built yet", missing=True)
     return cls
+
+
+def _installed(module: str) -> bool:
+    """Whether the top-level package of `module` is installed at all.
+
+    A loop is missing (skipped) only when its own module or a whole dependency is absent (an
+    extra that is not installed). A missing submodule of an installed package, e.g. after a
+    library renamed it, means the loop exists but is broken, which must fail loudly."""
+    try:
+        return importlib.util.find_spec(module.partition(".")[0]) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def available(names: list[str] | None = None) -> dict[str, type[Loop]]:
@@ -104,8 +128,8 @@ def unavailable() -> dict[str, LoopUnavailable]:
     return problems
 
 
-def known_failure(name: str, scenario: str) -> str | None:
-    """Why loop `name` is expected to fail `scenario`, or None if it should pass."""
+def known_failure(name: str, scenario: str) -> KnownFailure | None:
+    """How and why loop `name` is expected to fail `scenario`, or None if it should pass."""
     entry = REGISTRY.get(name)
     return None if entry is None else entry.known_failures.get(scenario)
 
