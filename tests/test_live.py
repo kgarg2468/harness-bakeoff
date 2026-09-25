@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 
 from bakeoff import live, loops
-from bakeoff.cli import build_parser, main
+from bakeoff.cli import _kind, build_parser, main
 from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.shared.contract import ModelConfig
 from bakeoff.shared.scenario import Workspace
@@ -180,6 +180,68 @@ def test_live_sends_the_system_prompt_and_reasoning(
     assert body["messages"][0] == {"role": "system", "content": system}
     assert system.startswith("You are Rocket Agent.") and live.UNATTENDED in system
     assert live.UNATTENDED not in live.system_prompt(attended=True)
+
+
+@pytest.mark.parametrize("impl", ["our", "pydantic"])
+def test_live_api_responses_sets_the_kind_and_passes_reasoning_through(
+    tmp_path: Path, impl: str, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """`--api responses` makes the thread's endpoint kind openai_responses, and `--reasoning
+    xhigh` reaches its model config as the effort. (The run's outcome is the loop's business:
+    it passes once the loop speaks the Responses API.)"""
+    out = tmp_path / "out"
+    with FakeProvider(wire_dir=tmp_path / "wire") as provider:
+        endpoint = f"http://127.0.0.1:{provider.port}/s/R01/r1/{{impl}}/v1"
+        argv = ["live", "--impl", impl, "--api", "responses", "--reasoning", "xhigh"]
+        argv += ["--base-url", endpoint, "--prompt", "Say hello to the RocketRide team."]
+        main([*argv, "--out", str(out), "--run-id", "t1"])
+    capfd.readouterr()
+    log = SessionLog(out / "live" / "t1" / impl / "log.sqlite")
+    try:
+        model = log.get_thread(f"live-{impl}")["meta"]["model"]
+    finally:
+        log.close()
+    assert (model["kind"], model["reasoning"], model["temperature"]) == (
+        "openai_responses",
+        {"effort": "xhigh"},
+        None,
+    )
+    assert model["base_url"] == endpoint.replace("{impl}", impl)
+
+
+def test_api_picks_the_endpoint_kind(capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+    base = ["live", "--impl", "our", "--prompt", "p"]
+    args = parser.parse_args(base)
+    assert (args.api, _kind(args), args.base_url) == ("chat", "openai_compat", live.OPENAI_BASE_URL)
+    assert _kind(parser.parse_args([*base, "--kind", "openrouter"])) == "openrouter"
+    args = parser.parse_args([*base, "--api", "responses", "--reasoning", "xhigh"])
+    assert (_kind(args), args.base_url, args.reasoning) == (
+        "openai_responses",
+        "https://api.openai.com/v1",
+        "xhigh",
+    )
+    assert _kind(parser.parse_args(["chat", "--api", "responses"])) == "openai_responses"
+    # --kind names a chat completions kind: with --api responses it is a mistake, not ignored.
+    conflict = [
+        *base,
+        "--api",
+        "responses",
+        "--kind",
+        "openrouter",
+        "--base-url",
+        "http://127.0.0.1:9/v1",
+    ]
+    assert main(conflict) == 1
+    assert "--kind openrouter is a chat completions kind" in capsys.readouterr().err
+    config = live.LiveModel(model="gpt-6-luna", kind="openai_responses", reasoning="xhigh").config(
+        "our"
+    )
+    assert (config.kind, config.reasoning, config.base_url) == (
+        "openai_responses",
+        {"effort": "xhigh"},
+        live.OPENAI_BASE_URL,
+    )
 
 
 async def test_chat_asks_before_writing(tmp_path: Path) -> None:
