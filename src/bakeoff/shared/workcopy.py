@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 from contextlib import suppress
 from pathlib import Path
 
-# Fixed identity and no signing, whatever the user's git config says.
+# Fixed identity, no signing, and none of the user's global ignore or attributes files: git
+# reads those from ~/.config/git even when there is no global config file.
 GIT_CONFIG = (
     "-c",
     "user.name=bakeoff",
@@ -15,6 +17,10 @@ GIT_CONFIG = (
     "user.email=bakeoff@localhost",
     "-c",
     "commit.gpgsign=false",
+    "-c",
+    "core.excludesFile=/dev/null",
+    "-c",
+    "core.attributesFile=/dev/null",
 )
 
 
@@ -28,6 +34,10 @@ def git_env(root: Path) -> dict[str, str]:
         GIT_CEILING_DIRECTORIES=str(root.parent),
     )
     return env
+
+
+def _failed(root: Path, args: tuple[str, ...], stderr: bytes) -> RuntimeError:
+    return RuntimeError(f"git {args[0]} failed in {root}: {stderr.decode().strip()}")
 
 
 class WorkCopy:
@@ -48,18 +58,47 @@ class WorkCopy:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        out, err = await proc.communicate()
+        try:
+            out, err = await proc.communicate()
+        except asyncio.CancelledError:
+            # Stop git before propagating, or it finishes on its own (e.g. a commit that no
+            # turn records). SIGTERM, not SIGKILL, so git removes its lock files.
+            with suppress(ProcessLookupError):
+                proc.terminate()
+            await proc.wait()
+            raise
         if proc.returncode:
-            raise RuntimeError(f"git {args[0]} failed in {self.root}: {err.decode().strip()}")
+            raise _failed(self.root, args, err)
         return out.decode()
 
-    async def init(self) -> None:
-        """Create the repository with an empty initial commit. No-op if it already exists."""
-        if (self.root / ".git").exists():
-            return
+    def _git_sync(self, *args: str, check: bool = True) -> str:
+        proc = subprocess.run(
+            ["git", *GIT_CONFIG, *args],
+            cwd=self.root,
+            env=self._env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+        )
+        if check and proc.returncode:
+            raise _failed(self.root, args, proc.stderr)
+        return proc.stdout.decode()
+
+    def init_sync(self) -> None:
+        """Create the repository with an empty initial commit (blocking).
+
+        Idempotent. It also repairs a repository whose initial commit never happened (a crash
+        right after `git init`), so every turn commit has a parent.
+        """
         self.root.mkdir(parents=True, exist_ok=True)
-        await self._git("init", "-q", "-b", "main")
-        await self._git("commit", "-q", "--allow-empty", "-m", "init")
+        if not (self.root / ".git").exists():
+            self._git_sync("init", "-q", "-b", "main")
+        if not self._git_sync("rev-parse", "--verify", "-q", "HEAD", check=False):
+            self._git_sync("commit", "-q", "--allow-empty", "-m", "init")
+
+    async def init(self) -> None:
+        """`init_sync` without blocking the event loop."""
+        await asyncio.to_thread(self.init_sync)
 
     async def commit(self, message: str) -> tuple[str, list[str]]:
         """Commit everything in the working tree (even if nothing changed)."""
@@ -80,11 +119,24 @@ class WorkCopy:
         await self._git("commit", "-q", "--allow-empty", "--no-edit")
         return await self._head_change()
 
+    async def recover(self, sha: str | None) -> None:
+        """Clean up after a worker that died while git was running.
+
+        Removes a stale index lock and moves HEAD back to `sha` (None: the initial commit) if
+        commits landed after it that no turn recorded. Their changes stay staged, so the next
+        commit includes them. Call it only when no other git process can be using the repo.
+        """
+        (self.root / ".git" / "index.lock").unlink(missing_ok=True)
+        target = sha or (await self._git("rev-list", "--max-parents=0", "HEAD")).split()[0]
+        if await self.head() != target:
+            await self._git("reset", "-q", "--soft", target)
+
     async def head(self) -> str:
         return (await self._git("rev-parse", "HEAD")).strip()
 
     async def _head_change(self) -> tuple[str, list[str]]:
-        # With --always, diff-tree prints the commit id even when the commit changes nothing.
-        out = await self._git("diff-tree", "-r", "--always", "--name-only", "-z", "HEAD")
+        # With --always, diff-tree prints the commit id even when the commit changes nothing;
+        # --root lists the files of a root commit too.
+        out = await self._git("diff-tree", "-r", "--root", "--always", "--name-only", "-z", "HEAD")
         sha, *files = out.rstrip("\0").split("\0")
         return sha, files
