@@ -54,7 +54,13 @@ class MockEngine:
 
     def __init__(self, delay_ms: int = 0, catalog_path: Path | None = None) -> None:
         self.delay_ms = delay_ms
-        self._services = _load_services(catalog_path or DEFAULT_CATALOG)
+        self._catalog_path = catalog_path or DEFAULT_CATALOG
+
+    @property
+    def _services(self) -> dict[str, dict]:
+        # Read on first use, so building a ToolHost never needs the catalog (a wheel does
+        # not ship data/); only the engine tools do.
+        return _load_services(self._catalog_path)
 
     async def get_services(self) -> dict[str, dict]:
         """All service definitions, keyed by provider name."""
@@ -116,6 +122,15 @@ def _is_text(value: Any) -> bool:
     return isinstance(value, str) and value != ""
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _is_int(value: Any) -> bool:
+    """JsonCpp's `Value::isInt`: a 32-bit integer, also when written as a real such as `1.0`."""
+    return _is_number(value) and -(2**31) <= value < 2**31 and float(value).is_integer()
+
+
 def structure_error(root: dict[str, Any]) -> str | None:
     """The first rule `PipelineConfig::validate(false)` breaks, in the engine's words, or None.
 
@@ -126,7 +141,7 @@ def structure_error(root: dict[str, Any]) -> str | None:
         return "'pipeline' is missing or invalid"
     if "version" in pipeline:
         version = pipeline["version"]
-        if not isinstance(version, int) or isinstance(version, bool):
+        if not _is_int(version):
             return "'pipeline.version' must be a number"
         if not 1 <= version <= VERSION:
             return "'pipeline.version' is unsupported"
@@ -142,8 +157,11 @@ def structure_error(root: dict[str, Any]) -> str | None:
             return f"Duplicate component {component['id']}"
         ids.add(component["id"])
 
-    # validate(false): the source is optional, but a named source must exist.
+    # validate(false): the source is optional, but a named source must exist. The engine reads
+    # it as text first, and a number converts to a name that is not a string.
     source = pipeline.get("source")
+    if _is_number(source):
+        return "'pipeline.source' must be a non-empty string"
     if _is_text(source) and source not in ids:
         return f"'pipeline.source' references unknown component id: {source}"
 

@@ -83,6 +83,12 @@ async def test_delay_ms_sleeps_before_answering():
     assert time.perf_counter() - start >= 0.05
 
 
+async def test_catalog_is_read_on_first_use(tmp_path):
+    engine = MockEngine(catalog_path=tmp_path / "missing.json")  # a ToolHost can still be built
+    with pytest.raises(FileNotFoundError):
+        await engine.get_services()
+
+
 async def test_custom_catalog_path(tmp_path):
     path = tmp_path / "catalog.json"
     path.write_text(json.dumps({"providers": {"only": {"lanes": {}}}}))
@@ -117,6 +123,8 @@ def _llm(p):
 # Messages are the engine's own (engLib/test/store/pipeline/pipeline_config.cpp).
 STRUCTURE_CASES = [
     ("version not a number", lambda p: p.update(version="one"), "'pipeline.version' must be a number"),
+    ("version not integral", lambda p: p.update(version=1.5), "'pipeline.version' must be a number"),
+    ("version beyond int32", lambda p: p.update(version=2**31), "'pipeline.version' must be a number"),
     ("version too low", lambda p: p.update(version=0), "'pipeline.version' is unsupported"),
     ("version too high", lambda p: p.update(version=3), "'pipeline.version' is unsupported"),
     ("components missing", lambda p: p.pop("components"), "'pipeline.components' must be an array"),
@@ -141,6 +149,7 @@ STRUCTURE_CASES = [
     ),
     ("duplicate id", lambda p: p["components"].append({"id": "chat_1", "provider": "chat", "config": {}}), "Duplicate component chat_1"),
     ("unknown source", lambda p: p.update(source="unknown_source"), "'pipeline.source' references unknown component id: unknown_source"),
+    ("source a number", lambda p: p.update(source=5), "'pipeline.source' must be a non-empty string"),
     ("input invalid", lambda p: _llm(p).update(input=42), "Component llm_1 input must be an array"),
     ("input entry invalid", lambda p: _llm(p).update(input=[42]), "Component llm_1 input entries must be objects"),
     ("lane missing", lambda p: _llm(p)["input"][0].pop("lane"), "Component llm_1 input 'lane' must be a non-empty string"),
@@ -181,6 +190,14 @@ async def test_source_is_optional(engine):
     pipeline = copy.deepcopy(BASE)
     del pipeline["source"]
     assert (await engine.validate(pipeline))["ok"]
+
+
+# JsonCpp's isInt() takes an integral real; a source that does not convert to text is no source.
+@pytest.mark.parametrize(
+    "change", [{"version": 1.0}, {"version": 2.0}, {"source": None}, {"source": True}]
+)
+async def test_what_the_engine_lets_through(engine, change):
+    assert (await engine.validate({**BASE, **change}))["ok"]
 
 
 async def test_unknown_provider(engine):
