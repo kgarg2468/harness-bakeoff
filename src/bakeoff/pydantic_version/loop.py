@@ -174,6 +174,7 @@ class PydanticLoop:
         self._models.clear()
 
     async def _drive(self, turn: TurnInput, state: _Turn, cancel: asyncio.Event) -> None:
+        """Run the turn in this task and queue its events, ending with turn.end and None."""
         _TURN.set(state)
         token = CancellationToken()
         watcher = asyncio.create_task(_cancel_when_set(cancel, token))
@@ -194,6 +195,7 @@ class PydanticLoop:
         state.out.put_nowait(None)
 
     async def _run(self, turn: TurnInput, state: _Turn, token: CancellationToken) -> dict[str, Any]:
+        """One agent run over the rebuilt history. Returns the turn.end data."""
         history = mapping.to_history(turn.history)
         deferred = None
         if turn.resume is not None and (pending := mapping.pending_calls(history)):

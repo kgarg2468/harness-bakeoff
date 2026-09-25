@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 from pai_sse_server import Reply, SSEServer, chunk, done, text, tool_call
-from pydantic_ai import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -296,6 +296,23 @@ async def test_crash_resume_rechecks_open_calls(loop):
     assert [c.id for c in tools.runs] == ["c1", "c2"]
     assert [m["role"] for m in srv.requests[0]["messages"][-3:]] == ["assistant", "tool", "tool"]
     assert of(events, "turn.end")[0]["stop"] == "end_turn"
+
+
+async def test_crash_resume_after_a_persisted_result_does_not_rerun_the_tool(loop):
+    call = ModelResponse(parts=[ToolCallPart("read_file", '{"path": "a"}', "c1")])
+    result = ModelRequest(parts=[ToolReturnPart("read_file", "read_file ok", "c1")])
+    history = [user("go"), native_item(call), native_item(result)]
+    tools = StubTools()
+    with SSEServer(Reply([*text("done"), done()])) as srv:
+        events = await run(loop, turn(history, config(srv), resume=Resume("crash")), tools)
+
+    assert tools.runs == []
+    assert srv.requests[0]["messages"][-1] == {
+        "role": "tool",
+        "tool_call_id": "c1",
+        "content": "read_file ok",
+    }
+    assert [i.message["content"] for i in items(events)] == ["done"]
 
 
 async def test_cancel_during_a_stall_stops_fast_and_replays_the_partial_answer(loop):

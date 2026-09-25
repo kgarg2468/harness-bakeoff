@@ -43,8 +43,9 @@ If you'd do something differently, edit this file in a PR, and A will be changed
       `cost_limit` count what was charged. Without it: `estimate` (genai-prices) or `none`.*
 - [x] **Retries**: the OpenAI SDK's built-in retries (`max_retries`). The `[retries]` tenacity
       transport is the alternative; reviewer's choice.
-      *`retry` events come from httpx event hooks on the SDK's own client class; the SDK numbers
-      attempts only in its `x-stainless-retry-count` header. Failed streams are not retried.*
+      *`retry` events come from httpx event hooks on the SDK's own client class, as each retry
+      starts (with the measured wait); the SDK numbers attempts only in its
+      `x-stainless-retry-count` header. A stream that fails midway is not retried.*
 - [x] **Bad tool arguments**: pydantic-ai's own idiom (`ModelRetry` / retry prompt), with `retries` set
       high enough that one bad call does not end the run. Reviewer's choice of idiom.
       *`retries=max_steps`. `ToolResult` has no failure kind, so every `ok=False` result is a `ModelRetry`.*
