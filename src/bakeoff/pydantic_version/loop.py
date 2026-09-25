@@ -1,0 +1,369 @@
+"""Loop A: the harness loop on pydantic-ai, used the way its docs recommend (A_CHECKLIST.md).
+
+A turn is one `Agent.iter()` run over the native history rebuilt from the items. The run
+executes in its own task and hands events to `run_turn` through a queue: pydantic-ai's
+`CancellationToken` cancels the task that drives the run, and that must never be the
+consumer's task.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import uuid
+from collections.abc import AsyncIterator, Iterable
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, field
+from decimal import Decimal
+from typing import Any
+
+import pydantic_ai
+from pydantic_ai import (
+    Agent,
+    AgentRun,
+    CancellationToken,
+    DeferredToolRequests,
+    DeferredToolResults,
+    ModelHTTPError,
+    ModelMessage,
+    ModelRequestContext,
+    ModelResponse,
+    ModelResponseStreamEvent,
+    ModelRetry,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RunCancelled,
+    RunContext,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    Tool,
+    ToolCallPart,
+    ToolDefinition,
+    ToolDenied,
+    UsageLimitExceeded,
+    UsageLimits,
+)
+from pydantic_ai.capabilities import Hooks
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.toolsets import ApprovalRequiredToolset, FunctionToolset
+
+from bakeoff.pydantic_version import mapping
+from bakeoff.pydantic_version.model import build_model
+from bakeoff.shared.contract import (
+    Event,
+    Item,
+    ModelConfig,
+    Resume,
+    ToolCall,
+    ToolHost,
+    ToolSpec,
+    TurnInput,
+)
+
+# The OpenAI SDK retries inside one call and numbers the attempts only in this request header.
+_RETRY_HEADER = "x-stainless-retry-count"
+
+
+@dataclass
+class _Turn:
+    """Per-turn state: the run's deps (tools reach it as `ctx.deps`) and the HTTP hooks' target."""
+
+    turn_id: str
+    tools: ToolHost
+    out: asyncio.Queue[Event | None] = field(default_factory=asyncio.Queue)
+    steps: int = 0
+    failure: tuple[int, float] | None = None  # (status, monotonic time) of the last failed attempt
+    emitted: dict[int, ModelMessage] = field(default_factory=dict)
+
+    def emit(self, type_: str, data: dict[str, Any]) -> None:
+        self.out.put_nowait(Event(type_, data))
+
+    def request_started(self, attempt: int) -> None:
+        if attempt == 1:
+            self.steps += 1
+        else:
+            status, failed_at = self.failure or (None, time.monotonic())
+            self.emit(
+                "retry",
+                {
+                    "attempt": attempt,
+                    "status": status,
+                    "wait_ms": round((time.monotonic() - failed_at) * 1000),
+                    "reason": f"HTTP {status}" if status else "connection error",
+                },
+            )
+        self.failure = None
+        self.emit("request.start", {"step": self.steps, "attempt": attempt})
+
+    def stream_event(self, event: ModelResponseStreamEvent) -> None:
+        match event:
+            case (
+                PartStartEvent(part=TextPart(content=text))
+                | PartDeltaEvent(delta=TextPartDelta(content_delta=text))
+            ) if text:
+                self.emit("text.delta", {"text": text})
+            case (
+                PartStartEvent(part=ThinkingPart(content=text))
+                | PartDeltaEvent(delta=ThinkingPartDelta(content_delta=text))
+            ) if text:
+                self.emit("reasoning.delta", {"text": text})
+            case PartEndEvent(part=ToolCallPart() as call):
+                self.emit("tool_call.ready", _call_data(call))
+
+    def flush(self, messages: Iterable[ModelMessage]) -> None:
+        """Emit items for the messages not emitted yet, plus a usage event per model response."""
+        for message in messages:
+            if id(message) in self.emitted:
+                continue
+            self.emitted[id(message)] = message  # keeps the object alive, so ids stay unique
+            interrupted = isinstance(message, ModelResponse) and message.state == "interrupted"
+            wire = mapping.to_openai(message)
+            for n, openai_message in enumerate(wire, 1):
+                item = Item(
+                    id=uuid.uuid4().hex,
+                    turn_id=self.turn_id,
+                    message=openai_message,
+                    status="incomplete" if interrupted else "complete",
+                    native=mapping.dump(message) if n == len(wire) else None,
+                )
+                self.emit("item", {"item": item})
+            if isinstance(message, ModelResponse):
+                self.emit("usage", _usage(message, self.steps))
+
+
+_TURN: ContextVar[_Turn] = ContextVar("pydantic_version_turn")
+
+
+class PydanticLoop:
+    """`contract.Loop` on pydantic-ai. Agents, and their HTTP pools, are cached per model config
+    and tool set."""
+
+    name = "pydantic"
+
+    def __init__(self) -> None:
+        pydantic_ai.BANNER_ENABLED = False  # newer releases print a first-run banner (rule 1)
+        self._agents: dict[str, Agent[_Turn, str | DeferredToolRequests]] = {}
+        self._models: list[OpenAIChatModel] = []
+
+    async def run_turn(
+        self, turn: TurnInput, tools: ToolHost, cancel: asyncio.Event
+    ) -> AsyncIterator[Event]:
+        state = _Turn(turn.turn_id, tools)
+        task = asyncio.create_task(self._drive(turn, state, cancel))
+        try:
+            while (event := await state.out.get()) is not None:
+                yield event
+                state.out.task_done()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def aclose(self) -> None:
+        for model in self._models:
+            await model.client.close()
+        self._agents.clear()
+        self._models.clear()
+
+    async def _drive(self, turn: TurnInput, state: _Turn, cancel: asyncio.Event) -> None:
+        _TURN.set(state)
+        token = CancellationToken()
+        watcher = asyncio.create_task(_cancel_when_set(cancel, token))
+        try:
+            end = await self._run(turn, state, token)
+        except RunCancelled:
+            end = {"stop": "cancelled"}
+        except Exception as exc:  # every turn ends with turn.end (rule 7)
+            retryable = isinstance(exc, ModelHTTPError) and (
+                exc.status_code == 429 or exc.status_code >= 500
+            )
+            kind, message = type(exc).__name__, f"{type(exc).__name__}: {exc}"
+            state.emit("error", {"kind": kind, "message": message, "retryable": retryable})
+            end = {"stop": "error", "error": message}
+        finally:
+            watcher.cancel()
+        state.emit("turn.end", {**end, "steps": state.steps})
+        state.out.put_nowait(None)
+
+    async def _run(self, turn: TurnInput, state: _Turn, token: CancellationToken) -> dict[str, Any]:
+        history = mapping.to_history(turn.history)
+        deferred = None
+        if turn.resume is not None and (pending := mapping.pending_calls(history)):
+            deferred, asks = _answers(turn.resume, pending, state.tools)
+            if asks:
+                return _pause(state, asks)
+        limits = turn.limits
+        cost_limit = None if limits.max_cost_usd is None else Decimal(str(limits.max_cost_usd))
+        agent = self._agent(turn.model, state.tools.specs())
+        run: AgentRun[_Turn, str | DeferredToolRequests] | None = None
+        try:
+            async with agent.iter(
+                message_history=history,  # ends with the user's request: the library resumes it
+                deferred_tool_results=deferred,
+                instructions=turn.system,
+                deps=state,
+                usage_limits=UsageLimits(request_limit=limits.max_steps, cost_limit=cost_limit),
+                retries=limits.max_steps,  # a tool's retry budget never outlasts the step cap
+                cancellation_token=token,
+            ) as run:
+                try:
+                    # Persist at every node boundary, so a crash loses at most the current step.
+                    async for node in run:
+                        if not Agent.is_model_request_node(node):
+                            state.flush(run.new_messages())
+                            continue
+                        # Tool results ride on the request node until it is sent: persist them now.
+                        unsent = [] if node.is_resuming_without_prompt else [node.request]
+                        state.flush([*run.new_messages(), *unsent])
+                        async with node.stream(run.ctx) as stream:
+                            async for event in stream:
+                                state.stream_event(event)
+                except UsageLimitExceeded:
+                    state.flush(run.new_messages())
+                    stop = "max_steps" if run.usage.requests >= limits.max_steps else "budget"
+                    return {"stop": stop}
+                result = run.result
+        except Exception as exc:
+            # Keep what completed and close the calls left open (rule 4). After a cancel the
+            # history is complete only once the run has unwound, in the RunCancelled snapshot.
+            ended = exc if isinstance(exc, RunCancelled) else run
+            if ended is not None:
+                state.flush([*ended.new_messages(), *mapping.close_pending(ended.all_messages())])
+            raise
+        if result is not None and isinstance(result.output, DeferredToolRequests):
+            return _pause(state, result.output.approvals)
+        return {"stop": "end_turn"}
+
+    def _agent(
+        self, cfg: ModelConfig, specs: list[ToolSpec]
+    ) -> Agent[_Turn, str | DeferredToolRequests]:
+        key = json.dumps([asdict(cfg), [asdict(spec) for spec in specs]], sort_keys=True)
+        if (agent := self._agents.get(key)) is None:
+            model = build_model(cfg, {"request": [_on_request], "response": [_on_response]})
+            toolset = ApprovalRequiredToolset(
+                FunctionToolset([_tool(spec) for spec in specs]),
+                approval_required_func=_needs_approval,
+            )
+            agent = Agent(
+                model,
+                deps_type=_Turn,
+                output_type=[str, DeferredToolRequests],
+                toolsets=[toolset],
+                capabilities=[Hooks(after_model_request=_billed_cost)],
+                name=self.name,
+            )
+            self._agents[key] = agent
+            self._models.append(model)
+        return agent
+
+
+def _tool(spec: ToolSpec) -> Tool[_Turn]:
+    async def call(ctx: RunContext[_Turn], **_: Any) -> str:
+        # The ToolHost sends tool.start straight to the runner; wait until the consumer has
+        # handled everything queued before it (this call's tool_call.ready).
+        await ctx.deps.out.join()
+        result = await ctx.deps.tools.run(_running_call(ctx))
+        if not result.ok:
+            raise ModelRetry(result.content)  # the library's bad-argument idiom (A_CHECKLIST)
+        return result.content
+
+    return Tool.from_schema(
+        call,
+        name=spec.name,
+        description=spec.description,
+        json_schema=spec.parameters,
+        takes_ctx=True,
+    )
+
+
+def _needs_approval(ctx: RunContext[_Turn], tool_def: ToolDefinition, args: dict[str, Any]) -> bool:
+    return ctx.deps.tools.check(_running_call(ctx)) == "ask"
+
+
+def _running_call(ctx: RunContext[_Turn]) -> ToolCall:
+    """The call `ctx` is executing, with the argument text exactly as the model streamed it."""
+    response = next(m for m in reversed(ctx.messages) if isinstance(m, ModelResponse))
+    return _to_call(next(c for c in response.tool_calls if c.tool_call_id == ctx.tool_call_id))
+
+
+def _to_call(part: ToolCallPart) -> ToolCall:
+    # args_as_json_str() returns the streamed text verbatim when it is a JSON object.
+    return ToolCall(id=part.tool_call_id, name=part.tool_name, arguments=part.args_as_json_str())
+
+
+def _call_data(part: ToolCallPart) -> dict[str, Any]:
+    return {
+        "call_id": part.tool_call_id,
+        "name": part.tool_name,
+        "arguments": part.args_as_json_str(),
+    }
+
+
+def _answers(
+    resume: Resume, pending: list[ToolCallPart], tools: ToolHost
+) -> tuple[DeferredToolResults, list[ToolCallPart]]:
+    """Approvals for the open calls: the user's decision, else `check()` again (a crash resume).
+    Calls that come back "ask" are returned to be asked again."""
+    approvals: dict[str, bool | ToolDenied] = {}
+    asks: list[ToolCallPart] = []
+    for call in pending:
+        decision = resume.decisions.get(call.tool_call_id)
+        if decision == "deny":
+            approvals[call.tool_call_id] = ToolDenied(
+                f"Denied by user: {resume.reason or 'no reason given'}"
+            )
+        elif decision == "allow" or tools.check(_to_call(call)) != "ask":
+            approvals[call.tool_call_id] = True  # run() still enforces "deny" rules
+        else:
+            asks.append(call)
+    return DeferredToolResults(approvals=approvals), asks
+
+
+def _pause(state: _Turn, calls: list[ToolCallPart]) -> dict[str, Any]:
+    for call in calls:
+        state.emit("permission.asked", _call_data(call))
+    return {"stop": "paused", "pending": [call.tool_call_id for call in calls]}
+
+
+def _usage(response: ModelResponse, step: int) -> dict[str, Any]:
+    usage = response.usage
+    billed = (response.provider_details or {}).get("cost")
+    estimate = None if usage.cost is None else float(usage.cost)
+    source = "provider" if billed is not None else "estimate" if estimate is not None else "none"
+    return {
+        "step": step,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cached_tokens": usage.cache_read_tokens,
+        "reasoning_tokens": usage.details.get("reasoning_tokens", 0),
+        "cost_usd": billed if billed is not None else estimate,
+        "cost_source": source,
+    }
+
+
+def _billed_cost(
+    ctx: RunContext[_Turn], /, *, request_context: ModelRequestContext, response: ModelResponse
+) -> ModelResponse:
+    """Use OpenRouter's billed cost as the response cost, so `RunUsage.cost` and `cost_limit`
+    count what was charged instead of pydantic-ai's price estimate."""
+    if (cost := (response.provider_details or {}).get("cost")) is not None:
+        response.usage.cost = Decimal(str(cost))
+    return response
+
+
+async def _cancel_when_set(cancel: asyncio.Event, token: CancellationToken) -> None:
+    await cancel.wait()
+    token.cancel()
+
+
+async def _on_request(request: Any) -> None:
+    if (turn := _TURN.get(None)) is not None:
+        turn.request_started(int(request.headers.get(_RETRY_HEADER, "0")) + 1)
+
+
+async def _on_response(response: Any) -> None:
+    if (turn := _TURN.get(None)) is not None and response.status_code >= 400:
+        turn.failure = (response.status_code, time.monotonic())
