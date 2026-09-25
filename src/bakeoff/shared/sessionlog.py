@@ -1,0 +1,226 @@
+"""SQLite session log: threads, turns, items and events.
+
+Items and events are append-only (triggers reject UPDATE and DELETE); thread and turn rows
+may change. The file runs in WAL mode, so several processes can share it (a worker running a
+turn plus a separate `approve` or `cancel` command).
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import fields
+from pathlib import Path
+from typing import Any
+
+from bakeoff.shared.contract import Item
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS threads(
+    id TEXT PRIMARY KEY, impl TEXT NOT NULL, system TEXT NOT NULL, meta TEXT NOT NULL,
+    created_us INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS turns(
+    id TEXT PRIMARY KEY, thread TEXT NOT NULL, idx INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('user', 'approval', 'crash', 'revert', 'compact')),
+    status TEXT NOT NULL
+        CHECK (status IN ('running', 'paused', 'done', 'error', 'cancelled')),
+    stop TEXT, pending TEXT, commit_sha TEXT, started_us INTEGER NOT NULL, ended_us INTEGER,
+    UNIQUE (thread, idx));
+CREATE TABLE IF NOT EXISTS items(
+    thread TEXT NOT NULL, seq INTEGER NOT NULL, turn TEXT NOT NULL, id TEXT NOT NULL,
+    json TEXT NOT NULL, PRIMARY KEY (thread, seq));
+CREATE TABLE IF NOT EXISTS events(
+    thread TEXT NOT NULL, seq INTEGER NOT NULL, turn TEXT NOT NULL, type TEXT NOT NULL,
+    t_us INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (thread, seq));
+CREATE TABLE IF NOT EXISTS cancels(thread TEXT NOT NULL, ts INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS cancels_thread ON cancels(thread, ts);
+CREATE TRIGGER IF NOT EXISTS items_no_update BEFORE UPDATE ON items
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS items_no_delete BEFORE DELETE ON items
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+"""
+
+_ITEM_FIELDS = tuple(f.name for f in fields(Item))
+
+
+def now_us() -> int:
+    """Wall-clock time in microseconds (comparable across processes)."""
+    return time.time_ns() // 1000
+
+
+def item_to_json(item: Item) -> dict[str, Any]:
+    """Every `Item` field as a JSON-ready dict; `native` is kept as-is."""
+    return {name: getattr(item, name) for name in _ITEM_FIELDS}
+
+
+def item_from_json(data: dict[str, Any]) -> Item:
+    """Inverse of `item_to_json`."""
+    return Item(**data)
+
+
+class SessionLog:
+    """The durable record of every thread. Writes are small and synchronous; any number of
+    instances, in one or more processes, can share a file."""
+
+    def __init__(self, path: Path | str) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(path, isolation_level=None)
+        self._db.row_factory = sqlite3.Row
+        # busy_timeout first, so switching to WAL waits for other processes instead of failing.
+        self._db.execute("PRAGMA busy_timeout = 5000")
+        self._db.execute("PRAGMA journal_mode = WAL")
+        self._db.execute("PRAGMA synchronous = NORMAL")
+        self._db.executescript(_SCHEMA)
+
+    def close(self) -> None:
+        self._db.close()
+
+    @contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        # IMMEDIATE takes the write lock up front, so read-then-insert (next seq/idx) is atomic.
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            yield self._db
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+        self._db.execute("COMMIT")
+
+    # threads
+
+    def create_thread(
+        self, thread_id: str, *, impl: str, system: str, meta: dict[str, Any]
+    ) -> None:
+        self._db.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?)",
+            (thread_id, impl, system, json.dumps(meta), now_us()),
+        )
+
+    def get_thread(self, thread_id: str) -> dict[str, Any] | None:
+        """`{"id", "impl", "system", "meta", "created_us"}`, or None if unknown."""
+        row = self._db.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
+        return None if row is None else {**dict(row), "meta": json.loads(row["meta"])}
+
+    # turns
+
+    def start_turn(self, thread_id: str, kind: str) -> dict[str, Any]:
+        """Insert a running turn with the next index; its id is `<thread>.<idx>`."""
+        with self._tx() as db:
+            (idx,) = db.execute(
+                "SELECT COUNT(*) FROM turns WHERE thread = ?", (thread_id,)
+            ).fetchone()
+            turn_id = f"{thread_id}.{idx}"
+            db.execute(
+                "INSERT INTO turns (id, thread, idx, kind, status, started_us)"
+                " VALUES (?, ?, ?, ?, 'running', ?)",
+                (turn_id, thread_id, idx, kind, now_us()),
+            )
+        return self._turn_rows("WHERE id = ?", turn_id)[0]
+
+    def set_turn_status(
+        self,
+        turn_id: str,
+        status: str,
+        *,
+        stop: str | None = None,
+        pending: list[str] | None = None,
+        commit_sha: str | None = None,
+    ) -> None:
+        """Record how a turn ended (sets `ended_us` unless the status is "running")."""
+        self._db.execute(
+            "UPDATE turns SET status = ?, stop = ?, pending = ?, commit_sha = ?, ended_us = ?"
+            " WHERE id = ?",
+            (
+                status,
+                stop,
+                None if pending is None else json.dumps(pending),
+                commit_sha,
+                None if status == "running" else now_us(),
+                turn_id,
+            ),
+        )
+
+    def turns(self, thread_id: str) -> list[dict[str, Any]]:
+        """All turns of a thread in order, as dicts of the `turns` columns."""
+        return self._turn_rows("WHERE thread = ? ORDER BY idx", thread_id)
+
+    def last_turn(self, thread_id: str) -> dict[str, Any] | None:
+        rows = self._turn_rows("WHERE thread = ? ORDER BY idx DESC LIMIT 1", thread_id)
+        return rows[0] if rows else None
+
+    def _turn_rows(self, where: str, arg: str) -> list[dict[str, Any]]:
+        rows = self._db.execute(f"SELECT * FROM turns {where}", (arg,)).fetchall()
+        return [
+            {**dict(r), "pending": None if r["pending"] is None else json.loads(r["pending"])}
+            for r in rows
+        ]
+
+    # items and events
+
+    def append_item(self, thread_id: str, item: Item, events: Iterable[dict[str, Any]] = ()) -> int:
+        """Append an item (seq = its position in history) plus `events`, in one transaction."""
+        data = json.dumps(item_to_json(item))
+        with self._tx() as db:
+            (seq,) = db.execute(
+                "SELECT COALESCE(MAX(seq) + 1, 0) FROM items WHERE thread = ?", (thread_id,)
+            ).fetchone()
+            db.execute(
+                "INSERT INTO items VALUES (?, ?, ?, ?, ?)",
+                (thread_id, seq, item.turn_id, item.id, data),
+            )
+            self._insert_events(db, events)
+        return seq
+
+    def items(self, thread_id: str) -> list[Item]:
+        rows = self._db.execute(
+            "SELECT json FROM items WHERE thread = ? ORDER BY seq", (thread_id,)
+        ).fetchall()
+        return [item_from_json(json.loads(r[0])) for r in rows]
+
+    def append_events(self, events: Iterable[dict[str, Any]]) -> None:
+        """Insert event envelopes (`{"v", "thread", "turn", "impl", "seq", "t_us", "type", "data"}`)."""
+        with self._tx() as db:
+            self._insert_events(db, events)
+
+    @staticmethod
+    def _insert_events(db: sqlite3.Connection, events: Iterable[dict[str, Any]]) -> None:
+        db.executemany(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (e["thread"], e["seq"], e["turn"], e["type"], e["t_us"], json.dumps(e))
+                for e in events
+            ],
+        )
+
+    def events(self, thread_id: str) -> list[dict[str, Any]]:
+        """All event envelopes of a thread in seq order."""
+        rows = self._db.execute(
+            "SELECT json FROM events WHERE thread = ? ORDER BY seq", (thread_id,)
+        ).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
+    def next_seq(self, thread_id: str) -> int:
+        """The seq the thread's next event gets (event seqs start at 1)."""
+        (seq,) = self._db.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE thread = ?", (thread_id,)
+        ).fetchone()
+        return seq
+
+    # cancellation, e.g. from a separate `bakeoff cancel` process
+
+    def request_cancel(self, thread_id: str) -> None:
+        self._db.execute("INSERT INTO cancels VALUES (?, ?)", (thread_id, now_us()))
+
+    def cancel_requested(self, thread_id: str, since_us: int = 0) -> bool:
+        """True if a cancel was requested for the thread at or after `since_us`."""
+        row = self._db.execute(
+            "SELECT 1 FROM cancels WHERE thread = ? AND ts >= ? LIMIT 1", (thread_id, since_us)
+        ).fetchone()
+        return row is not None
