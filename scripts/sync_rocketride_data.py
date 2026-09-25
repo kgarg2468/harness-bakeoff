@@ -203,6 +203,9 @@ def copy_skills(repo: Path, commit: str, out: Path) -> int:
     # Build the new bundle next to the old one and swap only when it is complete, so a failed
     # git read or write never leaves the bundle missing or half-copied.
     staging = out / ".skills.staging"
+    retired = out / ".skills.old"
+    if retired.exists() and not dest_root.exists():
+        retired.rename(dest_root)  # an earlier sync stopped between the two renames
     shutil.rmtree(staging, ignore_errors=True)
     try:
         # -z: without it git quotes non-ASCII paths ("r\303\251sum\303\251.md"), which the suffix
@@ -223,11 +226,15 @@ def copy_skills(repo: Path, commit: str, out: Path) -> int:
         shutil.rmtree(staging, ignore_errors=True)
         raise
     # Generated: files removed upstream must go too, so the old bundle is replaced whole.
-    retired = out / ".skills.old"
     shutil.rmtree(retired, ignore_errors=True)
     if dest_root.exists():
         dest_root.rename(retired)
-    staging.rename(dest_root)
+    try:
+        staging.rename(dest_root)
+    except BaseException:
+        if retired.exists() and not dest_root.exists():
+            retired.rename(dest_root)  # roll back: the old bundle stays in place
+        raise
     shutil.rmtree(retired, ignore_errors=True)
     return len(copied)
 
