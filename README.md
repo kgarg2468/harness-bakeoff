@@ -87,10 +87,12 @@ A run id is never reused: `out/live/<run_id>/<impl>` must not exist yet.
 
 `live` streams each loop's run (text inline, tool calls and results on one line each), then
 prints tokens, time to first token, total time and steps side by side, and writes
-`out/live/<run_id>/<impl>/` (same files as a scenario run; `result.json` adds `model`, `prompt`,
-`final_text`, `latency`). A run that fails, is interrupted or cannot even start (say, git fails)
-still writes its `result.json`, with the error. `--interactive` asks before each write;
-`--base-url` points it at another endpoint (`{impl}` in the URL is replaced by the loop name).
+`out/live/<run_id>/<impl>/` (same files as a scenario run; `result.json` adds `model`,
+`base_url`, `prompt`, `final_text`, `latency`, and what the session log does not keep:
+`max_steps` and `attended`, true when a person answers approvals). A run that fails, is
+interrupted or cannot even start (say, git fails) still writes its `result.json`, with the error.
+`--interactive` asks before each write (`attended`); `--base-url` points it at another endpoint
+(`{impl}` in the URL is replaced by the loop name).
 
 The commands below act on one thread of a session log from a separate process. The scenario
 driver uses them for the cross-process steps (approve in a new process, crash and resume):
