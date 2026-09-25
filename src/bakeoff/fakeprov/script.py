@@ -177,14 +177,21 @@ _RESPONSES_OPS = {
         "reasoning_item",
         _obj(
             # minLength 2: the added event sends its first half, which must differ from it.
-            {"id": _STR, "encrypted_content": {"type": "string", "minLength": 2}, "summary": _STRS},
+            # `text`: raw reasoning text parts (some models stream their reasoning itself).
+            {
+                "id": _STR,
+                "encrypted_content": {"type": "string", "minLength": 2},
+                "summary": _STRS,
+                "text": _STRS,
+            },
             "id",
             "encrypted_content",
         ),
         chunks=_INT1,
         done=_BOOL,
     ),
-    "tool_calls": _op("tool_calls", _CALLS, pieces=_INT1),
+    # `status: incomplete`: max_output_tokens cut the last call, which is done as incomplete.
+    "tool_calls": _op("tool_calls", _CALLS, pieces=_INT1, status={"const": "incomplete"}),
     "completed": _op("completed", _obj(_RESPONSES_USAGE, "input_tokens", "output_tokens")),
     # max_output_tokens ran out (say, while the model reasoned): the response ends with usage.
     "incomplete": _op(
@@ -437,8 +444,10 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
             for i, op in enumerate(ops[:-1]):
                 # An item cut short is the last one of a stream that fails, stalls or runs out
                 # of output tokens.
-                if op.get("done") is False and (i != len(ops) - 2 or "completed" in ops[-1]):
-                    fail(f"{where}.stream[{i}]", "done: false must come right before the"
+                cut = "done: false" if op.get("done") is False else None
+                cut = "status: incomplete" if op.get("status") == "incomplete" else cut
+                if cut and (i != len(ops) - 2 or "completed" in ops[-1]):
+                    fail(f"{where}.stream[{i}]", f"{cut} must come right before the"
                          " incomplete, error, failed or stall that ends the stream")  # fmt: skip
             reasoning_ids += [op["reasoning_item"]["id"] for op in ops if "reasoning_item" in op]
         call_ids += [call["id"] for op in ops for call in op.get("tool_calls", [])]
@@ -988,10 +997,12 @@ def _done_reasoning(spec: dict[str, Any], summarized: bool) -> dict[str, Any]:
     replay (`reasoning_replayed`)."""
     texts = spec.get("summary", []) if summarized else []
     summary = [{"type": "summary_text", "text": text} for text in texts]
+    content = [{"type": "reasoning_text", "text": text} for text in spec.get("text", [])]
     return {
         "id": spec["id"],
         "type": "reasoning",
         "summary": summary,
+        **({"content": content} if content else {}),
         "encrypted_content": spec["encrypted_content"],
     }
 
@@ -1153,7 +1164,13 @@ class _ResponsesStream:
         if "reasoning_item" in op:
             return self._reasoning(op)
         if "tool_calls" in op:
-            return [f for call in op["tool_calls"] for f in self._call(call, op.get("pieces", 1))]
+            calls, pieces = op["tool_calls"], op.get("pieces", 1)
+            cut = op.get("status") == "incomplete"  # the last call only
+            return [
+                frame
+                for n, call in enumerate(calls)
+                for frame in self._call(call, pieces, cut=cut and n == len(calls) - 1)
+            ]
         if "completed" in op:
             usage = _responses_usage(op["completed"])
             return [self._event("response.completed", response=self._response("completed", usage))]
@@ -1221,6 +1238,19 @@ class _ResponsesStream:
         frames: list[Op] = [
             self._event("response.output_item.added", output_index=index, item=added)
         ]
+        # Raw reasoning text streams whether or not a summary is asked for: it is no summary.
+        empty = {"type": "reasoning_text", "text": ""}
+        for n, text in enumerate(spec.get("text", [])):
+            part_at = {**at, "content_index": n}
+            frames.append(self._event("response.content_part.added", **part_at, part=empty))
+            for piece in _split(text, op.get("chunks", 1)):
+                frames.append(
+                    self._event("response.reasoning_text.delta", **part_at, delta=piece, pad=True)
+                )
+            frames += [
+                self._event("response.reasoning_text.done", **part_at, text=text),
+                self._event("response.content_part.done", **part_at, part={**empty, "text": text}),
+            ]
         summary = spec.get("summary", []) if self.summarize else []
         for n, text in enumerate(summary):
             part_at = {**at, "summary_index": n}
@@ -1253,7 +1283,7 @@ class _ResponsesStream:
         self.output.append(done)
         return [*frames, self._event("response.output_item.done", output_index=index, item=done)]
 
-    def _call(self, call: dict[str, Any], pieces: int) -> list[Op]:
+    def _call(self, call: dict[str, Any], pieces: int, *, cut: bool = False) -> list[Op]:
         index = self._start()
         args = call["arguments"]
         args = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
@@ -1274,15 +1304,15 @@ class _ResponsesStream:
             frames.append(
                 self._event("response.function_call_arguments.delta", **at, delta=piece, pad=True)
             )
-        done = {**item, "status": "completed", "arguments": args}
+        done = {**item, "status": "incomplete" if cut else "completed", "arguments": args}
         self.output.append(done)
-        return [
-            *frames,
-            self._event(
-                "response.function_call_arguments.done", **at, name=call["name"], arguments=args
-            ),
-            self._event("response.output_item.done", output_index=index, item=done),
-        ]
+        if not cut:  # the arguments of a call cut short never finish
+            frames.append(
+                self._event(
+                    "response.function_call_arguments.done", **at, name=call["name"], arguments=args
+                )
+            )
+        return [*frames, self._event("response.output_item.done", output_index=index, item=done)]
 
     def _start(self) -> int:
         index, self.started = self.started, self.started + 1
