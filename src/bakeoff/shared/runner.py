@@ -347,21 +347,23 @@ class Runner:
         target = next((t for t in self.log.turns(thread_id) if t["id"] == turn_id), None)
         if target is None or not target["commit_sha"]:
             raise ValueError(f"turn {turn_id} of thread {thread_id} has no commit to revert")
+        # Held until the revert is fully recorded: while its row says "running", a crash resume
+        # that got the lock would take git's revert commit for one that no turn recorded.
         with _exclusive(self._lock_path(thread_id)):
-            # The running turn row keeps other turns out while git works.
             row = self.log.start_turn(thread_id, "revert")
             try:
                 sha, files = await WorkCopy(self.workdir(thread_id)).revert(target["commit_sha"])
             except Exception:
                 self.log.discard_turn(row["id"])  # it recorded nothing yet
                 raise
-        pub = _Publisher(self.log, self.sink, thread_id, row["id"], thread["impl"])
-        note = f"[harness] Reverted turn {target['idx'] + 1}; files: {', '.join(files) or 'none'}"
-        message = {"role": "user", "content": note}
-        pub.emit("item", {"item": Item(f"{row['id']}:revert", row["id"], message)})
-        self.log.set_turn_status(row["id"], "done", commit_sha=sha)
-        pub.emit("commit", {"sha": sha, "files": files})
-        pub.close()
+            pub = _Publisher(self.log, self.sink, thread_id, row["id"], thread["impl"])
+            files_text = ", ".join(files) or "none"
+            note = f"[harness] Reverted turn {target['idx'] + 1}; files: {files_text}"
+            message = {"role": "user", "content": note}
+            pub.emit("item", {"item": Item(f"{row['id']}:revert", row["id"], message)})
+            self.log.set_turn_status(row["id"], "done", commit_sha=sha)
+            pub.emit("commit", {"sha": sha, "files": files})
+            pub.close()
         return {"turn_id": row["id"], "stop": None, "pending": [], "commit": sha}
 
     def compact(self, thread_id: str, summary: str) -> Item:

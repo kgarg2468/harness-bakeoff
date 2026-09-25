@@ -7,7 +7,7 @@ import pytest
 
 from bakeoff.shared.contract import Event, Item, ModelConfig, Resume, ToolCall, ToolResult
 from bakeoff.shared.invariants import check_commits, check_seq, check_tool_results
-from bakeoff.shared.runner import NdjsonMirror, Runner
+from bakeoff.shared.runner import NdjsonMirror, Runner, ThreadBusy, _exclusive
 from bakeoff.shared.sessionlog import SessionLog
 from bakeoff.shared.workcopy import GIT_CONFIG, WorkCopy, git_env
 
@@ -680,6 +680,26 @@ async def test_revert(runner, log, tid, published):
     assert loop.inputs[0].history[-2].message["content"].startswith("[harness] Reverted turn 1")
 
 
+async def test_revert_holds_the_thread_lock_until_it_is_recorded(log, tmp_path):
+    locked = []
+
+    def sink(envelope):  # tries the thread's lock, as a crash resume in another process would
+        if envelope["turn"] == f"{tid}.1":
+            try:
+                with _exclusive(runner._lock_path(tid)):
+                    locked.append((envelope["type"], False))
+            except ThreadBusy:
+                locked.append((envelope["type"], True))
+
+    runner = Runner(log, tmp_path / "wc", StubTools, sink=sink)
+    tid = runner.new_thread(impl="our", system="s", rules={}, model=MODEL)
+    await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
+    await runner.revert(tid, f"{tid}.0")
+    assert locked == [("item", True), ("commit", True)]
+    with _exclusive(runner._lock_path(tid)):  # released afterwards
+        pass
+
+
 async def test_revert_errors_record_no_turn(runner, log, tid):
     await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
     (runner.workdir(tid) / "a.pipe").write_text("changed")
@@ -729,8 +749,6 @@ async def test_ndjson_mirror(log, tmp_path):
 
 async def test_concurrent_crash_resumes_cannot_both_run(runner, log, tid):
     """Two crash resumes of one thread: exactly one runs, the other gets ThreadBusy."""
-    from bakeoff.shared.runner import ThreadBusy
-
     started = asyncio.Event()
 
     async def hang(turn, tools, cancel):
