@@ -65,6 +65,8 @@ async def read_file(args: dict[str, Any], ctx: ToolContext) -> str:
 async def write_file(args: dict[str, Any], ctx: ToolContext) -> str:
     """Create or overwrite a file, creating parent directories."""
     full = resolve_path(ctx.workdir, args["path"], write=True)
+    if full.is_dir():
+        raise ToolError(f"Is a directory: {args['path']}")
     size = _write(full, args["content"])
     return f"Wrote {size} bytes to {_rel(ctx, full)}"
 

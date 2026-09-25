@@ -103,6 +103,12 @@ async def test_write_file_creates_parents(wc, ctx):
     assert (wc / "x" / "y" / "z.pipe").read_bytes() == "é\n".encode()
 
 
+async def test_write_onto_a_directory(wc, ctx):
+    (wc / "d").mkdir()
+    with pytest.raises(ToolError, match="Is a directory: d"):
+        await write_file({"path": "d", "content": ""}, ctx)
+
+
 async def test_write_into_git_is_refused(wc, ctx):
     with pytest.raises(PathError):
         await write_file({"path": ".git/config", "content": ""}, ctx)
