@@ -66,8 +66,9 @@ only a session log names). The network guard allows only loopback and the endpoi
 ```bash
 bakeoff live --impl our,pydantic --model gpt-6-luna --reasoning none --max-steps 8 \
     --prompt "Build a chat pipeline, save it as chat.pipe, and validate it."
-bakeoff live --impl our,pydantic --api responses --reasoning xhigh --prompt "..."
 bakeoff chat --impl our            # REPL: approvals prompted, /revert N, /compact TEXT, /exit
+# Lands with the loop PRs (see below): no loop speaks the Responses API yet
+bakeoff live --impl our,pydantic --api responses --reasoning xhigh --prompt "..."
 ```
 
 `--api responses` uses OpenAI's Responses API (endpoint kind `openai_responses`, same
@@ -75,7 +76,10 @@ bakeoff chat --impl our            # REPL: approvals prompted, /revert N, /compa
 takes function tools on chat completions only with reasoning effort `none`, so tools plus
 reasoning need it. There `--reasoning EFFORT` also asks for a reasoning summary (`"summary":
 "auto"`, unless the effort is `none`): the API streams none otherwise. `--kind` picks the chat
-completions kind (`openai_compat` or `openrouter`).
+completions kind (`openai_compat` or `openrouter`). Only the shared groundwork is in so far
+(this option, fakeprov's Responses mode, scenarios R01-R05); loop support follows in the next
+PRs. Until a loop speaks the API (its R01-R05 cells pass instead of `xfail`), `--api responses`
+cannot complete a run with it.
 
 In `chat`, Ctrl-C during a turn cancels the turn, and at a prompt it ends the chat. `chat` exits 1
 if any turn stopped short (error, max_steps, budget, cancelled) or an invariant failed, else 0.

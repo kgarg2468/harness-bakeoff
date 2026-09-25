@@ -330,6 +330,136 @@ def test_bad_responses_requests(serve):
     assert post(provider, {**request(), "input": "hi"}).status_code == 200  # one user message
 
 
+def test_well_formed_items_of_every_served_type_pass(serve):
+    provider = serve(scenario("T", says("ok")))
+    items = [
+        {"role": "developer", "content": [{"type": "input_text", "text": "Be brief."}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {**DONE_REASONING, "encrypted_content": None},
+        {"id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+         "phase": "commentary", "content": [{"type": "output_text", "text": "Checking."}]},
+        DONE_CALL,
+        {"type": "function_call_output", "call_id": "call_1",
+         "output": [{"type": "input_text", "text": "3 rows"}]},
+    ]  # fmt: skip
+    assert post(provider, request(*items)).status_code == 200
+
+
+OUTPUT_OK = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("item", "message", "param", "code"),
+    [
+        (
+            {"type": "function_call_output", "call_id": "call_1"},
+            "Missing required parameter: 'input[1].output'.",
+            "input[1].output",
+            "missing_required_parameter",
+        ),
+        (
+            {**OUTPUT_OK, "output": None},
+            "Invalid type for 'input[1].output': expected one of a string or an array, but got"
+            " null instead.",
+            "input[1].output",
+            "invalid_type",
+        ),
+        (
+            {k: v for k, v in OUTPUT_OK.items() if k != "call_id"},
+            "Missing required parameter: 'input[1].call_id'.",
+            "input[1].call_id",
+            "missing_required_parameter",
+        ),
+        (
+            {**DONE_CALL, "arguments": {"path": "a.pipe"}},
+            "Invalid type for 'input[1].arguments': expected a string, but got an object instead.",
+            "input[1].arguments",
+            "invalid_type",
+        ),
+        (
+            {k: v for k, v in DONE_CALL.items() if k != "name"},
+            "Missing required parameter: 'input[1].name'.",
+            "input[1].name",
+            "missing_required_parameter",
+        ),
+        (
+            {"role": "user"},
+            "Missing required parameter: 'input[1].content'.",
+            "input[1].content",
+            "missing_required_parameter",
+        ),
+        (
+            {"role": "tool", "content": "3 rows"},
+            "Invalid value: 'tool'. Supported values are: 'user', 'assistant', 'system', and"
+            " 'developer'.",
+            "input[1].role",
+            "invalid_value",
+        ),
+        (
+            {"role": "assistant", "content": [{"type": "input_text", "text": "hi"}]},
+            "Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'.",
+            "input[1].content[0]",
+            "invalid_value",
+        ),
+        (
+            {"role": "user", "content": [{"type": "input_text"}]},
+            "Missing required parameter: 'input[1].content[0].text'.",
+            "input[1].content[0].text",
+            "missing_required_parameter",
+        ),
+        (
+            {k: v for k, v in DONE_REASONING.items() if k != "id"},
+            "Missing required parameter: 'input[1].id'.",
+            "input[1].id",
+            "missing_required_parameter",
+        ),
+        (
+            {k: v for k, v in DONE_REASONING.items() if k != "summary"},
+            "Missing required parameter: 'input[1].summary'.",
+            "input[1].summary",
+            "missing_required_parameter",
+        ),
+        (
+            {**DONE_REASONING, "summary": ["Go."]},
+            "Invalid type for 'input[1].summary[0]': expected an object, but got a string instead.",
+            "input[1].summary[0]",
+            "invalid_type",
+        ),
+        (
+            {**DONE_REASONING, "encrypted_content": 7},
+            "Invalid type for 'input[1].encrypted_content': expected a string, but got an integer"
+            " instead.",
+            "input[1].encrypted_content",
+            "invalid_type",
+        ),
+        (
+            {"call_id": "call_1", "output": "ok"},
+            "Missing required parameter: 'input[1].type'.",
+            "input[1].type",
+            "missing_required_parameter",
+        ),
+        (
+            {"type": "web_search_call", "id": "ws_1"},
+            "Invalid value: 'web_search_call'. Supported values are: 'message', 'function_call',"
+            " 'function_call_output', and 'reasoning'.",
+            "input[1].type",
+            "invalid_value",
+        ),
+    ],
+)
+def test_malformed_input_items_are_400(serve, tmp_path, item, message, param, code):
+    """As the API answers them, before the script is read: an exchange that expects nothing
+    refuses them too."""
+    provider = serve(scenario("T", says("ok")))
+    response = post(provider, request(USER, item))
+    assert response.status_code == 400
+    assert response.headers["x-should-retry"] == "false"
+    error = {"message": message, "type": "invalid_request_error", "param": param, "code": code}
+    assert response.json() == {"error": error}
+    meta = json.loads((tmp_path / "wire" / "T" / "r1" / "our" / "001.meta.json").read_text())
+    assert (meta["status"], meta["error"]) == (400, message)
+
+
 def replaying(reasoning: dict[str, Any]) -> dict[str, Any]:
     output = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
     return request(USER, reasoning, DONE_CALL, output)
@@ -378,6 +508,23 @@ def test_a_cut_reasoning_item_never_verifies(serve):
     response = post(provider, replaying(DONE_REASONING))
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_encrypted_content"
+
+
+def test_reasoning_that_no_earlier_response_sent_never_verifies(serve):
+    """A later exchange's reasoning item was never sent to this cursor, so its scripted
+    encrypted content cannot verify yet; once a response has sent it, it does."""
+    strict = {"reject_unencrypted_reasoning": True}
+    provider = serve(scenario("T", says("ok"), CALLS, says("ok"), strict=strict))
+    early = post(provider, replaying(DONE_REASONING))  # rs_1 comes with exchange 2
+    assert early.status_code == 400
+    assert early.json()["error"] == {
+        "message": "The encrypted content for item rs_1 could not be verified.",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "invalid_encrypted_content",
+    }
+    assert post(provider, request()).status_code == 200  # exchange 2 sends rs_1
+    assert post(provider, replaying(DONE_REASONING)).status_code == 200
 
 
 def test_reject_params_names_the_parameter(serve):
@@ -483,8 +630,12 @@ def test_reasoning_summaries_stream_only_when_asked_for(serve):
             "reasoning rs_1 is not replayed as sent (adds 'status', changes 'summary')",
         ),
         (
-            [USER, {k: v for k, v in DONE_REASONING.items() if k != "summary"}, DONE_CALL],
-            "reasoning rs_1 is not replayed as sent (lacks 'summary')",
+            [
+                USER,
+                {k: v for k, v in DONE_REASONING.items() if k != "encrypted_content"},
+                DONE_CALL,
+            ],
+            "reasoning rs_1 is not replayed as sent (lacks 'encrypted_content')",
         ),
     ],
 )
@@ -532,7 +683,11 @@ def test_reasoning_must_be_replayed_exactly_as_sent(serve, replayed, failure):
         ),
         (
             lambda s: s["exchanges"][0].update(expect={"reasoning_replayed": ["rs_9"]}),
-            "$.exchanges: unknown reasoning ids: ['rs_9']",
+            "$.exchanges[0].expect: no earlier exchange sends reasoning ['rs_9']",
+        ),
+        (  # a request cannot replay the reasoning its own response sends
+            lambda s: s["exchanges"][0].update(expect={"reasoning_replayed": ["rs_1"]}),
+            "$.exchanges[0].expect: no earlier exchange sends reasoning ['rs_1']",
         ),
         (lambda s: s["exchanges"][0].update(expect={"messages_len": 1}), "'messages_len'"),
         (lambda s: s["model"].update(kind="openai_chat"), "$.model.kind: 'openai_chat' is not one"),
