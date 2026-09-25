@@ -58,7 +58,9 @@ def check_prefix(
     `info["byte_prefix"]`. A prefix may reset only at a new compaction summary, placed right
     after the unchanged system messages (contract rule 8). Only the compaction `items` of
     the runner's "compact" turns (`turns`, as `SessionLog.turns` returns them) count as
-    summaries, so neither a look-alike message nor a loop's own item can fake a reset.
+    summaries, so neither a look-alike message nor a loop's own item can fake a reset. They
+    are matched in log order: a reset moves to a compaction item after the one the prefix
+    starts from, never back to an older one, and two compactions may share a summary text.
     """
     compact_turns = {t["id"] for t in turns if t["kind"] == "compact"}
     summaries = [
@@ -76,14 +78,24 @@ def check_prefix(
     violations: list[dict[str, int]] = []
     byte_mismatches: list[dict[str, int]] = []
     resets: list[int] = []
+    # The index of the compaction item the prefix starts from (-1: none). A recording may
+    # start after a compaction, e.g. in a new process.
+    used = -1
+    if requests:
+        first = requests[0][0]
+        n = _system_count(first)
+        if len(first) > n:
+            used = _next_summary(summaries, first[n], -1)
     for i in range(1, len(requests)):
         (prev, prev_raw), (cur, cur_raw) = requests[i - 1], requests[i]
         kept = len(prev)  # the messages that must reach `cur` unchanged
         j = _first_difference(prev, cur)
         if j is not None:
-            if not _is_reset(prev, cur, summaries):
+            k = _reset_to(prev, cur, summaries, used)
+            if k < 0:
                 violations.append({"request": i, "message": j})
                 continue
+            used = k
             resets.append(i)
             kept = _system_count(prev)
         k = _first_difference(prev_raw[:kept], cur_raw)
@@ -149,17 +161,23 @@ def _system_count(messages: list[dict[str, Any]]) -> int:
     )
 
 
-def _is_reset(
-    prev: list[dict[str, Any]], cur: list[dict[str, Any]], summaries: list[dict[str, Any]]
-) -> bool:
-    """True if `cur` starts over as rule 8 says: `prev`'s system messages, then a new summary."""
+def _reset_to(
+    prev: list[dict[str, Any]],
+    cur: list[dict[str, Any]],
+    summaries: list[dict[str, Any]],
+    used: int,
+) -> int:
+    """Where `cur` starts over as rule 8 says (`prev`'s system messages, then a summary): the
+    index of the first compaction item after `used` with that summary, or -1 if none."""
     n = _system_count(prev)
-    return (
-        len(cur) > n
-        and cur[:n] == prev[:n]
-        and cur[n] in summaries
-        and prev[n : n + 1] != [cur[n]]  # a new summary, not the same one again
-    )
+    if len(cur) <= n or cur[:n] != prev[:n]:
+        return -1
+    return _next_summary(summaries, cur[n], used)
+
+
+def _next_summary(summaries: list[dict[str, Any]], message: dict[str, Any], after: int) -> int:
+    """The index of the first summary after index `after` that equals `message`, or -1."""
+    return next((k for k in range(after + 1, len(summaries)) if summaries[k] == message), -1)
 
 
 def _raw_messages(body: bytes) -> list[bytes]:

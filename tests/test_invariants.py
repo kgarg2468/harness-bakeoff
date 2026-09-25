@@ -173,6 +173,63 @@ def test_only_a_compaction_item_of_the_log_resets_the_prefix():
     assert not check_prefix([before, after], COMPACTION).ok  # without the turns: no reset
 
 
+S1 = {"role": "user", "content": "[harness] Conversation summary: one"}
+S2 = {"role": "user", "content": "[harness] Conversation summary: two"}
+
+
+def compactions(*summaries):
+    """Compaction items of turns t.1, t.3, ... and the turn rows: t.0, t.2, ... are user turns."""
+    log_items = [
+        Item(f"t.{2 * n + 1}:compact", f"t.{2 * n + 1}", m, compaction=True)
+        for n, m in enumerate(summaries)
+    ]
+    turns = [
+        {"id": f"t.{k}", "kind": "compact" if k % 2 else "user"}
+        for k in range(2 * len(summaries) + 1)
+    ]
+    return log_items, turns
+
+
+def user(text):
+    return {"role": "user", "content": text}
+
+
+def test_resets_follow_the_compaction_items_in_log_order():
+    log_items, turns = compactions(S1, S2)
+    one, two, three = (
+        encode(SYSTEM, user("u1")),
+        encode(SYSTEM, S1, user("u2")),
+        encode(SYSTEM, S2, user("u3")),
+    )
+    check = check_prefix([one, two, three], log_items, turns)
+    assert (check.ok, check.info["resets"]) == (True, [1, 2])
+    # Back to the older summary: rule 8 says a request starts from the last one.
+    back = encode(SYSTEM, S1, user("u2"), ANSWER, user("u3"))
+    check = check_prefix([one, two, three, back], log_items, turns)
+    assert (check.ok, check.info["violations"]) == (False, [{"request": 3, "message": 1}])
+
+
+def test_two_compactions_may_have_the_same_summary():
+    log_items, turns = compactions(SUMMARY, SUMMARY)
+    bodies = [
+        encode(SYSTEM, user("u1")),
+        encode(SYSTEM, SUMMARY, user("u2")),
+        encode(SYSTEM, SUMMARY, user("u3")),  # the second compaction
+    ]
+    check = check_prefix(bodies, log_items, turns)
+    assert (check.ok, check.info["resets"]) == (True, [1, 2]), check.detail
+    # A third reset to the same text has no compaction item left to match.
+    assert not check_prefix([*bodies, encode(SYSTEM, SUMMARY, user("u4"))], log_items, turns).ok
+
+
+def test_a_recording_may_start_after_a_compaction():
+    log_items, turns = compactions(S1, S2)
+    bodies = [encode(SYSTEM, S1, user("u2")), encode(SYSTEM, S2, user("u3"))]
+    assert check_prefix(bodies, log_items, turns).info["resets"] == [1]
+    started_late = [encode(SYSTEM, S2, user("u3")), encode(SYSTEM, S1, user("u2"))]
+    assert not check_prefix(started_late, log_items, turns).ok
+
+
 def test_a_reset_still_compares_the_system_bytes():
     before = encode(SYSTEM, USER, ANSWER)
     # The frozen system prompt is serialized differently after the reset.
