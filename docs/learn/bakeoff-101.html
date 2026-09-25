@@ -190,6 +190,8 @@
   .chip.on { background:var(--ink); color:#fff; border-color:var(--ink); }
   .procs .box { margin:6px 0; }
   .ok { color:var(--ok); font-weight:700; } .no { color:var(--bad); font-weight:700; }
+  .grid3.archgrid { grid-template-columns:1fr 1.6fr 1fr; }
+  @media (max-width:860px) { .grid3.archgrid { grid-template-columns:1fr; } }
   @media (max-width:980px) { .split { grid-template-columns:1fr; } .split > .sticky { position:static; } }
 </style>
 </head>
@@ -225,7 +227,7 @@
   <h2>The whole repo in one picture</h2>
   <p class="lede">One <i data-t="process">process</i> (the <code>bakeoff</code> command) holds almost everything. It talks to a model over <i data-t="http">HTTP</i>, and writes three things to disk. Click any box to see what it is, which file it lives in, and which course explains it.</p>
   <div class="fig">
-    <div class="grid3" id="archGrid" style="grid-template-columns:1fr 1.6fr 1fr">
+    <div class="grid3 archgrid" id="archGrid">
       <div>
         <div class="box" data-arch="cli" style="cursor:pointer"><h5>You, in a terminal</h5><div class="s"><code>bakeoff scenario</code> · <code>live</code> · <code>chat</code></div></div>
         <div class="arrow" style="text-align:center">↓</div>
@@ -523,7 +525,7 @@
       <div>
         <div class="note">Rules (edit the JSON)</div>
         <textarea id="permRules" class="mono" style="width:100%;height:92px;border:1px solid var(--line);border-radius:8px;padding:8px">{"*": "allow", "write_file": {"*.pipe": "allow", "*": "ask"}, "edit_file": "ask"}</textarea>
-        <div class="ctrl"><select id="permTool" class="btn"><option>write_file</option><option>edit_file</option><option>read_file</option><option>validate_pipeline</option><option>list_components</option></select><input id="permPath" class="btn mono" value="agent.pipe" style="width:180px" placeholder="path"></div>
+        <div class="ctrl"><select id="permTool" class="btn"><option>write_file</option><option>edit_file</option><option>read_file</option><option>validate_pipeline</option><option>list_components</option></select><input id="permPath" class="btn mono" value="agent.pipe" style="width:180px" placeholder="path"><label class="note"><input type="checkbox" id="permWin"> Windows paths (a backslash separates folders)</label></div>
       </div>
       <div><div class="status" id="permStatus" style="margin-top:0;min-height:120px"></div></div>
     </div>
@@ -1475,22 +1477,57 @@ chips('sqlBtns', b => {
     return ['ask', 'nothing matched, so the default is <b>ask</b>'];
   }
   const hasPath = { write_file: 1, edit_file: 1, read_file: 1, validate_pipeline: 1 };
+  const DECISIONS = ['allow', 'ask', 'deny'];
+  function invalidRule(rules) {
+    // permissions.validate_rules: every decision must be allow, ask or deny (ToolHost refuses to start otherwise)
+    if (typeof rules !== 'object' || rules === null || Array.isArray(rules)) return 'the rules must be a JSON object';
+    for (const [tool, rule] of Object.entries(rules)) {
+      const values = typeof rule === 'object' && rule !== null && !Array.isArray(rule) ? Object.values(rule) : [rule];
+      for (const d of values) if (!DECISIONS.includes(d)) return `Invalid permission rule for '${tool}': ${JSON.stringify(d)}`;
+    }
+    return null;
+  }
+  let driveNote = false;
+  function normalize(path) {
+    // what resolve_path does before any rule is read: relative to the working copy, "." and ".." collapsed;
+    // only "/" separates (match() later reads a backslash as "/", as OpenCode's matcher does)
+    // (it also follows symlinks, which a web page can't see)
+    if (path.startsWith('/')) return null;
+    if ($('#permWin').checked) {
+      // Windows: "C:\\x" (drive + root) is absolute; a leading backslash is rooted, so it leaves the working copy;
+      // "C:name" (drive, no root) is relative to that drive's current folder: inside, if the working copy is on C:
+      if (/^[A-Za-z]:[\\/]/.test(path) || /^\\/.test(path)) return null;
+      if (/^[A-Za-z]:/.test(path)) { driveNote = true; path = path.slice(2); }
+    }
+    const out = [];
+    const win = $('#permWin').checked;  // Windows paths also separate on a backslash; on Linux (where the engine runs) it's part of a name
+    for (const part of (win ? path.replace(/\\/g, '/') : path).split('/')) {
+      if (!part || part === '.') continue;
+      if (part === '..') { if (!out.length) return null; out.pop(); } else out.push(part);
+    }
+    return out.join('/');
+  }
   function run() {
     let rules; try { rules = JSON.parse($('#permRules').value); } catch (e) { return status('permStatus', 'Not valid JSON: ' + esc(e.message), 'bad'); }
-    const tool = $('#permTool').value; let path = hasPath[tool] ? $('#permPath').value.trim() : null;
+    driveNote = false;
+    const bad = invalidRule(rules);
+    if (bad) return status('permStatus', `<b>ValueError</b> · ${esc(bad)}. <code>permissions.validate_rules()</code> runs when the ToolHost is built, so a conversation with these rules never starts; no call is evaluated.`, 'bad');
+    const tool = $('#permTool').value; const typed = hasPath[tool] ? $('#permPath').value.trim() : null;
     $('#permPath').disabled = !hasPath[tool];
     const write = tool === 'write_file' || tool === 'edit_file';
-    if (path !== null) {
-      let depth = 0, out = false;
-      for (const part of path.split('/')) { if (part === '..') { depth--; if (depth < 0) out = true; } else if (part && part !== '.') depth++; }
-      if (path.startsWith('/') || out) return status('permStatus', `<b>deny</b> · <code>resolve_path</code> refuses a path that is absolute or leaves the working copy, before any rule is read ("Denied: …").`, 'bad');
+    let path = null;
+    if (typed !== null) {
+      path = normalize(typed);
+      if (path === null) return status('permStatus', `<b>deny</b> · <code>resolve_path</code> refuses a path that is absolute or leaves the working copy, before any rule is read ("Denied: …").`, 'bad');
       if (write && path.split('/').some(p => p.toLowerCase() === '.git')) return status('permStatus', `<b>deny</b> · writes into <code>.git</code> are always refused (they could break <code>git add -A</code> or plant a hook).`, 'bad');
     }
     const [d, why] = evaluate(rules, tool, path);
     const meaning = { allow: 'runs now', ask: 'the turn pauses; a person approves or denies (maybe from another process)', deny: 'never runs; the model gets "Denied by permission rules: …" as the result' }[d];
-    status('permStatus', `<b>${d}</b> — ${meaning}.<br><span class="note">Why: ${why}. The tool's own key is tried before <code>"*"</code>; inside a mapping the first matching glob wins.</span>`, d === 'allow' ? 'good' : d === 'deny' ? 'bad' : 'warn');
+    const resolved = typed !== null && typed !== path ? ` The path is matched as <code>${esc(path)}</code>, after <code>resolve_path</code> collapsed <code>${esc(typed)}</code>.` : '';
+    status('permStatus', `<b>${d}</b> — ${meaning}.<br><span class="note">Why: ${why}.${resolved} ${driveNote ? 'A drive letter without a backslash after it is relative to that drive; this assumes the working copy is on it (on another drive the path would leave the working copy and be denied). ' : ''}The tool's own key is tried before <code>"*"</code>; inside a mapping the first matching glob wins. (The real <code>resolve_path</code> also follows symlinks, so a link pointing outside the working copy is denied; this page can't see your files.)</span>`, d === 'allow' ? 'good' : d === 'deny' ? 'bad' : 'warn');
   }
   ['permRules', 'permTool', 'permPath'].forEach(id => $('#' + id).addEventListener('input', run));
+  $('#permWin').addEventListener('change', run);
   $('#permTool').addEventListener('change', run); run();
 })();
 
