@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 import uuid
+import warnings
 from dataclasses import asdict
 from typing import Any
 
@@ -30,8 +31,15 @@ from bakeoff.shared.contract import (
 )
 
 PATH = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+PIPELINE = {  # like the engine's validate_pipeline: `pipeline` is a free-form object
+    "type": "object",
+    "properties": {
+        "pipeline": {"type": "object", "description": "Inline pipeline definition"},
+        "path": {"type": "string"},
+    },
+}
 SPECS = [
-    ToolSpec("validate_pipeline", "Validate a pipeline file.", PATH, read_only=True),
+    ToolSpec("validate_pipeline", "Validate a pipeline.", PIPELINE, read_only=True),
     ToolSpec("read_file", "Read a file.", PATH, read_only=True),
     ToolSpec(
         "write_file",
@@ -198,6 +206,12 @@ async def test_tool_calls_run_with_raw_arguments_and_one_item_per_result(loop):
         result2.message,
     ]
     assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+    # Schemas reach the wire open: nothing forbids the keys of the free-form `pipeline` object.
+    wire_schemas = {
+        t["function"]["name"]: t["function"]["parameters"] for t in srv.requests[0]["tools"]
+    }
+    assert wire_schemas["validate_pipeline"]["properties"]["pipeline"]["type"] == "object"
+    assert "additionalProperties" not in json.dumps(wire_schemas)
 
 
 async def test_bad_arguments_become_a_retry_prompt_and_the_turn_continues(loop):
@@ -507,3 +521,16 @@ async def test_cost_limit_ends_the_turn_with_budget(loop):
     # Recorded behavior: the library drops the response that crossed the limit from history,
     # so it gets no item (and no usage event), and its tool call never runs.
     assert of(events, "item") == []
+
+
+async def test_reasoning_model_with_temperature_stays_quiet(capfd):
+    with (
+        warnings.catch_warnings(record=True) as caught,
+        SSEServer(Reply([*text("ok"), done()])) as srv,
+    ):
+        loop = PydanticLoop()
+        await run(loop, turn([user("hi")], config(srv, model="openai/gpt-5")), StubTools())
+        await loop.aclose()
+
+    assert "temperature" not in srv.requests[0]  # the library drops it for reasoning models
+    assert (caught, capfd.readouterr()) == ([], ("", ""))

@@ -12,6 +12,7 @@ import asyncio
 import json
 import time
 import uuid
+import warnings
 from collections.abc import AsyncIterator, Iterable
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
@@ -145,7 +146,11 @@ class PydanticLoop:
     name = "pydantic"
 
     def __init__(self) -> None:
-        pydantic_ai.BANNER_ENABLED = False  # newer releases print a first-run banner (rule 1)
+        # Nothing may reach stdout/stderr (rule 1): newer releases print a first-run banner, and
+        # the library warns each time it drops `temperature` for a reasoning model (it drops it
+        # correctly either way).
+        pydantic_ai.BANNER_ENABLED = False
+        warnings.filterwarnings("ignore", "Sampling parameters", UserWarning, "pydantic_ai")
         self._agents: dict[str, Agent[_Turn, str | DeferredToolRequests]] = {}
         self._models: list[OpenAIChatModel] = []
 
@@ -270,13 +275,18 @@ def _tool(spec: ToolSpec) -> Tool[_Turn]:
             raise ModelRetry(result.content)  # the library's bad-argument idiom (A_CHECKLIST)
         return result.content
 
-    return Tool.from_schema(
+    tool = Tool.from_schema(
         call,
         name=spec.name,
         description=spec.description,
         json_schema=spec.parameters,
         takes_ctx=True,
     )
+    # The default (strict=None) lets the OpenAI schema transformer add
+    # `additionalProperties: false` to every object, which turns free-form objects such as
+    # `validate_pipeline.pipeline` into "must be empty". Our schemas are not strict schemas.
+    tool.strict = False
+    return tool
 
 
 def _needs_approval(ctx: RunContext[_Turn], tool_def: ToolDefinition, args: dict[str, Any]) -> bool:
