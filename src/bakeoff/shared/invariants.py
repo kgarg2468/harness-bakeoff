@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any
 
 from bakeoff.shared.contract import Item
-from bakeoff.shared.runner import SUMMARY_PREFIX
 from bakeoff.shared.sessionlog import SessionLog
 from bakeoff.shared.workcopy import GIT_CONFIG, git_env
 
@@ -51,13 +50,15 @@ def load_wire(directory: Path) -> list[tuple[bytes, dict[str, Any]]]:
 # I1 --------------------------------------------------------------------------------------
 
 
-def check_prefix(bodies: Sequence[bytes]) -> Check:
+def check_prefix(bodies: Sequence[bytes], items: Sequence[Item] = ()) -> Check:
     """I1: each request's `messages` are a prefix of the next request's.
 
     `ok` is semantic equality; byte equality of the raw message elements is reported in
     `info["byte_prefix"]`. A prefix may reset only at a new compaction summary, placed right
-    after the unchanged system messages (contract rule 8).
+    after the unchanged system messages (contract rule 8). Only the messages of the log's
+    compaction `items` count as summaries, so a look-alike message cannot fake a reset.
     """
+    summaries = [_semantic(item.message) for item in items if item.compaction]
     requests: list[tuple[list[dict[str, Any]], list[bytes]]] = []
     for i, body in enumerate(bodies):
         try:
@@ -70,15 +71,17 @@ def check_prefix(bodies: Sequence[bytes]) -> Check:
     resets: list[int] = []
     for i in range(1, len(requests)):
         (prev, prev_raw), (cur, cur_raw) = requests[i - 1], requests[i]
+        kept = len(prev)  # the messages that must reach `cur` unchanged
         j = _first_difference(prev, cur)
-        if j is None:
-            k = _first_difference(prev_raw, cur_raw)
-            if k is not None:
-                byte_mismatches.append({"request": i, "message": k})
-        elif _is_reset(prev, cur):
+        if j is not None:
+            if not _is_reset(prev, cur, summaries):
+                violations.append({"request": i, "message": j})
+                continue
             resets.append(i)
-        else:
-            violations.append({"request": i, "message": j})
+            kept = _system_count(prev)
+        k = _first_difference(prev_raw[:kept], cur_raw)
+        if k is not None:
+            byte_mismatches.append({"request": i, "message": k})
     info = {
         "requests": len(requests),
         "resets": resets,
@@ -132,17 +135,23 @@ def _first_difference(prev: Sequence[Any], cur: Sequence[Any]) -> int | None:
     return None
 
 
-def _is_reset(prev: list[dict[str, Any]], cur: list[dict[str, Any]]) -> bool:
+def _system_count(messages: list[dict[str, Any]]) -> int:
+    """How many system (or developer) messages `messages` starts with."""
+    return next(
+        (i for i, m in enumerate(messages) if m["role"] not in _SYSTEM_ROLES), len(messages)
+    )
+
+
+def _is_reset(
+    prev: list[dict[str, Any]], cur: list[dict[str, Any]], summaries: list[dict[str, Any]]
+) -> bool:
     """True if `cur` starts over as rule 8 says: `prev`'s system messages, then a new summary."""
-    n = next((i for i, m in enumerate(prev) if m["role"] not in _SYSTEM_ROLES), len(prev))
-    if len(cur) <= n or cur[:n] != prev[:n]:
-        return False
-    first = cur[n]
+    n = _system_count(prev)
     return (
-        first["role"] == "user"
-        and isinstance(first["content"], str)
-        and first["content"].startswith(SUMMARY_PREFIX)
-        and prev[n : n + 1] != [first]  # a new summary, not the same one again
+        len(cur) > n
+        and cur[:n] == prev[:n]
+        and cur[n] in summaries
+        and prev[n : n + 1] != [cur[n]]  # a new summary, not the same one again
     )
 
 
