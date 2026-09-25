@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import asdict
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Any
 import pytest
 
 from bakeoff.report import build, data, render
-from bakeoff.shared.contract import Item
+from bakeoff.shared.contract import Item, ModelConfig
 from bakeoff.shared.sessionlog import SessionLog, event_row, item_to_json
 
 NOW = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
@@ -589,6 +590,71 @@ def test_a_live_run_that_did_not_pass_is_not_a_sample(out: Path) -> None:
                {**live, "run_id": "L3", "impl": "pydantic"})  # fmt: skip
     html = make(out)
     assert "over 2 live runs" in html and "over 3 live runs" not in html
+
+
+def write_live(
+    live: Path, run_id: str, impl: str, seconds: float, *, prompt: str = "What is RocketRide?",
+    model: str = "gpt-test", reasoning: str = "low",
+) -> None:  # fmt: skip
+    """One loop's live run: result.json, and the session log's thread row with the model config
+    (minus the key), as `bakeoff live` saves them."""
+    folder = live / run_id / impl
+    base_url = "https://api.openai.com/v1"
+    write_json(folder / "result.json", {
+        "v": 1, "run_id": run_id, "impl": impl, "model": model, "base_url": base_url,
+        "prompt": prompt, "final_text": "ok", "stops": ["end_turn"], "steps": 1, "requests": 1,
+        "usage": {"input_tokens": 100}, "duration_ms": seconds * 1000, "passed": True,
+        "error": None, "thread": f"live-{impl}",
+    })  # fmt: skip
+    config = asdict(
+        ModelConfig(base_url, model, kind="openai_compat", reasoning={"effort": reasoning})
+    )
+    del config["api_key"]
+    log = SessionLog(folder / "log.sqlite")
+    log.create_thread(f"live-{impl}", impl=impl, system="sys", meta={"rules": {}, "model": config})
+    log.close()
+
+
+def test_live_medians_pool_only_runs_of_one_prompt(out: Path, tmp_path: Path) -> None:
+    """Two prompts are two groups, each with its own medians and saying what it is: B is faster
+    on the first prompt, A on the second, and pooled they would hide both."""
+    live = tmp_path / "live"
+    for run_id, prompt, ours, theirs in (
+        ("L1", "What is RocketRide?", 2.5, 3.3), ("L2", "What is RocketRide?", 2.6, 3.4),
+        ("L3", "Build a chat pipeline.", 9.0, 3.0), ("L4", "Build a chat pipeline.", 9.2, 3.1),
+    ):  # fmt: skip
+        write_live(live, run_id, "our", ours, prompt=prompt)
+        write_live(live, run_id, "pydantic", theirs, prompt=prompt)
+    text = re.sub(r"<[^>]+>", "", make(out, live=live))
+    assert "over 4 live runs" not in text
+    setup = "gpt-test, reasoning low, api.openai.com"
+    assert (
+        "Less time per step: median B 2.55 s vs A 3.35 s over 2 live runs of one prompt and "
+        f"setup (“What is RocketRide?”; {setup};"
+    ) in text
+    assert (
+        "Less time per step: median B 9.10 s vs A 3.05 s over 2 live runs of one prompt and "
+        f"setup (“Build a chat pipeline.”; {setup};"
+    ) in text
+
+
+def test_live_medians_pool_only_runs_of_one_model_setup(out: Path, tmp_path: Path) -> None:
+    """The model settings come from the session log (result.json has no reasoning effort): other
+    settings are another group, and a run whose loops used different models is in none."""
+    live = tmp_path / "live"
+    for run_id, reasoning in (("L1", "low"), ("L2", "low"), ("L3", "high"), ("L4", "high")):
+        write_live(live, run_id, "our", 2.5, reasoning=reasoning)
+        write_live(live, run_id, "pydantic", 3.3, reasoning=reasoning)
+    write_live(live, "L5", "our", 2.5)
+    write_live(live, "L5", "pydantic", 3.3, model="gpt-other")
+    html = make(out, live=live)
+    text = re.sub(r"<[^>]+>", "", html)
+    assert "over 5 live runs" not in text and "over 4 live runs" not in text
+    assert text.count("over 2 live runs of one prompt and setup") == 4  # 2 groups x 2 claims
+    assert "gpt-test, reasoning low, api.openai.com" in text
+    assert "gpt-test, reasoning high, api.openai.com" in text
+    # The live section says which run is not compared, and why.
+    assert "the loops ran different prompts or model settings: not in the medians" in text
 
 
 def test_metrics_errors_are_shown_not_hidden_or_fatal(out: Path) -> None:

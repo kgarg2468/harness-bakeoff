@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
-from bakeoff.report.data import WIRE_LIMIT, impl_of_package, impl_order, loop_info
+from bakeoff.report.data import WIRE_LIMIT, endpoint, impl_of_package, impl_order, loop_info
 
 REPO_URL = "https://github.com/kgarg2468/harness-bakeoff/blob/main"
 
@@ -1078,8 +1078,14 @@ def live(page: Page) -> str:
                 f'<dl class="stats">{dl}</dl>{error}<div class="answer"><div class="k">final answer</div>'
                 f"{_expandable(r.get('final_text') or '', 700)}</div></div>"
             )
+        # Which runs the medians in section 6 pool: those of one prompt and model setup.
+        setup = (
+            f" · {esc(_setup(run))}"
+            if run.get("group")
+            else " · the loops ran different prompts or model settings: not in the medians"
+        )
         out.append(
-            f'<div class="fig live"><div class="small muted">live run <code>{esc(run["run_id"])}</code></div>'
+            f'<div class="fig live"><div class="small muted">live run <code>{esc(run["run_id"])}</code>{setup}</div>'
             f'<div class="prompt"><span class="k">prompt</span> {_expandable(run.get("prompt") or "", 400)}</div>'
             f'<div class="live-cols">{"".join(cols)}</div></div>'
         )
@@ -1096,10 +1102,8 @@ def _cost(cost: float | None, source: str | None) -> str:
 
 def _endpoint(base_url: str | None) -> str:
     """ " · via OpenRouter" or " · BYOK api.openai.com": where a live run's requests went."""
-    if not base_url:
+    if not (host := endpoint(base_url)):
         return ""
-    # The host only: never a path, a query or a user:password@ part.
-    host = base_url.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0].rsplit("@", 1)[-1]
     if "openrouter" in host:
         return f" · via {term('openrouter')}"
     return f" · {term('byok')} {esc(host)}"
@@ -1336,19 +1340,43 @@ def _answered(result: dict[str, Any] | None) -> bool:
     return bool(stops) and stops[-1] == "end_turn"
 
 
+def _setup(run: dict[str, Any]) -> str:
+    """ "gpt-6-luna, reasoning low, api.openai.com": the model settings of a live run's group."""
+    settings = next(iter(run["results"].values())).get("settings") or {}
+    reasoning = settings.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    parts = [settings.get("model") or "unknown model", effort and f"reasoning {effort}"]
+    return ", ".join(str(p) for p in (*parts, settings.get("endpoint")) if p)
+
+
 def _live_claims(page: Page) -> list[Claim]:
-    """Latency and input tokens over the live runs every live loop answered: medians, and a win
-    only with enough samples and a clear margin. A run counts only if every loop finished it
+    """Live claims per group of runs with one prompt and model setup (see `data.load_live`),
+    largest group first: medians over runs of different prompts or models compare nothing."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for run in page.live:
+        if run.get("group"):
+            groups.setdefault(run["group"], []).append(run)
+    # Stable sort: among groups of one size, the newest first (page.live is newest first).
+    ordered = sorted(groups.values(), key=len, reverse=True)
+    return [claim for runs in ordered for claim in _group_claims(page, runs)]
+
+
+def _group_claims(page: Page, group: list[dict[str, Any]]) -> list[Claim]:
+    """Latency and input tokens over the group's runs every live loop answered: medians, and a
+    win only with enough samples and a clear margin. A run counts only if every loop finished it
     (passed, last stop end_turn, no error): a loop that failed at once would otherwise look fast
     and cheap."""
-    loops = [i for i in page.loops if any(i in run["results"] for run in page.live)]
+    loops = [i for i in page.loops if any(i in run["results"] for run in group)]
     samples = [
-        run["results"] for run in page.live if all(_answered(run["results"].get(i)) for i in loops)
+        run["results"] for run in group if all(_answered(run["results"].get(i)) for i in loops)
     ]
     if len(loops) < 2 or not samples:
         return []
     n = len(samples)
-    runs = f"{n} live run{'s' * (n != 1)}"
+    prompt = group[0]["prompt"]
+    quoted = f"“{prompt[:60]}…”" if len(prompt) > 60 else f"“{prompt}”"
+    setup = f"{esc(quoted)}; {esc(_setup(group[0]))}"
+    runs = f"{n} live run{'s' * (n != 1)} of one prompt and setup"
     # The model decides how many steps a task takes, and that swamps any loop difference in the
     # whole-answer time. So compare per step, and show the step counts as context.
     steps = {i: _median([r[i].get("steps") for r in samples]) for i in loops}
@@ -1368,13 +1396,13 @@ def _live_claims(page: Page) -> list[Claim]:
             f"{term('tokens', 'input tokens')} per step {_vs(tokens, fmt_int)}"
         )
         why = "the order of runs and the provider's prompt cache swing it"
-        return [Claim(None, f"{shown}: one live run, too few to call ({why}).", "#live")]
+        return [Claim(None, f"{shown} ({setup}): one live run, too few to call ({why}).", "#live")]
     claims = []
     for values, win, name, fmt in (
         (latency, "Less time per step", term("latency", "Time per step"), fmt_ms),
         (tokens, "Fewer input tokens per step", term("tokens", "Input tokens per step"), fmt_int),
     ):
-        shown = f"median {_vs(values, fmt)} over {runs} ({context})"
+        shown = f"median {_vs(values, fmt)} over {runs} ({setup}; {context})"
         if (winner := _better(values, margin=TIMING_MARGIN)) is not None:
             claims.append(Claim(winner, f"{win}: {shown}.", "#live"))
         else:
@@ -1435,8 +1463,9 @@ def wins(page: Page) -> str:
         "<p class='lede'>Only what the data on this page shows, plus a few design properties for "
         "each side, labelled as such. Counts compare only the scenarios every loop ran; a timing "
         f"counts only when it is at least {TIMING_MARGIN:.0%} better, and a live result only over "
-        f"{MIN_LIVE_SAMPLES} or more runs. Scenarios that favour A (cancel repair, built-in "
-        "features) are in the matrix. People decide; this page names no overall winner.</p>"
+        f"{MIN_LIVE_SAMPLES} or more runs of one prompt and model setup. Scenarios that favour A "
+        "(cancel repair, built-in features) are in the matrix. People decide; this page names no "
+        "overall winner.</p>"
         f'<div class="wins">{"".join(cards)}</div>{close}'
         f'<p class="small muted">Sources: {sources}</p>'
     )
