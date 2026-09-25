@@ -778,3 +778,21 @@ async def test_error_chunk_after_the_last_retry_ends_the_turn(loop, monkeypatch)
     assert [(i.status, i.message["content"]) for i in items(events)] == [("incomplete", "Hal")]
     assert of(events, "error")[0]["retryable"] is True
     assert of(events, "turn.end")[0]["stop"] == "error"
+
+
+async def test_byok_thinking_in_think_tags_is_shown_as_it_is_sent(loop):
+    """A BYOK model that streams its thinking as <think> tags in the content: the library parses
+    it into a ThinkingPart and sends it back as tags, joined to the text with a blank line."""
+    first = [*text("<think>", "plan it", "</think>", "The answer."), done()]
+    with SSEServer(Reply(first), Reply([*text("ok"), done()])) as srv:
+        byok = config(srv, kind="openai_compat", model="qwen3-32b")
+        events = await run(loop, turn([user("hi")], byok), StubTools())
+        history = [user("hi"), *items(events), user("again")]
+        await run(loop, turn(history, byok), StubTools())
+
+    [answer] = items(events)
+    assert answer.message == {
+        "role": "assistant",
+        "content": "<think>\nplan it\n</think>\n\nThe answer.",
+    }
+    assert srv.requests[1]["messages"][2] == answer.message

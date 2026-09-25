@@ -25,6 +25,7 @@ from pydantic_ai import (
     UserPromptPart,
 )
 from pydantic_ai.messages import INTERRUPTED_TOOL_RETURN_CONTENT
+from pydantic_ai.profiles import DEFAULT_THINKING_TAGS
 
 from bakeoff.shared.contract import Item
 
@@ -127,18 +128,26 @@ def _tool(call_id: str, content: str) -> dict[str, Any]:
 
 
 def _assistant(response: ModelResponse) -> dict[str, Any] | None:
-    """The assistant message OpenRouterModel / OpenAIChatModel sends for a response, or None."""
-    text = "".join(part.content for part in response.parts if isinstance(part, TextPart))
-    message: dict[str, Any] = {"role": "assistant", "content": text or None}
+    """The assistant message OpenRouterModel / OpenAIChatModel sends for a response, or None
+    (the library's "auto" rules for thinking; text pieces are joined with a blank line)."""
+    texts: list[str] = []
     details: list[dict[str, Any]] = []
     fields: dict[str, list[str]] = {}
     for part in response.parts:
-        if isinstance(part, ThinkingPart) and part.provider_name == "openrouter":
+        if isinstance(part, TextPart):
+            texts.append(part.content)
+        elif isinstance(part, ThinkingPart) and part.provider_name == "openrouter":
             details.append(_reasoning_detail(part))
         elif isinstance(part, ThinkingPart) and part.id not in (None, "content"):
             # BYOK: sent back in the field it streamed in, e.g. `reasoning_content`.
             fields.setdefault(part.id, []).append(part.content)
-    message.update({name: "\n\n".join(texts) for name, texts in fields.items()})
+        elif isinstance(part, ThinkingPart):
+            # BYOK thinking parsed from <think> tags in the content goes back the same way.
+            start, end = DEFAULT_THINKING_TAGS
+            texts.append("\n".join([start, part.content, end]))
+    text = "\n\n".join(texts)
+    message: dict[str, Any] = {"role": "assistant", "content": text or None}
+    message.update({name: "\n\n".join(values) for name, values in fields.items()})
     if response.tool_calls:
         message["tool_calls"] = [
             {
