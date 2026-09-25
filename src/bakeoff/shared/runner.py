@@ -138,10 +138,9 @@ class _Publisher:
         self._head = {"v": 1, "thread": thread_id, "turn": turn_id, "impl": impl}
         self._seq = log.next_seq(thread_id)
         self._t0 = time.perf_counter_ns()
+        self._turn = turn_id
         self._batch: list[EventRow] = []
         self.ended = False  # the loop's turn.end is stamped (or the publisher is closed)
-        # Tool events after the loop's turn.end, `{"t_us", "type", "data"}`; kept on the turn row.
-        self.late: list[dict[str, Any]] = []
 
     def _t_us(self) -> int:
         return (time.perf_counter_ns() - self._t0) // 1000
@@ -178,12 +177,15 @@ class _Publisher:
 
     def publish(self, event: Event) -> None:
         """The ToolHost's `emit` callback. A tool event after the loop's `turn.end` cannot
-        join the stream (`commit` must follow `turn.end` directly), so it goes to `late`, which
-        the runner stores on the turn row."""
+        join the stream (`commit` must follow `turn.end` directly), so it is stored on the turn
+        row (`late`) at once: also after the row is complete, e.g. from a tool task that
+        outlived its loop."""
         if not self.ended:
             self.emit(event.type, event.data)
-        else:
-            self.late.append({"t_us": self._t_us(), "type": event.type, "data": event.data})
+            return
+        late = {"t_us": self._t_us(), "type": event.type, "data": event.data}
+        with _logged_failure(f"storing a tool event after the end of turn {self._turn}"):
+            self._log.append_late(self._turn, late)
 
     def flush(self) -> None:
         if self._batch:
@@ -353,15 +355,11 @@ class Runner:
             stop = end.get("stop", "error")
             if stop == "paused":
                 pending = list(end.get("pending") or [])
-                self.log.set_turn_status(
-                    turn_id, "paused", stop=stop, pending=pending, late=pub.late or None
-                )
+                self.log.set_turn_status(turn_id, "paused", stop=stop, pending=pending)
                 return {"turn_id": turn_id, "stop": stop, "pending": pending, "commit": None}
             sha, files = await wc.commit(f"turn {row['idx'] + 1}: {stop}")
             status = _STATUS.get(stop, "error")
-            self.log.set_turn_status(
-                turn_id, status, stop=stop, commit_sha=sha, late=pub.late or None
-            )
+            self.log.set_turn_status(turn_id, status, stop=stop, commit_sha=sha)
             # Last, so a consumer that sees `commit` finds the turn row complete (rule 7).
             pub.emit("commit", {"sha": sha, "files": files})
             return {"turn_id": turn_id, "stop": stop, "pending": [], "commit": sha}
@@ -485,7 +483,7 @@ class Runner:
         still locked), that is only logged, so the caller raises the first error; a crash
         resume can still take the turn over."""
         with _logged_failure(f"recording turn {turn_id} as an error"):
-            self.log.set_turn_status(turn_id, "error", stop=stop, late=pub.late or None)
+            self.log.set_turn_status(turn_id, "error", stop=stop)
         with _logged_failure(f"storing the events of turn {turn_id}"):
             pub.close()  # e.g. a turn.end whose flush failed
 

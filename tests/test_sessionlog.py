@@ -1,6 +1,7 @@
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -64,7 +65,8 @@ def test_turns_get_indexes_and_status(log):
         None,
     )
     late = [{"t_us": 5, "type": "tool.start", "data": {"call_id": "c1", "name": "x"}}]
-    log.set_turn_status("th.0", "paused", stop="paused", pending=["c1", "c2"], late=late)
+    log.set_turn_status("th.0", "paused", stop="paused", pending=["c1", "c2"])
+    log.append_late("th.0", late[0])
     second = log.start_turn("th", "approval")
     assert second["idx"] == 1
     log.set_turn_status("th.1", "done", stop="end_turn", commit_sha="abc")
@@ -76,6 +78,37 @@ def test_turns_get_indexes_and_status(log):
     assert turns[1]["pending"] is turns[1]["late"] is None
     assert log.last_turn("th")["id"] == "th.1"
     assert log.last_turn("other") is None
+
+
+def test_late_events_are_appended_to_the_turn_row(log):
+    log.start_turn("th", "user")
+    log.set_turn_status("th.0", "done", stop="end_turn", commit_sha="abc")
+    log.append_late("th.0", {"t_us": 1, "type": "tool.start", "data": {"call_id": "c1"}})
+    # Any time later, e.g. from a tool task that outlived its turn; not-JSON values as str().
+    log.append_late("th.0", {"t_us": 2, "type": "tool.end", "data": {"path": Path("a.pipe")}})
+    turn = log.last_turn("th")
+    assert (turn["status"], turn["commit_sha"]) == ("done", "abc")
+    assert turn["late"] == [
+        {"t_us": 1, "type": "tool.start", "data": {"call_id": "c1"}},
+        {"t_us": 2, "type": "tool.end", "data": {"path": "a.pipe"}},
+    ]
+
+
+def test_a_log_without_the_late_column_gets_it(tmp_path):
+    path = tmp_path / "old.sqlite"
+    db = sqlite3.connect(path)
+    db.executescript(  # the turns table as the first release created it
+        "CREATE TABLE turns(id TEXT PRIMARY KEY, thread TEXT NOT NULL, idx INTEGER NOT NULL,"
+        " kind TEXT NOT NULL, status TEXT NOT NULL, stop TEXT, pending TEXT, commit_sha TEXT,"
+        " started_us INTEGER NOT NULL, ended_us INTEGER, UNIQUE (thread, idx));"
+        "INSERT INTO turns VALUES ('th.0', 'th', 0, 'user', 'done', 'end_turn', NULL, 'abc', 1, 2);"
+    )
+    db.close()
+    log = SessionLog(path)
+    assert log.last_turn("th")["late"] is None
+    assert log.start_turn("th", "user")["id"] == "th.1"
+    SessionLog(path).close()  # opening it again changes nothing
+    log.close()
 
 
 def test_only_a_crash_resume_starts_while_a_turn_runs(log, tmp_path):

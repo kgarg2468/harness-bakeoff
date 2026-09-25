@@ -96,6 +96,15 @@ class SessionLog:
         self._db.execute("PRAGMA journal_mode = WAL")
         self._db.execute("PRAGMA synchronous = NORMAL")
         self._db.executescript(_SCHEMA)
+        # A log created before `turns.late` existed gets the column. Checked first, so opening
+        # an up-to-date log never writes to it.
+        if "late" not in self._columns("turns"):
+            with self._tx() as db:
+                if "late" not in self._columns("turns"):  # another process may have added it
+                    db.execute("ALTER TABLE turns ADD COLUMN late TEXT")
+
+    def _columns(self, table: str) -> set[str]:
+        return {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
 
     def close(self) -> None:
         self._db.close()
@@ -159,25 +168,30 @@ class SessionLog:
         stop: str | None = None,
         pending: list[str] | None = None,
         commit_sha: str | None = None,
-        late: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Record how a turn ended (sets `ended_us` unless the status is "running").
-
-        `late` keeps tool events that came after the loop's `turn.end`, which cannot join the
-        event stream (contract rule 7).
-        """
+        """Record how a turn ended (sets `ended_us` unless the status is "running")."""
         self._db.execute(
-            "UPDATE turns SET status = ?, stop = ?, pending = ?, commit_sha = ?, ended_us = ?,"
-            " late = ? WHERE id = ?",
+            "UPDATE turns SET status = ?, stop = ?, pending = ?, commit_sha = ?, ended_us = ?"
+            " WHERE id = ?",
             (
                 status,
                 stop,
                 None if pending is None else json.dumps(pending),
                 commit_sha,
                 None if status == "running" else now_us(),
-                None if late is None else json.dumps(late),
                 turn_id,
             ),
+        )
+
+    def append_late(self, turn_id: str, event: dict[str, Any]) -> None:
+        """Add a tool event that came after the loop's `turn.end` to the turn row's `late` list.
+        Contract rule 7 keeps it out of the event stream; it is kept here as evidence, at any
+        time (e.g. from a tool task that outlived its turn). A value that is not JSON is stored
+        as its str()."""
+        self._db.execute(
+            "UPDATE turns SET late = json_insert(COALESCE(late, '[]'), '$[#]', json(?))"
+            " WHERE id = ?",
+            (json.dumps(event, default=str), turn_id),
         )
 
     def discard_turn(self, turn_id: str) -> None:

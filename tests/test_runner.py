@@ -579,6 +579,7 @@ async def test_commit_directly_follows_turn_end(runner, log, tid, published):
     assert late["t_us"] >= published[-2]["t_us"]
     StubTools.made[0].emit(Event("tool.start", {"call_id": "c9", "name": "x"}))  # after commit
     assert len(log.events(tid)) == len(published) == 4
+    assert [x["type"] for x in log.last_turn(tid)["late"]] == ["tool.end", "tool.start"]
 
 
 async def test_a_tool_run_after_turn_end_fails_i2(runner, log, tid):
@@ -623,6 +624,57 @@ async def test_a_tool_run_after_a_paused_turn_end_is_recorded_and_fails_i2(runne
     check = check_tool_results(reader.items(tid), reader.events(tid), reader.turns(tid))
     reader.close()
     assert (check.ok, check.info["late_runs"]) == (False, [call_id])
+
+
+async def test_a_tool_task_that_outlives_its_paused_turn_is_recorded(runner, log, tid):
+    """The loop left a tool run in a task; it runs after the runner recorded the paused turn."""
+    tasks = []
+
+    async def pauses(turn, tools, cancel):
+        call = write_call(turn, "a.txt")
+        yield item(turn, "a", assistant(call))
+
+        async def later():
+            await asyncio.sleep(0.05)
+            await tools.run(call)  # the pending call runs anyway
+
+        tasks.append(asyncio.create_task(later()))
+        yield Event("turn.end", {"stop": "paused", "steps": 1, "pending": [call.id]})
+
+    async def approve(turn, tools, cancel):
+        (spec,) = turn.history[-1].message["tool_calls"]
+        call = ToolCall(spec["id"], spec["function"]["name"], spec["function"]["arguments"])
+        yield tool_item(turn, await tools.run(call))
+        yield Event("turn.end", {"stop": "end_turn", "steps": 1})
+
+    paused = await runner.turn(FakeLoop(pauses), tid, model=MODEL, user_text="go")
+    assert log.last_turn(tid)["late"] is None
+    await tasks[0]
+    call_id = paused["pending"][0]
+    assert [(x["type"], x["data"]["call_id"]) for x in log.last_turn(tid)["late"]] == [
+        ("tool.start", call_id),
+        ("tool.end", call_id),
+    ]
+    resume = Resume(kind="approval", decisions={call_id: "allow"})
+    await runner.turn(FakeLoop(approve), tid, model=MODEL, resume=resume)
+    check = check_tool_results(log.items(tid), log.events(tid), log.turns(tid))
+    assert (check.ok, check.info["reran"], check.info["late_runs"]) == (False, [call_id], [call_id])
+
+
+async def test_a_late_tool_event_that_is_not_json_is_kept_as_text(runner, log, tid):
+    async def pauses(turn, tools, cancel):
+        yield item(turn, "a", assistant(write_call(turn, "a.txt")))
+        try:
+            yield Event("turn.end", {"stop": "paused", "steps": 1, "pending": [f"{tid}.0:c"]})
+        finally:
+            tools.emit(Event("tool.start", {"call_id": f"{tid}.0:c", "path": runner.wc_root}))
+
+    assert (await runner.turn(FakeLoop(pauses), tid, model=MODEL, user_text="go"))["stop"] == (
+        "paused"
+    )
+    (late,) = log.last_turn(tid)["late"]
+    assert late["data"] == {"call_id": f"{tid}.0:c", "path": str(runner.wc_root)}
+    assert log.last_turn(tid)["status"] == "paused"
 
 
 async def wait_for_cancel(turn, tools, cancel):
