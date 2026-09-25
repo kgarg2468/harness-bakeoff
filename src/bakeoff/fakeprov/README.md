@@ -216,8 +216,9 @@ reasoning item exists only as its encrypted content: an input reasoning item wit
 `encrypted_content` gets 404 `Item with id '<id>' not found. Items are not persisted when
 `store` is set to false. Try again with `store` set to true, or remove this item from your
 input.`; one whose `encrypted_content` is not the one its done event sent (the added item's
-incomplete one, or any for an item that was cut short) gets 400 `The encrypted content for
-item <id> could not be verified.` (`code: "invalid_encrypted_content"`).
+incomplete one, any for an item that was cut short, or any for an item that no earlier response
+of the cursor sent) gets 400 `The encrypted content for item <id> could not be verified.`
+(`code: "invalid_encrypted_content"`).
 
 **Exchange `expect`.** `body_has`, `body_lacks`, `model`, `body_equals`, `body_contains` and
 `min_gap_ms` read the body as in chat. The others read `input` without the system prompt
@@ -233,7 +234,7 @@ loop puts it. An item without a `type` but with a `role` is a `message`.
 | `last_content_contains` | the last item's text contains it: a message's text (a string or text parts), a `function_call_output`'s `output`, a `function_call`'s `arguments`, a reasoning summary |
 | `input_at` | `[{index, type?, role?, phase?, contains?}]`: checks one item; a negative index counts from the end |
 | `tool_result_contains` | `{call_id: substring}`: a `function_call_output` with that `call_id` contains it (`""`: it exists) |
-| `reasoning_replayed` | `[reasoning id]`: `input` has that reasoning item exactly once, equal to its done item (same keys and values; `encrypted_content` byte for byte; with a summary if this request asks for one, since a thread's requests all do or all don't) |
+| `reasoning_replayed` | `[reasoning id]`: `input` has that reasoning item exactly once, equal to its done item (same keys and values; `encrypted_content` byte for byte; with a summary if this request asks for one, since a thread's requests all do or all don't). The loader checks that an earlier exchange sends it |
 
 A sample (R02's first answer, shortened: one summary part, arguments in 2 pieces; the
 `response.created` and `response.in_progress` data are elided):

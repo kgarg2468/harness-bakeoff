@@ -380,6 +380,23 @@ def test_a_cut_reasoning_item_never_verifies(serve):
     assert response.json()["error"]["code"] == "invalid_encrypted_content"
 
 
+def test_reasoning_that_no_earlier_response_sent_never_verifies(serve):
+    """A later exchange's reasoning item was never sent to this cursor, so its scripted
+    encrypted content cannot verify yet; once a response has sent it, it does."""
+    strict = {"reject_unencrypted_reasoning": True}
+    provider = serve(scenario("T", says("ok"), CALLS, says("ok"), strict=strict))
+    early = post(provider, replaying(DONE_REASONING))  # rs_1 comes with exchange 2
+    assert early.status_code == 400
+    assert early.json()["error"] == {
+        "message": "The encrypted content for item rs_1 could not be verified.",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "invalid_encrypted_content",
+    }
+    assert post(provider, request()).status_code == 200  # exchange 2 sends rs_1
+    assert post(provider, replaying(DONE_REASONING)).status_code == 200
+
+
 def test_reject_params_names_the_parameter(serve):
     provider = serve(scenario("T", says("ok"), strict={"reject_params": ["temperature"]}))
     response = post(provider, request(temperature=0.0))
@@ -532,7 +549,11 @@ def test_reasoning_must_be_replayed_exactly_as_sent(serve, replayed, failure):
         ),
         (
             lambda s: s["exchanges"][0].update(expect={"reasoning_replayed": ["rs_9"]}),
-            "$.exchanges: unknown reasoning ids: ['rs_9']",
+            "$.exchanges[0].expect: no earlier exchange sends reasoning ['rs_9']",
+        ),
+        (  # a request cannot replay the reasoning its own response sends
+            lambda s: s["exchanges"][0].update(expect={"reasoning_replayed": ["rs_1"]}),
+            "$.exchanges[0].expect: no earlier exchange sends reasoning ['rs_1']",
         ),
         (lambda s: s["exchanges"][0].update(expect={"messages_len": 1}), "'messages_len'"),
         (lambda s: s["model"].update(kind="openai_chat"), "$.model.kind: 'openai_chat' is not one"),

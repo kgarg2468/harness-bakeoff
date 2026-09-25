@@ -417,6 +417,10 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
     call_ids: list[str] = []
     reasoning_ids: list[str] = []
     for n, exchange in enumerate(data["exchanges"]):
+        # A request can replay only reasoning that an earlier response sent (never its own).
+        replayed = exchange.get("expect", {}).get("reasoning_replayed", [])
+        if unsent := sorted(set(replayed) - set(reasoning_ids)):
+            fail(f"$.exchanges[{n}].expect", f"no earlier exchange sends reasoning {unsent}")
         respond = exchange["respond"]
         where = f"$.exchanges[{n}].respond"
         if (respond.get("status", 200) == 200) != ("stream" in respond):
@@ -444,12 +448,8 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
 
     referenced = set(data["expect"].get("tool_runs", {}))
     referenced |= set(data["expect"].get("tools_overlap", []))
-    replayed: set[str] = set()
     for exchange in data["exchanges"]:
         referenced |= set(exchange.get("expect", {}).get("tool_result_contains", {}))
-        replayed |= set(exchange.get("expect", {}).get("reasoning_replayed", []))
-    if unknown := sorted(replayed - set(reasoning_ids)):
-        fail("$.exchanges", f"unknown reasoning ids: {unknown}")
     steps = data["driver"]
     turns = 0  # steps that run a turn to its end in this process
     for i, step in enumerate(steps):
@@ -516,10 +516,10 @@ def reply(
             return rejected(400, *problem)
         failures = _expect_failures(expect, body, gap_ms)
     else:
-        if refused := _responses_strict(strict, body, scenario):
+        if refused := _responses_strict(strict, body, scenario, index):
             return refused
         failures = _body_failures(expect, body, gap_ms)
-        failures += _input_failures(expect, body, scenario)
+        failures += _input_failures(expect, body, scenario, index)
     if failures:
         return rejected(500, f"expect failed (exchange {index + 1}): " + "; ".join(failures))
 
@@ -890,18 +890,19 @@ def _done_reasoning(spec: dict[str, Any], summarized: bool) -> dict[str, Any]:
     }
 
 
-def _scripted_reasoning(scenario: Scenario) -> dict[str, dict[str, Any]]:
-    """Reasoning id -> the op of every scripted reasoning item, done or cut short."""
+def _scripted_reasoning(scenario: Scenario, before: int) -> dict[str, dict[str, Any]]:
+    """Reasoning id -> the op of every reasoning item (done or cut short) scripted for the
+    requests before request `before` (0-based) of a cursor: the only ones it can have got."""
     return {
         op["reasoning_item"]["id"]: op
-        for exchange in scenario.exchanges
+        for exchange in scenario.exchanges[:before]
         for op in exchange["respond"].get("stream", [])
         if "reasoning_item" in op
     }
 
 
 def _responses_strict(
-    strict: dict[str, Any], body: dict[str, Any], scenario: Scenario
+    strict: dict[str, Any], body: dict[str, Any], scenario: Scenario, index: int
 ) -> Reply | None:
     for key in strict.get("reject_params", []):
         if key in body:
@@ -909,8 +910,9 @@ def _responses_strict(
     if not strict.get("reject_unencrypted_reasoning"):
         return None
     # As the API does with `store: false`: a reasoning item is known only by its encrypted
-    # content, which must be the complete one a done event sent for that id.
-    scripted = _scripted_reasoning(scenario)
+    # content, which must be the complete one a done event sent for that id. A later
+    # exchange's item was never sent, so its scripted content does not verify either.
+    scripted = _scripted_reasoning(scenario, index)
     for item in _input_items(body):
         if _item_type(item) != "reasoning":
             continue
@@ -928,8 +930,11 @@ def _responses_strict(
     return None
 
 
-def _input_failures(expect: dict[str, Any], body: dict[str, Any], scenario: Scenario) -> list[str]:
-    """The Responses `expect` checks on `input` (after the system prompt) and the system prompt."""
+def _input_failures(
+    expect: dict[str, Any], body: dict[str, Any], scenario: Scenario, index: int
+) -> list[str]:
+    """The Responses `expect` checks on `input` (after the system prompt) and the system prompt
+    of request `index`."""
     system, items = _split_system(body)
     failures = []
     if "system_contains" in expect and expect["system_contains"] not in system:
@@ -969,7 +974,7 @@ def _input_failures(expect: dict[str, Any], body: dict[str, Any], scenario: Scen
                 failures.append(f"input item {i} {key} is {got[key]!r}, expected {check[key]!r}")
         if "contains" in check and check["contains"] not in _item_text(item):
             failures.append(f"input item {i} lacks {check['contains']!r}")
-    scripted = _scripted_reasoning(scenario)
+    scripted = _scripted_reasoning(scenario, index)  # the loader checks each id is in it
     for rid in expect.get("reasoning_replayed", []):
         # A thread's model config is fixed, so this request asks for summaries if the one that
         # got the item did.
