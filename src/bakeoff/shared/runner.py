@@ -40,6 +40,11 @@ _CANCEL_POLL_S = 0.05
 _STATUS = {"end_turn": "done", "max_steps": "done", "budget": "done", "cancelled": "cancelled"}
 _DEFAULT_LIMITS = Limits()
 _THREAD_ID = re.compile(r"[\w-]+")
+# A revert waits while the last turn has changes that no commit holds (see `Runner.revert`).
+_REVERT_WAITS = {
+    "paused": "is paused: resolve the pending approval first",
+    "error": "failed to commit its changes: run a turn first, its commit includes them",
+}
 logger = logging.getLogger(__name__)
 
 # Starts the content of a compaction item; see contract rule 8.
@@ -341,7 +346,9 @@ class Runner:
         """Undo a committed turn's changes with a new commit, recorded as a new "revert" turn.
 
         Appends a runner item telling the model what was reverted. Returns the same summary
-        shape as `turn()`. If git fails (e.g. a conflict), no turn is recorded.
+        shape as `turn()`. If git fails (e.g. a conflict), no turn is recorded. It refuses while
+        the last turn is paused or failed to commit: that turn's changes are not committed, so
+        the revert would take them into its own commit, or lose them if git aborts it.
         """
         thread = self._thread(thread_id)
         target = next((t for t in self.log.turns(thread_id) if t["id"] == turn_id), None)
@@ -350,6 +357,11 @@ class Runner:
         # Held until the revert is fully recorded: while its row says "running", a crash resume
         # that got the lock would take git's revert commit for one that no turn recorded.
         with _exclusive(self._lock_path(thread_id)):
+            last = self._git_turns(thread_id)[-1]  # there is one: the target
+            if last["status"] in _REVERT_WAITS and not last["commit_sha"]:
+                raise RuntimeError(
+                    f"cannot revert: turn {last['id']} {_REVERT_WAITS[last['status']]}"
+                )
             row = self.log.start_turn(thread_id, "revert")
             try:
                 sha, files = await WorkCopy(self.workdir(thread_id)).revert(target["commit_sha"])

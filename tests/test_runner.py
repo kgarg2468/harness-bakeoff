@@ -713,6 +713,58 @@ async def test_revert_errors_record_no_turn(runner, log, tid):
     assert check_commits(log, tid, runner.workdir(tid)).ok
 
 
+async def test_revert_waits_for_a_paused_turn(runner, log, tid):
+    await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
+    wd = runner.workdir(tid)
+
+    def call(turn_id, n, path):
+        return ToolCall(f"{turn_id}:c{n}", "write_file", json.dumps({"path": path, "content": "x"}))
+
+    async def asks(turn, tools, cancel):
+        ran, asked = call(turn.turn_id, 1, "b.pipe"), call(turn.turn_id, 2, "c.txt")
+        yield item(turn, "a", assistant(ran, asked))
+        yield tool_item(turn, await tools.run(ran))  # b.pipe is written, not committed
+        yield Event("permission.asked", {"call_id": asked.id, "name": asked.name, "arguments": ""})
+        yield Event("turn.end", {"stop": "paused", "steps": 1, "pending": [asked.id]})
+
+    await runner.turn(FakeLoop(asks), tid, model=MODEL, user_text="two")
+    with pytest.raises(RuntimeError, match=r"turn .*\.1 is paused: resolve the pending approval"):
+        await runner.revert(tid, f"{tid}.0")
+    assert [t["kind"] for t in log.turns(tid)] == ["user", "user"]
+    assert (wd / "a.pipe").exists()
+
+    async def approve(turn, tools, cancel):
+        yield tool_item(turn, await tools.run(call(f"{tid}.1", 2, "c.txt")))
+        yield Event("turn.end", {"stop": "end_turn", "steps": 1})
+
+    resume = Resume(kind="approval", decisions={f"{tid}.1:c2": "allow"})
+    await runner.turn(FakeLoop(approve), tid, model=MODEL, resume=resume)
+    assert log.events(tid)[-1]["data"]["files"] == ["b.pipe", "c.txt"]  # the paused turn's files
+    await runner.revert(tid, f"{tid}.0")
+    assert not (wd / "a.pipe").exists()
+    assert git(wd, "status", "--porcelain") == ""
+    for check in (
+        check_tool_results(log.items(tid), log.events(tid), log.turns(tid)),
+        check_commits(log, tid, wd),
+    ):
+        assert check.ok, check.detail
+
+
+async def test_revert_waits_for_a_turn_that_failed_to_commit(runner, log, tid):
+    await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
+    (runner.workdir(tid) / ".git" / "index.lock").write_text("")
+    with pytest.raises(RuntimeError, match="git add failed"):
+        await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")
+    with pytest.raises(RuntimeError, match="failed to commit its changes: run a turn first"):
+        await runner.revert(tid, f"{tid}.0")
+    no_op = FakeLoop(only(Event("turn.end", {"stop": "end_turn", "steps": 0})))
+    await runner.turn(no_op, tid, model=MODEL, user_text="three")
+    assert log.events(tid)[-1]["data"]["files"] == ["b.pipe"]
+    await runner.revert(tid, f"{tid}.0")
+    check = check_commits(log, tid, runner.workdir(tid))
+    assert check.ok, check.detail
+
+
 async def test_compact(runner, log, tid, published):
     await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
     published.clear()
