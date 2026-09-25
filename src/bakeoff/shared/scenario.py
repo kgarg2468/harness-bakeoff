@@ -304,8 +304,9 @@ class _ScenarioRun:
         self.sc, self.impl, self.run_id, self.dir = sc, impl, run_id, directory
         self.thread_id = f"{sc.id}-{impl}"
         self.limits = Limits(max_steps=sc.limits["max_steps"])
-        # A fresh fakeprov cursor for every run, so running the same scenario again (same run id
-        # and loop) starts at the first exchange. Its recordings move to `wire/` afterwards.
+        # A fresh fakeprov cursor for every run: one provider may serve many runs (the test
+        # suite shares one), even with the same run id under another `out`. Each starts at the
+        # first exchange. Its recordings move to `wire/` afterwards.
         self.cursor = f"{run_id}.{uuid.uuid4().hex[:6]}"
         self.recorded = provider.wire_dir / sc.id / self.cursor / impl
         self.model = ModelConfig(
@@ -494,6 +495,7 @@ async def run_scenario(
 
     `provider` serves the scenario (its folder must hold it); `loop_factory` replaces the
     registry's loop class (child processes still use the registry, by the loop's name).
+    Raises DriverError if that directory exists: a run id is never reused.
     """
     path = (
         Path(scenario)
@@ -502,8 +504,10 @@ async def run_scenario(
     )
     sc = load_scenario(path)
     directory = out / "runs" / run_id / sc.id / impl
-    shutil.rmtree(directory, ignore_errors=True)
-    directory.mkdir(parents=True)
+    try:
+        directory.mkdir(parents=True)  # never over an earlier run: that would erase its results
+    except FileExistsError:
+        raise DriverError(f"{directory} already exists: pick another --run-id") from None
     started = time.perf_counter()
     run = _ScenarioRun(sc, impl, run_id, directory, provider)
     captured = Captured()
@@ -922,8 +926,11 @@ async def run_matrix(
     scenarios_dir: Path = SCENARIOS_DIR,
 ) -> dict[str, Any]:
     """Run every scenario for every loop against one fake provider, then write summary.json
-    and point `out/runs/latest` at the run. Returns the summary."""
+    and point `out/runs/latest` at the run. Returns the summary. Raises DriverError before
+    anything runs if `out/runs/<run_id>` exists: a run id is never reused."""
     run_id = run_id or new_run_id()
+    if (out / "runs" / run_id).exists():  # its summary.json and cells would be replaced
+        raise DriverError(f"{out / 'runs' / run_id} already exists: pick another --run-id")
     staging = out / "runs" / run_id / ".wire"  # fakeprov records here; each run moves its part
     results = []
     with FakeProvider(scenarios_dir, wire_dir=staging) as provider:

@@ -492,6 +492,19 @@ def test_a_broken_loop_fails_the_command_and_a_missing_one_is_skipped(
     assert list(json.loads((out / "runs" / "m1" / "summary.json").read_text())["loops"]) == ["our"]
 
 
+def test_cli_scenario_never_reuses_a_run_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["scenario", "S01", "--impl", "our", "--out", str(tmp_path), "--run-id", "c1"]
+    assert main(argv) == 0
+    run = tmp_path / "runs" / "c1"
+    saved = {p: p.read_bytes() for p in (run / "summary.json", run / "S01" / "our" / "result.json")}
+    capsys.readouterr()
+    assert main(argv) == 1
+    assert f"{run} already exists: pick another --run-id" in capsys.readouterr().err
+    assert {p: p.read_bytes() for p in saved} == saved
+
+
 def test_cli_worker_errors_are_reported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     db = tmp_path / "log.sqlite"
     SessionLog(db).close()

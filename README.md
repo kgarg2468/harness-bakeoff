@@ -39,6 +39,9 @@ but fails to import is an error (exit 1), so it never drops out of a comparison 
 bakeoff scenario S01 S05 --impl our,pydantic   # or --all; --out out (default), --run-id ID
 ```
 
+A run id is never reused: `out/runs/<run_id>` must not exist yet (the default is a new
+timestamped id).
+
 It prints a matrix and exits 1 on any `FAIL` or `XPASS`. `xfail` is a failure that the loop's
 registry entry (`bakeoff/loops.py`) documents, with exactly the checks it documents; a documented
 cell that fails any other way is a `FAIL`. `XPASS` means a documented failure is fixed, so its

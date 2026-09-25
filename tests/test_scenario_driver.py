@@ -304,14 +304,19 @@ async def test_result_json_shape_and_layout(real_provider: FakeProvider, tmp_pat
     assert types[0] == "turn.start" and types[-2:] == ["turn.end", "commit"]
 
 
-async def test_the_same_scenario_can_run_again(real_provider: FakeProvider, tmp_path: Path) -> None:
-    # Every run gets a fresh fakeprov cursor, so a rerun with the same run id starts over.
-    for _ in range(2):
-        result = await run_scenario(
-            "S01", "our", out=tmp_path / "out", run_id="r1", provider=real_provider
-        )
-        assert result["passed"], reason(result)
-        assert result["requests"] == 1
+async def test_a_run_id_is_never_reused(real_provider: FakeProvider, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    first = await run_scenario("S01", "our", out=out, run_id="r1", provider=real_provider)
+    saved = (out / "runs" / "r1" / "S01" / "our" / "result.json").read_bytes()
+    with pytest.raises(DriverError, match="already exists: pick another --run-id"):
+        await run_scenario("S01", "our", out=out, run_id="r1", provider=real_provider)
+    assert (out / "runs" / "r1" / "S01" / "our" / "result.json").read_bytes() == saved
+    # Every run gets a fresh fakeprov cursor, so the same run id elsewhere starts over.
+    again = await run_scenario(
+        "S01", "our", out=tmp_path / "other", run_id="r1", provider=real_provider
+    )
+    assert first["passed"] and again["passed"], reason(again)
+    assert again["requests"] == 1
 
 
 async def test_failed_expectations_are_reported_per_key(
