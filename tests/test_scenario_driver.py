@@ -18,10 +18,12 @@ from bakeoff.fakeprov.script import SCENARIOS_DIR
 from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.our_version import OurLoop
 from bakeoff.shared import scenario
-from bakeoff.shared.contract import ModelConfig
+from bakeoff.shared.contract import ModelConfig, ToolResult
 from bakeoff.shared.scenario import (
+    CancelMark,
     DriverError,
     Observed,
+    cancel_latency,
     capture_output,
     crash_sink,
     decide,
@@ -30,6 +32,7 @@ from bakeoff.shared.scenario import (
     reason,
     run_matrix,
     run_scenario,
+    tool_spans,
     unexpected,
     usage_totals,
 )
@@ -158,6 +161,66 @@ def test_cost_is_compared_with_a_tolerance(tmp_path: Path) -> None:
     assert evaluate_expect({"cost_usd": 0.3}, observed(tmp_path, usage=usage))["cost_usd"]["ok"]
 
 
+def tool_event(turn: str, type_: str, call_id: str, t_ms: float) -> dict[str, Any]:
+    return {"turn": turn, "type": type_, "t_us": int(t_ms * 1000), "data": {"call_id": call_id}}
+
+
+def test_tools_overlap_needs_every_run_at_one_moment(tmp_path: Path) -> None:
+    parallel = [
+        tool_event("t.0", "tool.start", "a", 0),
+        tool_event("t.0", "tool.start", "b", 1),
+        tool_event("t.0", "tool.end", "a", 300),
+        tool_event("t.0", "tool.end", "b", 301),
+    ]
+    want = {"tools_overlap": ["a", "b"]}
+    check = evaluate_expect(want, observed(tmp_path, tool_spans=tool_spans(parallel)))
+    assert check["tools_overlap"] == {
+        "ok": True,
+        "detail": "all 2 running together for 299 ms: a 0-300 ms, b 1-301 ms",
+    }
+    serial = [
+        tool_event("t.0", "tool.start", "a", 0),
+        tool_event("t.0", "tool.end", "a", 300),
+        tool_event("t.0", "tool.start", "b", 300),
+        tool_event("t.0", "tool.end", "b", 600),
+    ]
+    check = evaluate_expect(want, observed(tmp_path, tool_spans=tool_spans(serial)))
+    assert check["tools_overlap"] == {
+        "ok": False,
+        "detail": "not all running at once: a 0-300 ms, b 300-600 ms",
+    }
+    unfinished = serial[:3]
+    check = evaluate_expect(want, observed(tmp_path, tool_spans=tool_spans(unfinished)))
+    assert check["tools_overlap"]["detail"] == "no tool.end in the turn for ['b']"
+    twice = [*parallel, tool_event("t.1", "tool.start", "a", 5)]
+    check = evaluate_expect(want, observed(tmp_path, tool_spans=tool_spans(twice)))
+    assert check["tools_overlap"]["detail"] == "a ran 2x, expected once each"
+
+
+def test_cancel_latency_is_measured_from_the_drivers_cancel(tmp_path: Path) -> None:
+    events = [
+        {"turn": "t.0", "type": "turn.start", "t_us": 100, "data": {}},
+        {"turn": "t.0", "type": "turn.end", "t_us": 400_100 + 3_500, "data": {"stop": "cancelled"}},
+    ]
+    fired = CancelMark(turn="t.0", after_start_us=400_000)
+    assert cancel_latency(events, fired) == ("t.0", 3.5)
+    assert cancel_latency(events, CancelMark(turn="t.0")) == ("t.0", 0.0)  # ended first
+    assert cancel_latency(events[:1], fired) == ("t.0", None)  # no turn.end
+    assert cancel_latency(events, CancelMark()) == (None, None)  # never started
+    fast = observed(tmp_path, cancels=[("t.0", 3.5), ("t.1", 0.0)])
+    check = evaluate_expect({"cancel_within_ms": 200}, fast)["cancel_within_ms"]
+    assert check == {
+        "ok": True,
+        "detail": "turn.end after the cancel: t.0: 3.5 ms, t.1: 0.0 ms (limit 200 ms)",
+    }
+    slow = observed(tmp_path, cancels=[("t.0", 1605.0), ("t.1", None)])
+    check = evaluate_expect({"cancel_within_ms": 200}, slow)["cancel_within_ms"]
+    assert not check["ok"] and "t.0: 1605.0 ms, t.1: no turn.end" in check["detail"]
+    assert not evaluate_expect({"cancel_within_ms": 200}, observed(tmp_path))["cancel_within_ms"][
+        "ok"
+    ]
+
+
 def test_decide_answers_every_pending_call_exactly() -> None:
     assert decide(["a", "b"], "all", ["b"]) == {"a": "allow", "b": "deny"}
     assert decide(["a"], [], ["a"]) == {"a": "deny"}
@@ -283,6 +346,166 @@ async def test_a_loop_that_prints_fails_i5(real_provider: FakeProvider, tmp_path
     assert not result["passed"] and not i5["ok"]
     assert i5["info"]["stdout"] == "debug: turn started\n"
     assert reason(result).startswith("I5: 20 chars to stdout: 'debug: turn started'")
+
+
+# Loops that break the contract in ways only timing or the tool events show. Each wraps OurLoop
+# and changes one thing, so the scenario must fail for exactly that reason.
+
+
+class _Tools:
+    """A ToolHost that passes everything through; subclasses change `run`."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    def specs(self):  # type: ignore[no-untyped-def]
+        return self.inner.specs()
+
+    def check(self, call):  # type: ignore[no-untyped-def]
+        return self.inner.check(call)
+
+    async def run(self, call):  # type: ignore[no-untyped-def]
+        return await self.inner.run(call)
+
+
+class _OneAtATime(_Tools):
+    def __init__(self, inner: Any) -> None:
+        super().__init__(inner)
+        self.lock = asyncio.Lock()
+
+    async def run(self, call):  # type: ignore[no-untyped-def]
+        async with self.lock:
+            return await self.inner.run(call)
+
+
+class _Invents(_Tools):
+    async def run(self, call):  # type: ignore[no-untyped-def]
+        return ToolResult(call.id, True, "")
+
+
+class _Shields(_Tools):
+    async def run(self, call):  # type: ignore[no-untyped-def]
+        return await asyncio.shield(self.inner.run(call))
+
+
+class _FinishesFirst(_Tools):
+    async def run(self, call):  # type: ignore[no-untyped-def]
+        task = asyncio.ensure_future(self.inner.run(call))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task  # the cancel waits for the tool
+            raise
+
+
+def wrapping(tools_class: type[_Tools]) -> type[OurLoop]:
+    class Wrapped(OurLoop):
+        def run_turn(self, turn, tools, cancel):  # type: ignore[no-untyped-def]
+            return super().run_turn(turn, tools_class(tools), cancel)
+
+    return Wrapped
+
+
+class LeaksCancelledError(OurLoop):
+    """Raises CancelledError instead of ending a cancelled turn."""
+
+    async def run_turn(self, turn, tools, cancel):  # type: ignore[no-untyped-def]
+        async for event in super().run_turn(turn, tools, cancel):
+            if event.type == "turn.end" and event.data.get("stop") == "cancelled":
+                raise asyncio.CancelledError
+            yield event
+
+
+class PrintsAfterItsTurn(OurLoop):
+    """Prints from a task 50 ms after each turn: in S05, while the approve child runs."""
+
+    async def run_turn(self, turn, tools, cancel):  # type: ignore[no-untyped-def]
+        try:
+            async for event in super().run_turn(turn, tools, cancel):
+                yield event
+        finally:
+            self.later = asyncio.get_running_loop().create_task(self._print_later())
+
+    async def _print_later(self) -> None:
+        await asyncio.sleep(0.05)
+        print("late output from a loop task")
+
+
+async def scenario_with(
+    provider: FakeProvider, tmp_path: Path, sid: str, loop: type[OurLoop]
+) -> dict[str, Any]:
+    return await run_scenario(
+        sid, "our", out=tmp_path / "out", run_id="r1", provider=provider, loop_factory=loop
+    )
+
+
+def failed_checks(result: dict[str, Any]) -> dict[str, str]:
+    return {
+        key: check["detail"]
+        for group in ("expect", "invariants")
+        for key, check in result[group].items()
+        if not check["ok"]
+    }
+
+
+async def test_tools_run_one_at_a_time_fail_s03(
+    real_provider: FakeProvider, tmp_path: Path
+) -> None:
+    result = await scenario_with(real_provider, tmp_path, "S03", wrapping(_OneAtATime))
+    assert list(failed_checks(result)) == ["tools_overlap"] and result["error"] is None
+    assert failed_checks(result)["tools_overlap"].startswith("not all running at once")
+
+
+async def test_invented_tool_results_fail_i2(real_provider: FakeProvider, tmp_path: Path) -> None:
+    # S12 checks no tool_runs; the result that no run produced still fails.
+    result = await scenario_with(real_provider, tmp_path, "S12", wrapping(_Invents))
+    assert failed_checks(result) == {"I2": "unrun_results: ['call_S12_1']"}
+
+
+async def test_a_tool_left_running_after_a_cancel_fails(
+    real_provider: FakeProvider, tmp_path: Path
+) -> None:
+    result = await scenario_with(real_provider, tmp_path, "S07", wrapping(_Shields))
+    assert failed_checks(result) == {"I2": "unfinished: ['call_S07_1']"}
+    # The driver cancelled the stray tool before judging, so its tool.end is on record (late)
+    # and nothing reaches the next scenario.
+    assert result["error"] == "tasks still running after aclose: ['ToolHostImpl.run']"
+    assert result["invariants"]["I5"]["ok"]
+
+
+async def test_a_cancel_that_waits_for_the_tool_is_too_slow(
+    provider: FakeProvider, tmp_path: Path
+) -> None:
+    copy_scenario(tmp_path, "S07", "X07", engine={"delay_ms": 800})  # a shorter slow tool
+    result = await scenario_with(provider, tmp_path, "X07", wrapping(_FinishesFirst))
+    assert list(failed_checks(result)) == ["cancel_within_ms"] and result["error"] is None
+    detail = failed_checks(result)["cancel_within_ms"]
+    assert "X07-our.0: " in detail and detail.endswith("(limit 200 ms)")
+    (slow,) = [ms for turn, ms in result_cancels(detail) if turn == "X07-our.1"]
+    assert slow > 200
+
+
+def result_cancels(detail: str) -> list[tuple[str, float]]:
+    """(turn, ms) pairs from a cancel_within_ms detail."""
+    pairs = detail.removeprefix("turn.end after the cancel: ").split(" (limit")[0].split(", ")
+    return [(turn, float(ms.removesuffix(" ms"))) for turn, ms in (p.split(": ") for p in pairs)]
+
+
+async def test_a_loop_that_leaks_cancelled_error_fails_only_its_scenario(
+    real_provider: FakeProvider, tmp_path: Path
+) -> None:
+    result = await scenario_with(real_provider, tmp_path, "S07", LeaksCancelledError)
+    assert not result["passed"]
+    assert result["error"].startswith("CancelledError: a turn raised CancelledError")
+    assert (tmp_path / "out" / "runs" / "r1" / "S07" / "our" / "result.json").is_file()
+
+
+async def test_output_while_a_child_runs_fails_i5(
+    real_provider: FakeProvider, tmp_path: Path
+) -> None:
+    result = await scenario_with(real_provider, tmp_path, "S05", PrintsAfterItsTurn)
+    assert failed_checks(result) == {"I5": "29 chars to stdout: 'late output from a loop task'"}
+    assert result["error"] is None and result["processes"][0]["command"] == "approve"
 
 
 async def test_approve_in_a_new_process(real_provider: FakeProvider, tmp_path: Path) -> None:

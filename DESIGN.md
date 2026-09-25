@@ -214,16 +214,25 @@ and ToolHost on MockEngine. `approve` with `new_process` and the user turn after
 as separate OS processes (`bakeoff approve`, `bakeoff turn`); the crash is a SIGKILL the child
 sends itself from its runner's sink, so for `item`, `tool.start` and `turn.end` (stored before
 they are published) it comes right after the event is durable. Every key of the final `expect`
-and the invariants I1, I2, I3, I5 and I7 decide pass or fail. For I5 the driver captures
-stdout/stderr around the loop's code and reads the child processes' pipes (a worker prints only
-its one-line JSON summary). A loop's documented failures are listed in `bakeoff/loops.py`: the
-matrix runs them as strict xfails, so a fix shows up as well as a regression.
+and the invariants I1, I2, I3, I5 and I7 decide pass or fail. The timing criteria above are
+final-expect keys too: `tools_overlap` (S03: the tools' `tool.start`..`tool.end` spans share a
+moment) and `cancel_within_ms` (S07: `turn.end` at most 200 ms after the driver set `cancel`).
+For I5 the driver captures this process's stdout/stderr from the loop's creation until it is
+closed, so background tasks and threads count too, and reads the child processes' pipes (a
+worker prints only its one-line JSON summary). Tasks a loop leaves running after `aclose()` are
+cancelled before judging and fail the scenario, so nothing they do lands in the next scenario.
+A loop's documented failures are listed in `bakeoff/loops.py` with the exact checks they fail:
+the matrix runs them as strict xfails, so a fix shows up as well as a regression, and a cell
+that fails any other way is a plain failure.
 
 ## Invariants (checked on every scenario)
 
 - **I1 append-only**: each request's `messages` are a prefix of the next request's (semantic
   equality; byte equality reported separately). Resets only at a compaction item.
-- **I2** every tool call gets exactly one result; no call id runs twice (`tool.start` count).
+- **I2** every tool call gets exactly one result; no call id runs twice (`tool.start` count);
+  every run ends before its turn's `turn.end` (no orphan tools); and every result comes from a
+  run, unless the user denied the call or its turn stopped early (cancelled, max_steps, budget,
+  error).
 - **I3** `seq` has no gaps; `item` events == item rows.
 - **I5** the loop writes nothing to stdout/stderr.
 - **I6** no connection leaves 127.0.0.1 (socket guard in tests and in every `bakeoff` command;

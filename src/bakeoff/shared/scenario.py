@@ -61,6 +61,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 LOOP_TURNS = ("user", "approval", "crash")  # turn kinds that run a loop (not revert/compact)
 MODEL_TIMEOUT_S = 30.0  # a scenario request that hangs longer than this is a failure anyway
 CHILD_TIMEOUT_S = 60.0
+STRAY_WAIT_S = 2.0  # how long tasks a loop left behind get to finish once cancelled
 _ONE_LINE = 160
 
 
@@ -280,6 +281,18 @@ def new_run_id() -> str:
     return f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
 
 
+@dataclass(slots=True)
+class CancelMark:
+    """When the driver cancelled one turn (a `cancel_after_ms` step), for `cancel_within_ms`.
+
+    `after_start_us` is measured on the driver's clock from the moment the turn's `turn.start`
+    was published, which is when the runner stamped it; the log's `t_us` gives the rest."""
+
+    turn: str | None = None  # None: the turn never started
+    started: float = 0.0  # perf_counter() at turn.start
+    after_start_us: int | None = None  # None: the turn ended before the cancel fired
+
+
 class _ScenarioRun:
     """The state of one scenario run while its driver steps execute."""
 
@@ -306,26 +319,17 @@ class _ScenarioRun:
         self.ws = Workspace(
             directory / "log.sqlite", engine_delay_ms=sc.engine["delay_ms"], sinks=[self._on_event]
         )
+        # I5: what this process wrote while the loop existed, then each child's extra output.
         self.stdout: list[str] = []
         self.stderr: list[str] = []
         self.processes: list[dict[str, Any]] = []
-        self._on_start: Callable[[], None] | None = None  # arms a step's cancel timer
+        self.cancels: list[CancelMark] = []
+        self._on_start: Callable[[str], None] | None = None  # arms a step's cancel timer
 
     def _on_event(self, envelope: dict[str, Any]) -> None:
         if envelope["type"] == "turn.start" and self._on_start is not None:
-            self._on_start()
+            self._on_start(envelope["turn"])
             self._on_start = None
-
-    @contextmanager
-    def _quiet(self) -> Iterator[None]:
-        """Capture the output of loop code (I5), also when it raises."""
-        captured = Captured()
-        try:
-            with capture_output() as captured:
-                yield
-        finally:
-            self.stdout.append(captured.stdout)
-            self.stderr.append(captured.stderr)
 
     async def drive(self, loop: Loop) -> None:
         """Create the thread and perform every driver step, in order."""
@@ -373,18 +377,28 @@ class _ScenarioRun:
         timers: list[asyncio.TimerHandle] = []
         if cancel_ms is not None:
             aio = asyncio.get_running_loop()
-            self._on_start = lambda: timers.append(aio.call_later(cancel_ms / 1000, cancel.set))
+            mark = CancelMark()
+            self.cancels.append(mark)
+
+            def fire() -> None:
+                mark.after_start_us = round((time.perf_counter() - mark.started) * 1e6)
+                cancel.set()
+
+            def arm(turn_id: str) -> None:
+                mark.turn, mark.started = turn_id, time.perf_counter()
+                timers.append(aio.call_later(cancel_ms / 1000, fire))
+
+            self._on_start = arm
         try:
-            with self._quiet():
-                await self.ws.runner.turn(
-                    self.loop,
-                    self.thread_id,
-                    model=self.model,
-                    user_text=user_text,
-                    resume=resume,
-                    limits=self.limits,
-                    cancel=cancel,
-                )
+            await self.ws.runner.turn(
+                self.loop,
+                self.thread_id,
+                model=self.model,
+                user_text=user_text,
+                resume=resume,
+                limits=self.limits,
+                cancel=cancel,
+            )
         finally:
             self._on_start = None
             for timer in timers:
@@ -492,18 +506,16 @@ async def run_scenario(
     directory.mkdir(parents=True)
     started = time.perf_counter()
     run = _ScenarioRun(sc, impl, run_id, directory, provider)
-    error = None
-    loop: Loop | None = None
+    captured = Captured()
     try:
-        with run._quiet():
-            loop = (loop_factory or loops.load(impl))()
-        await run.drive(loop)
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
+        # I5 covers the loop's whole life, so output from its background tasks and threads
+        # counts too, also while the driver waits for a child process. The driver itself
+        # prints nothing here, and children write to their own pipes.
+        with capture_output() as captured:
+            error = await _drive_and_close(run, loop_factory or loops.load(impl))
     finally:
-        if loop is not None:
-            with run._quiet():
-                await loop.aclose()
+        run.stdout.insert(0, captured.stdout)
+        run.stderr.insert(0, captured.stderr)
     duration_ms = round((time.perf_counter() - started) * 1000, 1)
     wire = directory / "wire"
     if run.recorded.exists():
@@ -517,6 +529,58 @@ async def run_scenario(
     result["passed"] = error is None and result["passed"]
     write_json(directory / "result.json", result)
     return result
+
+
+async def _drive_and_close(run: _ScenarioRun, factory: Callable[[], Loop]) -> str | None:
+    """Create the loop, run the scenario's steps, close the loop. Returns the run's error, if
+    any: a failure of the loop or of a driver step is the scenario's result, not a crash of the
+    whole matrix."""
+    errors: list[str] = []
+    loop: Loop | None = None
+    before = asyncio.all_tasks()
+    try:
+        loop = factory()
+        await run.drive(loop)
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+    except asyncio.CancelledError:
+        if _cancelled_from_outside():
+            raise
+        errors.append("CancelledError: a turn raised CancelledError instead of ending")
+    finally:
+        if loop is not None:
+            try:
+                await loop.aclose()
+            except Exception as exc:
+                errors.append(f"aclose: {type(exc).__name__}: {exc}")
+            except asyncio.CancelledError:
+                if _cancelled_from_outside():
+                    raise
+                errors.append("aclose: CancelledError")
+        if strays := await _stop_strays(before):
+            errors.append(f"tasks still running after aclose: {strays}")
+    return "; ".join(errors) or None
+
+
+async def _stop_strays(before: set[asyncio.Task[Any]]) -> list[str]:
+    """Cancel the tasks the loop left running after `aclose` (e.g. a tool it shielded from a
+    cancel), give them a moment to finish, and name them. Their last events and output then
+    land in this scenario's log and I5 capture, not in the next scenario's, which may be
+    another loop's."""
+    current = asyncio.current_task()
+    strays = [t for t in asyncio.all_tasks() - before if t is not current and not t.done()]
+    for task in strays:
+        task.cancel()
+    if strays:
+        await asyncio.wait(strays, timeout=STRAY_WAIT_S)
+    return [getattr(t.get_coro(), "__qualname__", t.get_name()) for t in strays]
+
+
+def _cancelled_from_outside() -> bool:
+    """Whether someone cancelled this task (Ctrl-C, a timeout): that CancelledError must
+    propagate. One that a loop lets escape by itself only fails the scenario."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 # --- judging -----------------------------------------------------------------------------------
@@ -534,9 +598,23 @@ class Observed:
     usage: list[dict[str, Any]]  # the data of every usage event
     workdir: Path
     bodies: list[bytes] = field(default_factory=list)
+    # call id -> one (turn, tool.start t_us, tool.end t_us or None) per run, from the events
+    tool_spans: dict[str, list[ToolSpan]] = field(default_factory=dict)
+    # per cancelled turn: (turn id, ms from the cancel to turn.end); ms is 0.0 if the turn
+    # ended before its cancel fired, None if it never started or never ended
+    cancels: list[tuple[str | None, float | None]] = field(default_factory=list)
 
 
-def observe(log: SessionLog, thread_id: str, wire: Path, workdir: Path) -> Observed:
+ToolSpan = tuple[str, int, int | None]
+
+
+def observe(
+    log: SessionLog,
+    thread_id: str,
+    wire: Path,
+    workdir: Path,
+    cancels: Sequence[CancelMark] = (),
+) -> Observed:
     """Collect the facts the final `expect` and the invariants are judged on."""
     turns, events = log.turns(thread_id), log.events(thread_id)
     starts = [e["data"].get("call_id") for e in events if e["type"] == "tool.start"]
@@ -566,7 +644,43 @@ def observe(log: SessionLog, thread_id: str, wire: Path, workdir: Path) -> Obser
         usage=[e["data"] for e in events if e["type"] == "usage"],
         workdir=workdir,
         bodies=bodies,
+        tool_spans=tool_spans(events),
+        cancels=[cancel_latency(events, mark) for mark in cancels],
     )
+
+
+def tool_spans(events: Sequence[dict[str, Any]]) -> dict[str, list[ToolSpan]]:
+    """Each call's runs as (turn, start t_us, end t_us): a `tool.end` closes the open run of
+    its call in its turn. A run whose `tool.end` never joined its turn's events has no end."""
+    spans: dict[str, list[ToolSpan]] = {}
+    for e in events:
+        call_id = e["data"].get("call_id")
+        if e["type"] == "tool.start":
+            spans.setdefault(call_id, []).append((e["turn"], e["t_us"], None))
+        elif e["type"] == "tool.end":
+            runs = spans.get(call_id, [])
+            for i in reversed(range(len(runs))):
+                if runs[i][0] == e["turn"] and runs[i][2] is None:
+                    runs[i] = (runs[i][0], runs[i][1], e["t_us"])
+                    break
+    return spans
+
+
+def cancel_latency(
+    events: Sequence[dict[str, Any]], mark: CancelMark
+) -> tuple[str | None, float | None]:
+    """(turn, ms from the driver's cancel to the loop's turn.end) for one cancelled turn."""
+    if mark.turn is None:
+        return None, None
+    start = next((e["t_us"] for e in events if e["turn"] == mark.turn), None)
+    end = next(
+        (e["t_us"] for e in events if e["turn"] == mark.turn and e["type"] == "turn.end"), None
+    )
+    if start is None or end is None:
+        return mark.turn, None
+    if mark.after_start_us is None:  # the turn ended first; the timer never fired
+        return mark.turn, 0.0
+    return mark.turn, max(0.0, (end - start - mark.after_start_us) / 1000)
 
 
 def _text(content: Any) -> str:
@@ -653,7 +767,46 @@ def _expect(key: str, want: Any, obs: Observed) -> tuple[bool, str]:
             if not sources:
                 return False, "no usage events"
             return equal(sources[0] if len(sources) == 1 else sources)
+        case "tools_overlap":
+            return _overlap(want, obs.tool_spans)
+        case "cancel_within_ms":
+            if not obs.cancels:
+                return False, "no turn was cancelled"
+            times = [
+                f"{turn or 'a turn that never started'}: "
+                + ("no turn.end" if ms is None else f"{ms:.1f} ms")
+                for turn, ms in obs.cancels
+            ]
+            ok = all(ms is not None and ms <= want for _, ms in obs.cancels)
+            return ok, f"turn.end after the cancel: {', '.join(times)} (limit {want} ms)"
     return False, f"unknown expect key {key!r}"
+
+
+def _overlap(call_ids: Sequence[str], spans: dict[str, list[ToolSpan]]) -> tuple[bool, str]:
+    """Whether the tools of `call_ids` ran at one moment: each once, in one turn, and the last
+    `tool.start` before the first `tool.end`."""
+    runs = {c: spans.get(c, []) for c in call_ids}
+    if wrong := [f"{c} ran {len(r)}x" for c, r in runs.items() if len(r) != 1]:
+        return False, "; ".join(wrong) + ", expected once each"
+    closed: dict[str, tuple[int, int]] = {}
+    for call_id, [(_, start, end)] in runs.items():
+        if end is not None:
+            closed[call_id] = (start, end)
+    if running := [c for c in runs if c not in closed]:
+        return False, f"no tool.end in the turn for {running}"
+    if len({turn for [(turn, _, _)] in runs.values()}) > 1:
+        return False, "the calls ran in different turns"
+    t0 = min(start for start, _ in closed.values())
+    shown = ", ".join(
+        f"{c} {(start - t0) / 1000:.0f}-{(end - t0) / 1000:.0f} ms"
+        for c, (start, end) in closed.items()
+    )
+    last_start = max(start for start, _ in closed.values())
+    first_end = min(end for _, end in closed.values())
+    if last_start < first_end:
+        together = (first_end - last_start) / 1000
+        return True, f"all {len(closed)} running together for {together:.0f} ms: {shown}"
+    return False, f"not all running at once: {shown}"
 
 
 def _file_problem(workdir: Path, path: str, needle: str | None) -> str | None:
@@ -693,7 +846,7 @@ def check_invariants(
 def judge(run: _ScenarioRun, wire: Path) -> dict[str, Any]:
     """The result of a finished scenario run (without duration and error)."""
     workdir = run.ws.runner.workdir(run.thread_id)
-    obs = observe(run.ws.log, run.thread_id, wire, workdir)
+    obs = observe(run.ws.log, run.thread_id, wire, workdir, run.cancels)
     expect = evaluate_expect(run.sc.expect, obs)
     checks = check_invariants(
         run.ws.log, run.thread_id, obs, "".join(run.stdout), "".join(run.stderr)
