@@ -9,7 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from bakeoff.metrics import REPO_ROOT, loc
-from bakeoff.metrics.loc import Counts, count_package, count_source, ported_from
+from bakeoff.metrics.loc import Counts, bakeoff_imports, count_package, count_source, ported_from
 
 
 def counts(source: str) -> dict[str, int]:
@@ -149,7 +149,57 @@ def test_package_split_and_deterministic_json(tmp_path: Path) -> None:
     assert report["ported"] == {"Pi": asdict(Counts(1, 2, 2, 0, 0, 2))}
     assert report["original"] == asdict(Counts(2, 1, 1, 1, 1, 1))
     assert report["files"][1]["ported_from"] == "Pi"
+    assert report["imports_outside"] == [] and report["other_files"] == []
     assert json.dumps(report) == json.dumps(count_package(pkg, tmp_path))
+
+
+def test_bakeoff_imports() -> None:
+    source = textwrap.dedent("""
+        import os
+        import bakeoff.metrics.bench as b
+        from bakeoff import our_version, shared
+        from bakeoff.shared.contract import Loop
+        from . import sibling
+        from .sub.mod import x
+        from .. import fakeprov
+        from ..our_version.loop import OurLoop
+        import httpx
+    """)
+    assert bakeoff_imports(source, "bakeoff.hybrid_version") == {
+        "bakeoff.metrics.bench",
+        "bakeoff.our_version",
+        "bakeoff.shared",
+        "bakeoff.shared.contract",
+        "bakeoff.hybrid_version",
+        "bakeoff.hybrid_version.sub.mod",
+        "bakeoff.fakeprov",
+        "bakeoff.our_version.loop",
+    }
+
+
+def test_code_that_lives_elsewhere_is_listed(tmp_path: Path) -> None:
+    """A loop cannot look small by importing another loop's code or keeping logic in data."""
+    pkg = tmp_path / "src" / "bakeoff" / "hybrid_version"
+    (pkg / "sub").mkdir(parents=True)
+    (pkg / "__init__.py").write_text(
+        "from bakeoff.our_version.loop import OurLoop as HybridLoop\n"
+        "from bakeoff.shared.contract import Loop\n"
+        "from .sub import helper\n"
+    )
+    (pkg / "sub" / "helper.py").write_text("from ...fakeprov import server\nfrom .. import x\n")
+    (pkg / "sub" / "prompts.toml").write_text("a = 1\nb = 2\n")
+    report = count_package(pkg, tmp_path)
+    assert report["imports_outside"] == ["bakeoff.fakeprov", "bakeoff.our_version.loop"]
+    assert report["other_files"] == [
+        {"path": "src/bakeoff/hybrid_version/sub/prompts.toml", "lines": 2}
+    ]
+    loops = {"our_version": report, "hybrid_version": report}
+    table = loc.table({"loops": loops, "shared": report}, per_file=False)
+    assert "  imports bakeoff.our_version.loop (counted in our_version)" in table
+    assert "  imports bakeoff.fakeprov (not counted)" in table
+    assert (
+        "  not Python, not counted: src/bakeoff/hybrid_version/sub/prompts.toml (2 lines)" in table
+    )
 
 
 def test_measure_real_repo() -> None:
@@ -160,5 +210,6 @@ def test_measure_real_repo() -> None:
     assert ours["total"]["code"] == ours["original"]["code"] + sum(
         c["code"] for c in ours["ported"].values()
     )
+    assert ours["imports_outside"] == [] and report["shared"]["imports_outside"] == []
     table = loc.table(report)
     assert "our_version" in table and "shared (baseline)" in table and "ported from" in table

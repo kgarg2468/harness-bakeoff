@@ -16,6 +16,11 @@ choices cannot move it.
 A file whose leading comment block has `# Ported from <project> (...)` (DESIGN.md, "Porting and
 attribution") is counted as ported from that project. Its lines are reported per project, apart
 from the original ones (FAIRNESS.md rule 8).
+
+A package's lines only tell the truth if its code lives in the package. So each package also
+lists the `bakeoff` modules it imports from outside itself and `shared/` (code counted in
+another loop, or not counted at all), and its files that are not Python (tables, templates),
+which the line counts do not cover. Imports are read with ast; `importlib` calls are not seen.
 """
 
 from __future__ import annotations
@@ -132,11 +137,38 @@ def read_source(path: Path) -> str:
     return raw.decode(encoding)
 
 
+def bakeoff_imports(source: str, package: str) -> set[str]:
+    """The `bakeoff` modules that `source`, a file of the dotted `package`, imports, relative
+    imports resolved. `from bakeoff import x` counts as `bakeoff.x`."""
+    parts = package.split(".")
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                parent = parts[: len(parts) - node.level + 1]
+                base = ".".join([*parent, *filter(None, [node.module])])
+            if base == "bakeoff":
+                found.update(f"bakeoff.{alias.name}" for alias in node.names)
+            else:
+                found.add(base)
+    return {name for name in found if name.startswith("bakeoff.")}
+
+
+def _inside(name: str, package: str) -> bool:
+    return name == package or name.startswith(package + ".")
+
+
 def count_package(package: Path, root: Path) -> dict[str, Any]:
-    """Per-file counts and totals of every `.py` file under `package`, split ported/original."""
+    """Per-file counts and totals of every `.py` file under `package` (which lies under
+    `<root>/src`), split ported/original, with its outside imports and non-Python files."""
     total, original = Counts(), Counts()
     ported: dict[str, Counts] = {}
-    files = []
+    files: list[dict[str, Any]] = []
+    outside: set[str] = set()
+    dotted = ".".join(package.relative_to(root / "src").parts)
     for path in sorted(p for p in package.rglob("*.py") if "__pycache__" not in p.parts):
         source = read_source(path)
         counts, project = count_source(source), ported_from(source)
@@ -144,11 +176,27 @@ def count_package(package: Path, root: Path) -> dict[str, Any]:
         (original if project is None else ported.setdefault(project, Counts())).add(counts)
         path_ = path.relative_to(root).as_posix()
         files.append({"path": path_, **asdict(counts), "ported_from": project})
+        in_package = ".".join(path.relative_to(root / "src").parent.parts)
+        outside |= {
+            imported
+            for imported in bakeoff_imports(source, in_package)
+            if not _inside(imported, dotted) and not _inside(imported, "bakeoff.shared")
+        }
+    other = sorted(
+        p
+        for p in package.rglob("*")
+        if p.is_file() and p.suffix not in (".py", ".pyc") and "__pycache__" not in p.parts
+    )
     return {
         "path": package.relative_to(root).as_posix(),
         "total": asdict(total),
         "original": asdict(original),
         "ported": {name: asdict(ported[name]) for name in sorted(ported)},
+        "imports_outside": sorted(outside),
+        "other_files": [
+            {"path": p.relative_to(root).as_posix(), "lines": len(p.read_bytes().splitlines())}
+            for p in other
+        ],
         "files": files,
     }
 
@@ -181,6 +229,13 @@ def table(report: dict[str, Any], *, per_file: bool = True) -> str:
             out.append(row(f"  ported from {project}", counts))
         if package["ported"]:
             out.append(row("  original", package["original"]))
+        for imported in package["imports_outside"]:
+            owner = imported.split(".")[1]
+            where = f"counted in {owner}" if owner in report["loops"] else "not counted"
+            out.append(f"  imports {imported} ({where})")
+        for other in package["other_files"]:
+            lines = f"{other['lines']} line" + "s" * (other["lines"] != 1)
+            out.append(f"  not Python, not counted: {other['path']} ({lines})")
         if per_file:
             for file in package["files"]:
                 out.append(row(f"    {file['path'].removeprefix('src/bakeoff/')}", file))
