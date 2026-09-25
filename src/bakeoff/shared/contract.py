@@ -21,6 +21,8 @@ Rules every Loop must follow (tests enforce them, see DESIGN.md):
 6. When `cancel` is set, stop within 200 ms, leave no orphan tool calls, and
    end with `turn.end` stop="cancelled".
 7. The last event of every turn is `turn.end`.
+8. If history contains a compaction item (`Item.compaction`), a request carries
+   only the system prompt plus the last compaction item and everything after it.
 """
 
 from __future__ import annotations
@@ -89,6 +91,8 @@ class Item:
     # Optional loop-private payload, e.g. pydantic-ai's native ModelMessage JSON.
     native: Any = None
     usage: dict[str, Any] | None = None
+    # True for a runner-written summary that replaces everything before it (rule 8).
+    compaction: bool = False
 
 
 @dataclass(slots=True)

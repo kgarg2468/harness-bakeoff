@@ -76,7 +76,9 @@ timed identically for every loop.
 
 `Item.native` is loop-private. `pydantic_version` stores pydantic-ai's native `ModelMessage` JSON
 there (on the last item produced from each native message) and rebuilds its history from it.
-Items the runner created (user messages) have `native=None`, and every loop must handle them.
+Items the runner created (user messages, revert notes, compaction summaries) have `native=None`, and every
+loop must handle them. A compaction item (`Item.compaction=True`, a user message starting with
+`[harness] Conversation summary:`) replaces everything before it (contract rule 8).
 
 ### Resume
 
