@@ -165,7 +165,8 @@
       const t1 = lay.abs(seg.turn, seg.t1);
       const first = seg.first == null ? t1 : lay.abs(seg.turn, seg.first);
       const u = seg.usage;
-      const usage = u ? `\n${fmtInt(u.input_tokens)} in / ${fmtInt(u.output_tokens)} out tokens${u.cost_usd != null ? ` · $${u.cost_usd.toFixed(4)}` : ""}` : "";
+      const cost = u && u.cost_usd != null && u.cost_source !== "none" ? ` · $${u.cost_usd.toFixed(4)} (${u.cost_source})` : "";
+      const usage = u ? `\n${fmtInt(u.input_tokens)} in / ${fmtInt(u.output_tokens)} out tokens${cost}` : "";
       const g = s("g", {
         "data-tip": `step ${seg.step ?? "?"}${seg.attempt > 1 ? `, attempt ${seg.attempt}` : ""}\nwaited ${fmtMs(first - t0)} for the first token, streamed ${fmtMs(t1 - first)}\nended with ${END[seg.end] || seg.end}${usage}`,
       });

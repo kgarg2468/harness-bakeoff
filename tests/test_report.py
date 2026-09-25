@@ -266,6 +266,8 @@ def test_full_page_is_well_formed_with_every_section(out: Path) -> None:
     assert "1,234" in html and "3.25 s" in html
     # where each wins: a measured win for A (fewer own lines), linked to its evidence
     assert "Fewer lines of its own code to maintain" in html and 'href="#loc"' in html
+    assert "Answered faster: B 2.50 s vs A 3.25 s (live run L1, one sample" in html
+    assert "Sent fewer input tokens" not in html  # a tie is nobody's win
 
 
 def test_replay_and_wire_data(out: Path) -> None:

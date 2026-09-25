@@ -482,7 +482,7 @@ def _score_cells(page: Page, impl: str) -> list[str]:
         cells.append(f"<b>{fmt_int(deps.get('distributions'))}</b> packages · {esc(mb)} MB")
     else:
         cells.append(_MISSING)
-    cells.append(fmt_ms(deps["import_ms"]) if deps and deps.get("import_ms") else _MISSING)
+    cells.append(_import_cell(deps) if deps else _MISSING)
     over, error = _overhead(page, impl), (_bench_for(page, impl) or {}).get("error")
     if over.get("p50") is not None:
         p95 = f"<span class='muted small'>p95 {fmt_ms(over.get('p95'))}</span>"
@@ -690,49 +690,63 @@ def _empty(text: str, command: str) -> str:
     return f'<p class="empty">{esc(text)}{cmd}</p>'
 
 
+_ALONE = "<span class='muted' data-tip='The library alone: this loop is not in the measured checkout yet.'>*</span>"
+
+
+def _import_cell(d: dict[str, Any]) -> str:
+    """The loop's cold import time; the library's alone (marked *) when the loop is not in the
+    measured checkout (its package still empty); "error" with the reason on hover."""
+    if d.get("import_ms") is not None:
+        return fmt_ms(d["import_ms"])
+    if d.get("framework_import_ms") is not None:
+        return f"{fmt_ms(d['framework_import_ms'])}{_ALONE}"
+    if error := d.get("import_error") or d.get("framework_import_error"):
+        return f'<span class="bad-t" tabindex="0" data-tip="{esc(error)}">error</span>'
+    return "n/a"
+
+
+def _third_party_cell(d: dict[str, Any]) -> str:
+    """Third-party code lines loaded after one turn (or by the library's import alone)."""
+    code = d.get("third_party_code") or {}
+    if (turn := (code.get("loop_turn") or {}).get("total")) is not None:
+        return fmt_int(turn)
+    if (alone := (code.get("framework_import") or {}).get("total")) is not None:
+        return f"{fmt_int(alone)}{_ALONE}"
+    return "n/a"
+
+
 def deps_figure(page: Page) -> str:
     """What each loop makes you install and load, per dependency set."""
     intro = (
         f"<h3>{term('dependency', 'Dependencies')}</h3><p class='small muted'>Each set installed "
         f"alone in a fresh virtual environment. {term('third-party-lines')} counts other people's "
-        "code that actually runs.</p>"
+        "code that actually runs. * the loop package is not in the measured checkout yet, so "
+        "only its library was imported.</p>"
     )
     deps = (page.metrics or {}).get("deps") or {}
     if not deps:
-        return intro + _empty(
-            "Not measured yet (needs network).", "uv run python -m bakeoff.metrics.collect --deps"
-        )
+        command = "uv run python -m bakeoff.metrics.collect --deps"
+        return intro + _empty("Not measured yet (needs network).", command)
     rows = []
     for name in sorted(deps, key=lambda n: (impl_order(impl_of_package(n)), n)):
         d = deps[name] or {}
         installed = d.get("installed") or {}
-        key = ", ".join(
+        versions = ", ".join(
             f"{k} {installed[k]}"
-            for k in ("httpx", "pydantic-ai-slim", "openai", "pydantic")
+            for k in ("httpx", "jsonschema", "pydantic-ai-slim", "openai", "pydantic")
             if k in installed
         )
-        code = ((d.get("third_party_code") or {}).get("loop_turn") or {}).get("total")
-        error = d.get("import_error") or d.get("turn_error")
-        if d.get("import_ms") is not None:
-            imp = fmt_ms(d["import_ms"])
-        elif error:
-            imp = f'<span class="bad-t" tabindex="0" data-tip="{esc(error)}">error</span>'
-        else:
-            imp = "n/a"  # the package exports no loop yet
         rows.append(
             f"<tr><th>{chip(impl_of_package(name))}<div class='mono small muted'>{esc(name)}</div></th>"
             f"<td>{fmt_int(d.get('distributions'))}</td><td>{esc(d.get('site_packages_mb', 'n/a'))}</td>"
-            f"<td>{imp}</td><td>{fmt_int(code)}</td></tr>"
-            f"<tr class='sub'><td colspan='5' class='mono small muted'>{esc(key)}</td></tr>"
+            f"<td>{_import_cell(d)}</td><td>{_third_party_cell(d)}</td></tr>"
+            f"<tr class='sub'><td colspan='5' class='mono small muted'>{esc(versions)}</td></tr>"
         )
-    return (
-        intro
-        + "<table class='num deps'><thead><tr><th>set</th><th>packages</th>"
-        + f"<th>{term('site-packages', 'MB')}</th><th>{term('cold-import', 'import')}</th>"
-        + f"<th>{term('third-party-lines', '3rd-party lines')}</th></tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table>"
+    head = (
+        f"<th>set</th><th>packages</th><th>{term('site-packages', 'MB')}</th>"
+        f"<th>{term('cold-import', 'import')}</th><th>{term('third-party-lines', '3rd-party lines')}</th>"
     )
+    return f"{intro}<table class='num deps'><thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
 
 
 def overhead_figure(page: Page) -> str:
@@ -984,7 +998,7 @@ def live(page: Page) -> str:
                 ("input tokens", fmt_int(usage.get("input_tokens"))),
                 ("output tokens", fmt_int(usage.get("output_tokens"))),
                 ("cached tokens", fmt_int(usage.get("cached_tokens"))),
-                ("cost", f"{fmt_usd(cost)} ({esc(usage.get('cost_source', 'n/a'))})"),
+                ("cost", _cost(cost, usage.get("cost_source"))),
             ]
             dl = "".join(f"<div><dt>{esc(k)}</dt><dd>{v}</dd></div>" for k, v in stats)
             error = f'<p class="bad-t small">error: {esc(r["error"])}</p>' if r.get("error") else ""
@@ -1000,6 +1014,13 @@ def live(page: Page) -> str:
             f'<div class="live-cols">{"".join(cols)}</div></div>'
         )
     return "".join(out)
+
+
+def _cost(cost: float | None, source: str | None) -> str:
+    """A cost with where it came from; "unknown" when the provider reported none."""
+    if source in (None, "none") or cost is None:
+        return f"unknown <span class='muted small'>({esc(source or 'n/a')})</span>"
+    return f"{fmt_usd(cost)} <span class='muted small'>({esc(source)})</span>"
 
 
 def _expandable(text: str, preview: int) -> str:
@@ -1094,6 +1115,24 @@ def _measured_claims(page: Page) -> list[tuple[str, str, str]]:
         (when("conns", "requests"), True,
          lambda v: f"Opens fewer connections ({term('connection')}) for the same requests: {_vs(v, fmt_int)}, in scenarios where both loops sent the same number of requests.", "#wire"),
     ]  # fmt: skip
+    if page.live:  # the newest live run only: one sample, so it says so
+        run = page.live[0]
+        results = {i: run["results"].get(i) or {} for i in page.loops}
+        if all(r and not r.get("error") for r in results.values()):
+            caveat = f"live run {esc(run['run_id'])}, one sample; the order of runs and the provider's prompt cache can swing it"
+            latency = {i: r.get("duration_ms") for i, r in results.items()}
+            measures.append(
+                (latency, True, lambda v: f"Answered faster: {_vs(v, fmt_ms)} ({caveat}).", "#live")
+            )
+            tokens = {i: (r.get("usage") or {}).get("input_tokens") for i, r in results.items()}
+            measures.append(
+                (
+                    tokens,
+                    True,
+                    lambda v: f"Sent fewer input tokens: {_vs(v, fmt_int)} ({caveat}).",
+                    "#live",
+                )
+            )
     claims = []
     for values, lower, sentence, link in measures:
         if (winner := _better(values, lower)) and values[winner]:  # a win of 0 eager starts is none
