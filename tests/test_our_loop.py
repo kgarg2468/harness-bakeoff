@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import socket
 import threading
 import time
 import uuid
@@ -14,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import httpx
+import pytest
 
 from bakeoff.our_version import OurLoop
 from bakeoff.shared.contract import (
@@ -47,6 +49,7 @@ class StubTools:
         self.delays = delays or {}
         self.run_counts: Counter[str] = Counter()
         self.spans: dict[str, tuple[float, float]] = {}
+        self.stopped: list[str] = []  # like ToolHost's tool.end: also on cancel
         self.started = asyncio.Event()
 
     def specs(self) -> list[ToolSpec]:
@@ -61,7 +64,10 @@ class StubTools:
         self.run_counts[call.id] += 1
         self.started.set()
         start = time.perf_counter()
-        await asyncio.sleep(self.delays.get(call.name, 0))
+        try:
+            await asyncio.sleep(self.delays.get(call.name, 0))
+        finally:
+            self.stopped.append(call.id)
         self.spans[call.id] = (start, time.perf_counter())
         return ToolResult(call.id, True, f"{call.name} ok")
 
@@ -484,6 +490,86 @@ async def test_mid_stream_error_is_retried_with_backoff() -> None:
     assert items(events)[0].message["content"] == "Hello"
 
 
+async def no_wait(seconds: float) -> None:
+    pass
+
+
+async def test_network_error_is_retried() -> None:
+    def refused() -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    server = Server(refused, reply("ok"))
+    events = await run(server.loop(sleep=no_wait), [user("hi")], StubTools())
+    (retry,) = of(events, "retry")
+    assert retry["status"] is None and retry["reason"].startswith("Network error: ConnectError")
+    assert len(server.bodies) == 2 and events[-1].data["stop"] == "end_turn"
+
+
+async def test_stream_cut_off_is_retried() -> None:
+    server = Server(sse(delta(content="Hel")), reply("Hello"))
+    events = await run(server.loop(sleep=no_wait), [user("hi")], StubTools())
+    assert [r["reason"] for r in of(events, "retry")] == ["Stream ended without finish_reason"]
+    assert [it.message["content"] for it in items(events)] == ["Hello"]
+
+
+@pytest.mark.parametrize(
+    ("reason", "retried"), [("error", True), ("network_error", True), ("content_filter", False)]
+)
+async def test_failed_finish_reasons(reason: str, retried: bool) -> None:
+    server = Server(sse(delta(content="Hel"), finish(reason), "data: [DONE]"), reply("Hello"))
+    events = await run(server.loop(sleep=no_wait), [user("hi")], StubTools())
+    assert len(server.bodies) == (2 if retried else 1)
+    if retried:
+        assert [it.message["content"] for it in items(events)] == ["Hello"]
+    else:
+        assert items(events) == [] and events[-1].data["stop"] == "error"
+        assert of(events, "error")[0]["message"] == f"Provider finish_reason: {reason}"
+
+
+async def test_no_retry_after_an_eager_tool_started() -> None:
+    tools = StubTools(delays={"describe_component": 10})
+    error = {"error": {"code": 502, "message": "Provider disconnected"}}
+
+    async def body() -> AsyncIterator[bytes]:
+        yield sse_bytes(call(0, '{"name": "a"}', "c0", "describe_component"))
+        await tools.started.wait()
+        yield sse_bytes(error)
+
+    server = Server(lambda: httpx.Response(200, content=body()))
+    events = []
+    async for event in server.loop(sleep=no_wait).run_turn(
+        turn([user("go")]), tools, asyncio.Event()
+    ):
+        events.append(event)
+        if event.type == "turn.end":
+            assert tools.stopped == ["c0"]  # the tool's end comes before the turn's
+    assert len(server.bodies) == 1 and of(events, "retry") == [] and items(events) == []
+    assert events[-1].data["stop"] == "error" and "c0" not in tools.spans
+
+
+async def test_cancel_during_retry_backoff() -> None:
+    limited = httpx.Response(429, headers={"retry-after": "5"}, json={"error": {"message": "slow"}})
+    server = Server(limited, reply("never"))
+    cancel, events = asyncio.Event(), []
+    async with asyncio.timeout(2):
+        async for event in server.loop().run_turn(turn([user("hi")]), StubTools(), cancel):
+            events.append(event)
+            if event.type == "retry":
+                cancelled_at = time.perf_counter()
+                cancel.set()
+    assert time.perf_counter() - cancelled_at < 0.2
+    assert events[-1].data == {"stop": "cancelled", "steps": 1} and len(server.bodies) == 1
+
+
+async def test_a_bug_still_ends_the_turn() -> None:
+    def broken() -> httpx.Response:
+        raise RuntimeError("boom")
+
+    events = await run(Server(broken).loop(), [user("hi")], StubTools())
+    assert [e.type for e in events] == ["request.start", "error", "turn.end"]
+    assert events[1].data["kind"] == "internal" and events[-1].data["stop"] == "error"
+
+
 async def test_errors_that_are_not_retried() -> None:
     overflow = httpx.Response(
         400, json={"error": {"message": "prompt is too long: 213462 tokens > 200000"}}
@@ -506,6 +592,12 @@ async def test_errors_that_are_not_retried() -> None:
     events = await run(server.loop(sleep=sleep), [user("hi")], StubTools())
     assert len(server.bodies) == 4 and len(of(events, "retry")) == 3  # max_retries=3
     assert events[-1].data["stop"] == "error"
+
+    server = Server(sse(delta(content="Hel"), "data: {not json"))
+    events = await run(server.loop(), [user("hi")], StubTools())
+    (error,) = of(events, "error")
+    assert error["kind"] == "stream" and error["message"].startswith("Invalid stream data")
+    assert events[-1].data["stop"] == "error" and len(server.bodies) == 1
 
 
 async def test_reasoning_details_round_trip_verbatim() -> None:
@@ -552,6 +644,36 @@ async def test_reasoning_details_round_trip_verbatim() -> None:
         tools,
     )
     assert server.bodies[2].startswith(server.bodies[1][:-2])
+
+
+async def test_split_surrogate_pair_is_sent_and_replayed_identically() -> None:
+    server = Server(
+        sse(
+            delta(content="\ud83d"),
+            delta(content="\ude00"),
+            call(0, "{}", "c0", "describe_component"),
+            finish("tool_calls"),
+        ),
+        reply("ok"),
+        reply("again"),
+    )
+    history = [user("smile")]
+    events = await run(server.loop(), history, StubTools())
+    assert events[-1].data["stop"] == "end_turn" and len(server.bodies) == 2
+    assert server.messages(1)[2]["content"] == "\U0001f600" and server.bodies[1].isascii()
+    history += [*(persisted(it) for it in items(events)), user("more")]
+    await run(server.loop(), history, StubTools())  # fresh loop: bytes rebuilt from the log
+    assert server.bodies[2].startswith(server.bodies[1][:-2])
+
+
+async def test_empty_answer_is_not_replayed() -> None:
+    server = Server(sse(finish("stop"), "data: [DONE]"), reply("there"))
+    history = [user("hi")]
+    events = await run(server.loop(), history, StubTools())
+    assert items(events)[0].message == {"role": "assistant", "content": None}
+    history += [*(persisted(it) for it in items(events)), user("hello?")]
+    await run(server.loop(), history, StubTools())
+    assert [m["content"] for m in server.messages(1)] == [SYSTEM, "hi", "hello?"]
 
 
 async def test_max_steps_stops_after_exactly_n_requests() -> None:
@@ -671,8 +793,13 @@ def socket_model(server: ThreadingHTTPServer) -> ModelConfig:
 
 async def test_one_connection_serves_every_step() -> None:
     ports: list[int] = []
-    replies = [
-        sse_bytes(call(0, "{}", "c0", "describe_component"), finish("tool_calls"), "data: [DONE]"),
+    replies = [  # the first answer is complete at its usage chunk, the second at [DONE]
+        sse_bytes(
+            call(0, "{}", "c0", "describe_component"),
+            finish("tool_calls"),
+            finish("tool_calls", {"cost": 1}),
+            "data: [DONE]",
+        ),
         sse_bytes(delta(content="ok"), finish("stop"), "data: [DONE]"),
     ]
 
@@ -708,6 +835,54 @@ async def test_cancel_closes_a_stalled_socket() -> None:
                         cancelled_at = time.perf_counter()
                         cancel.set()
             assert event.data["stop"] == "cancelled" and time.perf_counter() - cancelled_at < 0.2
+        finally:
+            release.set()
+            await loop.aclose()
+
+
+# The answer is complete at [DONE], or at a usage chunk once finish_reason has arrived.
+COMPLETE = {
+    "done": sse_bytes(delta(content="The answer."), finish("stop"), "data: [DONE]"),
+    "usage": sse_bytes(delta(content="The answer."), finish("stop"), finish("stop", {"cost": 1})),
+}
+
+
+@pytest.mark.parametrize("end", COMPLETE)
+async def test_answer_survives_a_connection_dropped_after_it_completed(end: str) -> None:
+    requests: list[int] = []
+
+    def respond(handler: BaseHTTPRequestHandler) -> None:
+        requests.append(1)
+        write_chunk(handler, COMPLETE[end])
+        handler.close_connection = True
+        handler.connection.shutdown(socket.SHUT_RDWR)  # no terminating zero-length chunk
+
+    loop = OurLoop(sleep=no_wait)
+    with socket_server(respond) as server:
+        events = await run(loop, [user("hi")], StubTools(), model=socket_model(server))
+        await loop.aclose()
+    assert events[-1].data == {"stop": "end_turn", "steps": 1}
+    assert len(requests) == 1 and of(events, "retry") == []
+    assert items(events)[0].message["content"] == "The answer."
+
+
+@pytest.mark.parametrize("end", COMPLETE)
+async def test_body_held_open_after_the_answer_does_not_block(end: str) -> None:
+    release = threading.Event()
+
+    def respond(handler: BaseHTTPRequestHandler) -> None:
+        write_chunk(handler, COMPLETE[end])
+        release.wait(5)
+        with contextlib.suppress(OSError):
+            write_chunk(handler, b"")
+
+    loop = OurLoop()
+    with socket_server(respond) as server:
+        try:
+            start = time.perf_counter()
+            events = await run(loop, [user("hi")], StubTools(), model=socket_model(server))
+            assert time.perf_counter() - start < 0.5
+            assert events[-1].data == {"stop": "end_turn", "steps": 1}
         finally:
             release.set()
             await loop.aclose()

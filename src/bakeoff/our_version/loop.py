@@ -14,12 +14,23 @@ import httpx
 
 from bakeoff.shared.contract import Event, Item, ToolCall, ToolHost, ToolResult, ToolSpec, TurnInput
 
-from .compat import merge_detail, static_body, usage_fields
-from .provider import Stream, StreamedCall, Wire, as_provider_error, http_error, stream_error
+from .compat import REASONING_FIELDS, merge_detail, static_body, usage_fields
+from .provider import (
+    Stream,
+    StreamedCall,
+    Wire,
+    as_provider_error,
+    http_error,
+    replayed,
+    stream_error,
+)
 from .retry import backoff
 
 CANCELLED = "Cancelled by user"
 _MAX_THREADS = 64  # request caches kept for this many recently used threads
+_DRAIN_S = 0.05  # once the answer is complete, wait this long for the body's end (keep-alive)
+_EMPTY: dict[str, Any] = {}
+_NO_CHOICE = (_EMPTY,)
 
 
 class _Cancelled(Exception):
@@ -96,7 +107,7 @@ class _Turn:
             "Content-Type": "application/json",
         }
         self.timeout = httpx.Timeout(self.model.timeout_s, connect=10.0)
-        self.items = _replayed(turn.history)
+        self.items = replayed(turn.history)
         resume = turn.resume
         self.user = resume.decisions if resume else {}
         self.reason = (resume.reason if resume else None) or "no reason given"
@@ -108,11 +119,100 @@ class _Turn:
         self.response: httpx.Response | None = None
 
     async def run(self) -> AsyncIterator[Event]:
+        """The whole turn. The SSE reader is inlined here on purpose: every async-generator level
+        between it and the runner would cost each streamed chunk another suspend/resume."""
         watcher = asyncio.ensure_future(self._watch())
+        history, limits = self.turn.history, self.turn.limits
         try:
-            async for event in self._events():
-                yield event
+            if pending := self._pending():  # approval or crash resume
+                async for event in self._tools(pending):
+                    yield event
+            elif history and history[-1].message.get("role") == "assistant":
+                yield self._end("end_turn")  # crashed after the final answer: nothing left to do
+            while not self.ended:  # one step: a model request, then its tool calls
+                if self.cancel.is_set():
+                    yield self._end("cancelled")
+                elif self.steps >= limits.max_steps:
+                    yield self._end("max_steps")
+                elif limits.max_cost_usd is not None and self.cost >= limits.max_cost_usd:
+                    yield self._end("budget")
+                if self.ended:
+                    break
+                self.steps += 1
+                body = self.wire.body(self.items)
+                for attempt in itertools.count(1):
+                    yield Event("request.start", {"step": self.steps, "attempt": attempt})
+                    stream, failure = Stream(), None
+                    try:
+                        lines = (await self._open(body)).aiter_lines()
+                        async for line in lines:
+                            if not line.startswith("data:"):
+                                continue  # blank separators, ": keep-alive" comments, other fields
+                            data = line[5:]
+                            if data[-6:] == "[DONE]":
+                                stream.done = True
+                                break
+                            chunk = json.loads(data)
+                            if (error := chunk.get("error")) is not None:
+                                raise stream_error(error)
+                            choice = (chunk.get("choices") or _NO_CHOICE)[0]
+                            if finish := choice.get("finish_reason"):
+                                stream.finish = finish
+                            delta = choice.get("delta") or _EMPTY
+                            if text := delta.get("content"):
+                                stream.text.append(text)
+                                yield Event("text.delta", {"text": text})
+                            for field in REASONING_FIELDS:
+                                if thought := delta.get(field):
+                                    yield Event("reasoning.delta", {"text": thought})
+                                    break
+                            for fragment in delta.get("reasoning_details") or ():
+                                merge_detail(stream.details, fragment)
+                            for tool_delta in delta.get("tool_calls") or ():
+                                if done := stream.tool_delta(tool_delta, self.read_only):
+                                    yield self._ready(done, eager=True)
+                            if usage := chunk.get("usage"):
+                                stream.usage = usage  # replaced, never added: counted once
+                                if stream.finish:  # finish_reason and usage: nothing else is due
+                                    stream.done = True
+                                    break
+                        if stream.done:  # read the body's end only to keep the connection
+                            with contextlib.suppress(Exception):
+                                async with asyncio.timeout(_DRAIN_S):
+                                    async for _ in lines:
+                                        pass
+                        stream.check_end()
+                    except Exception as exc:
+                        failure = exc
+                    finally:
+                        if (resp := self.response) is not None:
+                            self.response = None
+                            await resp.aclose()
+                    if failure is None:
+                        break
+                    events, wait = await self._failed(failure, stream, attempt)
+                    for event in events:
+                        yield event
+                    if self.ended:
+                        return
+                    await self._settle(self.loop._sleep(wait))
+                    if self.cancel.is_set():
+                        yield self._end("cancelled")
+                        return
+                for call in stream.calls.values():
+                    if not call.ready:
+                        yield self._ready(call, eager=False)
+                usage = {"step": self.steps, **usage_fields(stream.usage)}
+                self.cost += usage["cost_usd"]
+                yield self._item(stream.message(), usage=usage)
+                yield Event("usage", usage)
+                if calls := stream.tool_calls():
+                    async for event in self._tools(calls):
+                        yield event
+                else:
+                    yield self._end("end_turn")
         except Exception as exc:  # a bug must still end the turn (contract rule 7)
+            await self._stop_jobs()
             yield Event("error", {"kind": "internal", "message": repr(exc), "retryable": False})
             yield self._end("error", error=repr(exc))
         finally:
@@ -128,24 +228,6 @@ class _Turn:
             with contextlib.suppress(Exception):
                 await self.response.aclose()  # wakes the stream reader; no per-chunk polling
 
-    async def _events(self) -> AsyncIterator[Event]:
-        if pending := self._pending():  # approval or crash resume
-            async for event in self._tools(pending):
-                yield event
-        elif self.items and self.items[-1].message.get("role") == "assistant":
-            yield self._end("end_turn")  # crashed after the final answer: nothing left to do
-        limits = self.turn.limits
-        while not self.ended:
-            if self.cancel.is_set():
-                yield self._end("cancelled")
-            elif self.steps >= limits.max_steps:
-                yield self._end("max_steps")
-            elif limits.max_cost_usd is not None and self.cost >= limits.max_cost_usd:
-                yield self._end("budget")
-            else:
-                async for event in self._step():
-                    yield event
-
     def _pending(self) -> list[ToolCall]:
         """Calls of the last assistant message that have no result item yet."""
         for i in range(len(self.items) - 1, -1, -1):
@@ -159,56 +241,8 @@ class _Turn:
                 ]
         return []
 
-    async def _step(self) -> AsyncIterator[Event]:
-        self.steps += 1
-        body = self.wire.body(self.items)
-        for attempt in itertools.count(1):
-            yield Event("request.start", {"step": self.steps, "attempt": attempt})
-            stream = Stream()
-            try:
-                async for event in self._attempt(body, stream):
-                    yield event
-                break
-            except Exception as exc:
-                if self.cancel.is_set():
-                    if (partial := stream.partial()) is not None:
-                        yield self._item(partial, status="incomplete")
-                    yield self._end("cancelled")
-                    return
-                err = as_provider_error(exc)
-                # Once a tool has started, a retry could replay its call id: fail instead.
-                if self.jobs or not err.retryable or attempt > self.model.max_retries:
-                    yield Event(
-                        "error",
-                        {"kind": err.kind, "message": err.message, "retryable": err.retryable},
-                    )
-                    yield self._end("error", error=err.message)
-                    return
-                wait = backoff(attempt - 1) if err.wait_s is None else err.wait_s
-                yield Event(
-                    "retry",
-                    {
-                        "attempt": attempt,
-                        "status": err.status,
-                        "wait_ms": round(wait * 1000),
-                        "reason": err.message,
-                    },
-                )
-                await self._settle(self.loop._sleep(wait))
-                if self.cancel.is_set():
-                    yield self._end("cancelled")
-                    return
-        usage = {"step": self.steps, **usage_fields(stream.usage)}
-        self.cost += usage["cost_usd"]
-        yield self._item(stream.message(), usage=usage)
-        yield Event("usage", usage)
-        if calls := stream.tool_calls():
-            async for event in self._tools(calls):
-                yield event
-        else:
-            yield self._end("end_turn")
-
-    async def _attempt(self, body: bytes, stream: Stream) -> AsyncIterator[Event]:
+    async def _open(self, body: bytes) -> httpx.Response:
+        """POST the request as a task the cancel watcher can stop; return the 200 response."""
         client = self.loop._client(self.model.base_url)
         request = client.build_request(
             "POST", self.url, content=body, headers=self.headers, timeout=self.timeout
@@ -216,54 +250,36 @@ class _Turn:
         send = await self._settle(client.send(request, stream=True))
         if send.cancelled():
             raise _Cancelled
-        resp = self.response = send.result()
-        try:
-            if self.cancel.is_set():
-                raise _Cancelled
-            if resp.status_code != 200:
-                raise await http_error(resp)
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue  # blank separators, ": keep-alive" comments, other SSE fields
-                data = line[5:]
-                if data[-6:] == "[DONE]":
-                    stream.done = True  # read on to the end of the body: keeps the connection
-                    continue
-                chunk = json.loads(data)
-                if (error := chunk.get("error")) is not None:
-                    raise stream_error(error)
-                if usage := chunk.get("usage"):
-                    stream.usage = usage  # replaced, never added: counted once
-                if not (choices := chunk.get("choices")):
-                    continue
-                choice = choices[0]
-                if finish := choice.get("finish_reason"):
-                    stream.finish = finish
-                if not (delta := choice.get("delta")):
-                    continue
-                if text := delta.get("content"):
-                    stream.text.append(text)
-                    yield Event("text.delta", {"text": text})
-                if (
-                    thought := delta.get("reasoning")
-                    or delta.get("reasoning_content")
-                    or delta.get("reasoning_text")
-                ):
-                    yield Event("reasoning.delta", {"text": thought})
-                if details := delta.get("reasoning_details"):
-                    for fragment in details:
-                        merge_detail(stream.details, fragment)
-                if tool_deltas := delta.get("tool_calls"):
-                    for tool_delta in tool_deltas:
-                        if done := stream.tool_delta(tool_delta, self.read_only):
-                            yield self._ready(done, eager=True)
-        finally:
-            self.response = None
-            await resp.aclose()
-        stream.check_end()
-        for call in stream.calls.values():
-            if not call.ready:
-                yield self._ready(call, eager=False)
+        resp = self.response = send.result()  # from here on, cancel closes it (no polling)
+        if self.cancel.is_set():
+            raise _Cancelled
+        if resp.status_code != 200:
+            raise await http_error(resp)
+        return resp
+
+    async def _failed(
+        self, exc: Exception, stream: Stream, attempt: int
+    ) -> tuple[list[Event], float]:
+        """The events for a failed attempt (ending the turn, or a `retry`) and the retry wait."""
+        if self.cancel.is_set():
+            await self._stop_jobs()
+            partial = stream.partial()
+            cut = [] if partial is None else [self._item(partial, status="incomplete")]
+            return [*cut, self._end("cancelled")], 0.0
+        err = as_provider_error(exc)  # re-raises a bug
+        # Once a tool has started, a retry could replay its call id: fail instead.
+        if self.jobs or not err.retryable or attempt > self.model.max_retries:
+            await self._stop_jobs()
+            error = {"kind": err.kind, "message": err.message, "retryable": err.retryable}
+            return [Event("error", error), self._end("error", error=err.message)], 0.0
+        wait = backoff(attempt - 1) if err.wait_s is None else err.wait_s
+        retry = {
+            "attempt": attempt,
+            "status": err.status,
+            "wait_ms": round(wait * 1000),
+            "reason": err.message,
+        }
+        return [Event("retry", retry)], wait
 
     def _ready(self, streamed: StreamedCall, *, eager: bool) -> Event:
         """A call's arguments are complete. Eager: start an allowed read-only call right away."""
@@ -308,6 +324,13 @@ class _Turn:
             await asyncio.wait([job])
         return ToolResult(call.id, False, CANCELLED) if job.cancelled() else job.result()
 
+    async def _stop_jobs(self) -> None:
+        """Cancel tool runs whose results will not be used; wait so their tool.end precedes ours."""
+        for job in self.jobs.values():
+            job.cancel()
+        if self.jobs:
+            await asyncio.wait(self.jobs.values())
+
     def _spawn(self, coro: Awaitable[Any]) -> asyncio.Task[Any]:
         task = asyncio.ensure_future(coro)
         self.tasks.add(task)
@@ -342,9 +365,3 @@ class _Turn:
     def _end(self, stop: str, **extra: Any) -> Event:
         self.ended = True
         return Event("turn.end", {"stop": stop, "steps": self.steps, **extra})
-
-
-def _replayed(history: list[Item]) -> list[Item]:
-    """Items the next request carries: from the last compaction item on, minus cancelled output."""
-    start = max((i for i, it in enumerate(history) if it.compaction), default=0)
-    return [it for it in history[start:] if it.status != "incomplete"]

@@ -32,6 +32,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
 }
 _CONCAT = ("text", "summary", "data")
 _RUNS = ("reasoning.text", "reasoning.summary")  # without an index, these continue the last entry
+# Streamed reasoning text arrives in one of these delta fields, depending on the server.
+REASONING_FIELDS = ("reasoning", "reasoning_content", "reasoning_text")
 
 
 def flags(model: ModelConfig) -> dict[str, Any]:
