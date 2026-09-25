@@ -1487,11 +1487,18 @@ chips('sqlBtns', b => {
     }
     return null;
   }
+  let driveNote = false;
   function normalize(path) {
     // what resolve_path does before any rule is read: relative to the working copy, "." and ".." collapsed;
     // only "/" separates (match() later reads a backslash as "/", as OpenCode's matcher does)
     // (it also follows symlinks, which a web page can't see)
-    if (path.startsWith('/') || ($('#permWin').checked && /^([A-Za-z]:|\\)/.test(path))) return null;
+    if (path.startsWith('/')) return null;
+    if ($('#permWin').checked) {
+      // Windows: "C:\\x" (drive + root) is absolute; a leading backslash is rooted, so it leaves the working copy;
+      // "C:name" (drive, no root) is relative to that drive's current folder: inside, if the working copy is on C:
+      if (/^[A-Za-z]:[\\/]/.test(path) || /^\\/.test(path)) return null;
+      if (/^[A-Za-z]:/.test(path)) { driveNote = true; path = path.slice(2); }
+    }
     const out = [];
     const win = $('#permWin').checked;  // Windows paths also separate on a backslash; on Linux (where the engine runs) it's part of a name
     for (const part of (win ? path.replace(/\\/g, '/') : path).split('/')) {
@@ -1502,6 +1509,7 @@ chips('sqlBtns', b => {
   }
   function run() {
     let rules; try { rules = JSON.parse($('#permRules').value); } catch (e) { return status('permStatus', 'Not valid JSON: ' + esc(e.message), 'bad'); }
+    driveNote = false;
     const bad = invalidRule(rules);
     if (bad) return status('permStatus', `<b>ValueError</b> · ${esc(bad)}. <code>permissions.validate_rules()</code> runs when the ToolHost is built, so a conversation with these rules never starts; no call is evaluated.`, 'bad');
     const tool = $('#permTool').value; const typed = hasPath[tool] ? $('#permPath').value.trim() : null;
@@ -1516,7 +1524,7 @@ chips('sqlBtns', b => {
     const [d, why] = evaluate(rules, tool, path);
     const meaning = { allow: 'runs now', ask: 'the turn pauses; a person approves or denies (maybe from another process)', deny: 'never runs; the model gets "Denied by permission rules: …" as the result' }[d];
     const resolved = typed !== null && typed !== path ? ` The path is matched as <code>${esc(path)}</code>, after <code>resolve_path</code> collapsed <code>${esc(typed)}</code>.` : '';
-    status('permStatus', `<b>${d}</b> — ${meaning}.<br><span class="note">Why: ${why}.${resolved} The tool's own key is tried before <code>"*"</code>; inside a mapping the first matching glob wins. (The real <code>resolve_path</code> also follows symlinks, so a link pointing outside the working copy is denied; this page can't see your files.)</span>`, d === 'allow' ? 'good' : d === 'deny' ? 'bad' : 'warn');
+    status('permStatus', `<b>${d}</b> — ${meaning}.<br><span class="note">Why: ${why}.${resolved} ${driveNote ? 'A drive letter without a backslash after it is relative to that drive; this assumes the working copy is on it (on another drive the path would leave the working copy and be denied). ' : ''}The tool's own key is tried before <code>"*"</code>; inside a mapping the first matching glob wins. (The real <code>resolve_path</code> also follows symlinks, so a link pointing outside the working copy is denied; this page can't see your files.)</span>`, d === 'allow' ? 'good' : d === 'deny' ? 'bad' : 'warn');
   }
   ['permRules', 'permTool', 'permPath'].forEach(id => $('#' + id).addEventListener('input', run));
   $('#permWin').addEventListener('change', run);
