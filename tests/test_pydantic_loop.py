@@ -20,6 +20,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from bakeoff.pydantic_version import PydanticLoop, mapping
+from bakeoff.pydantic_version import loop as loop_module
 from bakeoff.shared.contract import (
     Decision,
     Event,
@@ -718,14 +719,45 @@ async def test_reasoning_model_with_temperature_stays_quiet(capfd):
     assert (caught, capfd.readouterr()) == ([], ("", ""))
 
 
-async def test_error_chunk_mid_stream_is_not_retried(loop):
-    error = {**chunk(finish="error"), "error": {"code": 502, "message": "upstream died"}}
-    with SSEServer(Reply([*text("Hal"), error])) as srv:
-        events = await run(loop, turn([user("hi")], config(srv, max_retries=2)), StubTools())
+def _error_chunk(code: str | int) -> dict[str, Any]:
+    """OpenRouter's mid-stream error: HTTP 200, a top-level error, finish_reason "error"."""
+    return {**chunk(finish="error"), "error": {"code": code, "message": "Provider disconnected"}}
 
-    # Recorded behavior: the OpenAI SDK retries only before a stream starts, and pydantic-ai does
-    # not retry a failed stream, so this is one attempt and an error turn keeping the partial text.
-    assert len(srv.bodies) == 1
+
+@pytest.mark.parametrize("code", ["server_error", 502])  # OpenRouter's documented code is a string
+async def test_error_chunk_mid_stream_is_retried_from_the_saved_history(loop, monkeypatch, code):
+    monkeypatch.setattr(loop_module, "_STREAM_RETRY_BASE_S", 0.01)
+    tools = StubTools()
+    replies = [
+        Reply([*tool_call(0, "c1", "read_file", '{"path": "a"}'), done("tool_calls")]),
+        Reply([*text("Hal"), _error_chunk(code)]),
+        Reply([*text("Hello"), done()]),
+    ]
+    with SSEServer(*replies) as srv:
+        limits = Limits(max_steps=2)  # the retry is the same step, not a third one
+        model = config(srv, max_retries=1)
+        events = await run(loop, turn([user("hi")], model, limits=limits), tools)
+
+    assert len(srv.bodies) == 3 and srv.requests[2]["messages"] == srv.requests[1]["messages"]
+    assert [c.id for c in tools.runs] == ["c1"]  # the saved step is not redone
+    starts = [(d["step"], d["attempt"]) for d in of(events, "request.start")]
+    assert starts == [(1, 1), (2, 1), (2, 2)]
+    [retry] = of(events, "retry")
+    assert (retry["attempt"], retry["status"]) == (2, None if code == "server_error" else 502)
+    assert retry["reason"] in ("OpenRouter error chunk: server_error", "HTTP 502")
+    # The partial "Hal" is dropped, not saved: the step's one item is the retried answer.
+    assert [i.message.get("content") for i in items(events)] == [None, "read_file ok", "Hello"]
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+
+
+async def test_error_chunk_after_the_last_retry_ends_the_turn(loop, monkeypatch):
+    monkeypatch.setattr(loop_module, "_STREAM_RETRY_BASE_S", 0.01)
+    failing = [Reply([*text("Hal"), _error_chunk("server_error")]) for _ in range(2)]
+    with SSEServer(*failing) as srv:
+        events = await run(loop, turn([user("hi")], config(srv, max_retries=1)), StubTools())
+
+    assert len(srv.bodies) == 2
+    # The last attempt's partial text is kept, as a cancelled one would be.
     assert [(i.status, i.message["content"]) for i in items(events)] == [("incomplete", "Hal")]
     assert of(events, "error")[0]["retryable"] is True
     assert of(events, "turn.end")[0]["stop"] == "error"
