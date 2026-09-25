@@ -9,11 +9,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
-from collections.abc import Callable
-from contextlib import aclosing
+from collections.abc import Callable, Iterator
+from contextlib import aclosing, contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,36 @@ logger = logging.getLogger(__name__)
 
 # Starts the content of a compaction item; see contract rule 8.
 SUMMARY_PREFIX = "[harness] Conversation summary:"
+
+try:
+    import fcntl
+except ImportError:  # Windows: no advisory locks; the log's running-turn check still applies
+    fcntl = None  # type: ignore[assignment]
+
+
+class ThreadBusy(RuntimeError):
+    """Another live process is running a turn (or a revert) on this thread."""
+
+
+@contextmanager
+def _exclusive(lock_path: Path) -> Iterator[None]:
+    """Hold an OS advisory lock on `lock_path` for the duration of a turn.
+
+    The kernel drops the lock when its process dies, so a crash resume can always take it,
+    while two live processes (e.g. two concurrent crash resumes) can never both hold it.
+    """
+    if fcntl is None:
+        yield
+        return
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ThreadBusy(f"thread is busy in another process: {lock_path.stem}") from None
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
 
 
 class _Publisher:
@@ -198,6 +229,23 @@ class Runner:
         thread = self._thread(thread_id)
         if loop.name != thread["impl"]:
             raise ValueError(f"thread {thread_id} belongs to {thread['impl']!r}, not {loop.name!r}")
+        with _exclusive(self._lock_path(thread_id)):
+            return await self._turn(
+                loop, thread, thread_id, model, user_text, resume, limits, cancel, watch_cancel
+            )
+
+    async def _turn(
+        self,
+        loop: Loop,
+        thread: dict[str, Any],
+        thread_id: str,
+        model: ModelConfig,
+        user_text: str | None,
+        resume: Resume | None,
+        limits: Limits,
+        cancel: asyncio.Event | None,
+        watch_cancel: bool,
+    ) -> dict[str, Any]:
         kind = resume.kind if resume else "user"
         row = self.log.start_turn(thread_id, kind)  # raises if a turn is running (unless crash)
         turn_id = row["id"]
@@ -298,13 +346,14 @@ class Runner:
         target = next((t for t in self.log.turns(thread_id) if t["id"] == turn_id), None)
         if target is None or not target["commit_sha"]:
             raise ValueError(f"turn {turn_id} of thread {thread_id} has no commit to revert")
-        # The running turn row keeps other turns out while git works.
-        row = self.log.start_turn(thread_id, "revert")
-        try:
-            sha, files = await WorkCopy(self.workdir(thread_id)).revert(target["commit_sha"])
-        except Exception:
-            self.log.discard_turn(row["id"])  # it recorded nothing yet
-            raise
+        with _exclusive(self._lock_path(thread_id)):
+            # The running turn row keeps other turns out while git works.
+            row = self.log.start_turn(thread_id, "revert")
+            try:
+                sha, files = await WorkCopy(self.workdir(thread_id)).revert(target["commit_sha"])
+            except Exception:
+                self.log.discard_turn(row["id"])  # it recorded nothing yet
+                raise
         pub = _Publisher(self.log, self.sink, thread_id, row["id"], thread["impl"])
         note = f"[harness] Reverted turn {target['idx'] + 1}; files: {', '.join(files) or 'none'}"
         message = {"role": "user", "content": note}
@@ -332,6 +381,10 @@ class Runner:
         pub.close()
         self.log.set_turn_status(row["id"], "done")
         return item
+
+    def _lock_path(self, thread_id: str) -> Path:
+        # Next to the working copy, not inside it, so it is never committed.
+        return self.workdir(thread_id).parent / f"{thread_id}.lock"
 
     def _thread(self, thread_id: str) -> dict[str, Any]:
         thread = self.log.get_thread(thread_id)

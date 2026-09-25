@@ -291,7 +291,7 @@ async def test_crash_leaves_turn_running_and_crash_resume_continues(runner, log,
 
     task = asyncio.create_task(runner.turn(FakeLoop(hang), tid, model=MODEL, user_text="go"))
     await blocked.wait()
-    with pytest.raises(RuntimeError, match="running turn"):
+    with pytest.raises(RuntimeError, match=r"running turn|busy"):
         await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="again")
     with pytest.raises(RuntimeError, match="running turn"):
         runner.compact(tid, "s")
@@ -345,7 +345,7 @@ async def test_a_turn_cannot_start_while_a_revert_runs_git(runner, log, tid):
     )
     assert reverted["commit"]
     assert isinstance(rejected, RuntimeError)
-    assert "running turn" in str(rejected)
+    assert "running turn" in str(rejected) or "busy" in str(rejected)
     assert [(t["kind"], t["status"]) for t in log.turns(tid)] == [
         ("user", "done"),
         ("revert", "done"),
@@ -687,3 +687,41 @@ async def test_ndjson_mirror(log, tmp_path):
     mirror.close()
     lines = (tmp_path / "mirror" / "events.ndjson").read_text().splitlines()
     assert [json.loads(line) for line in lines] == log.events(tid)
+
+
+async def test_concurrent_crash_resumes_cannot_both_run(runner, log, tid):
+    """Two crash resumes of one thread: exactly one runs, the other gets ThreadBusy."""
+    from bakeoff.shared.runner import ThreadBusy
+
+    started = asyncio.Event()
+
+    async def hang(turn, tools, cancel):
+        started.set()
+        await asyncio.Event().wait()
+        yield Event("turn.end", {"stop": "end_turn", "steps": 1})
+
+    crashed = asyncio.create_task(runner.turn(FakeLoop(hang), tid, model=MODEL, user_text="go"))
+    await started.wait()
+    crashed.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await crashed
+
+    release = asyncio.Event()
+
+    async def slow_finish(turn, tools, cancel):
+        await release.wait()
+        yield item(turn, "final", {"role": "assistant", "content": "done"})
+        yield Event("turn.end", {"stop": "end_turn", "steps": 1})
+
+    first = asyncio.create_task(
+        runner.turn(FakeLoop(slow_finish), tid, model=MODEL, resume=Resume(kind="crash"))
+    )
+    await asyncio.sleep(0.05)
+    with pytest.raises(ThreadBusy):
+        await runner.turn(FakeLoop(slow_finish), tid, model=MODEL, resume=Resume(kind="crash"))
+    release.set()
+    assert (await first)["stop"] == "end_turn"
+    assert [(t["kind"], t["status"]) for t in log.turns(tid)] == [
+        ("user", "running"),
+        ("crash", "done"),
+    ]
