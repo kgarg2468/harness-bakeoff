@@ -61,6 +61,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 LOOP_TURNS = ("user", "approval", "crash")  # turn kinds that run a loop (not revert/compact)
 MODEL_TIMEOUT_S = 30.0  # a scenario request that hangs longer than this is a failure anyway
 CHILD_TIMEOUT_S = 60.0
+# What a child step runs after the interpreter: `bakeoff`, whose registry loads the thread's loop.
+WORKER: tuple[str, ...] = ("-m", "bakeoff.cli")
 STRAY_WAIT_S = 2.0  # how long tasks a loop left behind get to finish once cancelled
 _ONE_LINE = 160
 
@@ -299,9 +301,16 @@ class _ScenarioRun:
     loop: Loop  # set by `drive`
 
     def __init__(
-        self, sc: Scenario, impl: str, run_id: str, directory: Path, provider: FakeProvider
+        self,
+        sc: Scenario,
+        impl: str,
+        run_id: str,
+        directory: Path,
+        provider: FakeProvider,
+        worker: Sequence[str],
     ) -> None:
         self.sc, self.impl, self.run_id, self.dir = sc, impl, run_id, directory
+        self.worker = worker
         self.thread_id = f"{sc.id}-{impl}"
         self.limits = Limits(max_steps=sc.limits["max_steps"])
         # A fresh fakeprov cursor for every run: one provider may serve many runs (the test
@@ -429,8 +438,7 @@ class _ScenarioRun:
         """
         argv = [
             sys.executable,
-            "-m",
-            "bakeoff.cli",
+            *self.worker,
             command,
             self.thread_id,
             f"--db={self.ws.log_path}",
@@ -488,6 +496,7 @@ async def run_scenario(
     run_id: str,
     provider: FakeProvider,
     loop_factory: Callable[[], Loop] | None = None,
+    worker: Sequence[str] = WORKER,
 ) -> dict[str, Any]:
     """Run one scenario (an id in fakeprov/scenarios, or a path) for one loop, judge it, and
     write `out/runs/<run_id>/<scenario>/<impl>/result.json`. Returns the result:
@@ -497,7 +506,9 @@ async def run_scenario(
     "usage", "duration_ms", "passed", "error", "thread", "processes"}`.
 
     `provider` serves the scenario (its folder must hold it); `loop_factory` replaces the
-    registry's loop class (child processes still use the registry, by the loop's name).
+    registry's loop class in this process. Child processes run `python <worker> <command>` and
+    load the loop from the registry by its name, so a loop that is not registered needs a
+    `worker` that registers it first (as `tests/reference_worker.py` does).
     Raises DriverError if that directory exists: a run id is never reused.
     """
     path = (
@@ -512,7 +523,7 @@ async def run_scenario(
     except FileExistsError:
         raise DriverError(f"{directory} already exists: pick another --run-id") from None
     started = time.perf_counter()
-    run = _ScenarioRun(sc, impl, run_id, directory, provider)
+    run = _ScenarioRun(sc, impl, run_id, directory, provider, worker)
     captured = Captured()
     try:
         # I5 covers the loop's whole life, so output from its background tasks and threads

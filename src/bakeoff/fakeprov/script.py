@@ -417,6 +417,10 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
     call_ids: list[str] = []
     reasoning_ids: list[str] = []
     for n, exchange in enumerate(data["exchanges"]):
+        # A request can replay only reasoning that an earlier response sent (never its own).
+        replayed = exchange.get("expect", {}).get("reasoning_replayed", [])
+        if unsent := sorted(set(replayed) - set(reasoning_ids)):
+            fail(f"$.exchanges[{n}].expect", f"no earlier exchange sends reasoning {unsent}")
         respond = exchange["respond"]
         where = f"$.exchanges[{n}].respond"
         if (respond.get("status", 200) == 200) != ("stream" in respond):
@@ -444,12 +448,8 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
 
     referenced = set(data["expect"].get("tool_runs", {}))
     referenced |= set(data["expect"].get("tools_overlap", []))
-    replayed: set[str] = set()
     for exchange in data["exchanges"]:
         referenced |= set(exchange.get("expect", {}).get("tool_result_contains", {}))
-        replayed |= set(exchange.get("expect", {}).get("reasoning_replayed", []))
-    if unknown := sorted(replayed - set(reasoning_ids)):
-        fail("$.exchanges", f"unknown reasoning ids: {unknown}")
     steps = data["driver"]
     turns = 0  # steps that run a turn to its end in this process
     for i, step in enumerate(steps):
@@ -504,6 +504,8 @@ def reply(
         return rejected(400, f"request body is not JSON: {exc}")
     if problem := (_chat_body_problem if api == "chat" else _responses_body_problem)(body):
         return rejected(400, problem)
+    if api == "responses" and (malformed := _malformed_item(_input_items(body))):
+        return rejected(400, *malformed)
     if body.get("stream") is not True:
         return rejected(400, "the fake provider only serves stream=true")
     if index >= len(scenario.exchanges):
@@ -516,10 +518,10 @@ def reply(
             return rejected(400, *problem)
         failures = _expect_failures(expect, body, gap_ms)
     else:
-        if refused := _responses_strict(strict, body, scenario):
+        if refused := _responses_strict(strict, body, scenario, index):
             return refused
         failures = _body_failures(expect, body, gap_ms)
-        failures += _input_failures(expect, body, scenario)
+        failures += _input_failures(expect, body, scenario, index)
     if failures:
         return rejected(500, f"expect failed (exchange {index + 1}): " + "; ".join(failures))
 
@@ -832,6 +834,110 @@ def _responses_body_problem(body: object) -> str | None:
     return None
 
 
+type _Problem = tuple[str, str, str]  # (message, param, code) of the API's 400
+
+# The input item types this fake serves, with their required fields and those fields' JSON types.
+# The API checks these before anything else, so a malformed item is 400 whatever the script says.
+_ITEM_FIELDS: dict[str, dict[str, tuple[type, ...]]] = {
+    "message": {"role": (str,), "content": (str, list)},
+    "function_call": {"call_id": (str,), "name": (str,), "arguments": (str,)},
+    "function_call_output": {"call_id": (str,), "output": (str, list)},
+    "reasoning": {"id": (str,), "summary": (list,)},
+}
+_ROLES = ("user", "assistant", "system", "developer")
+_INPUT_PARTS = ("input_text", "input_image", "input_file")
+_OUTPUT_PARTS = ("output_text", "refusal")  # an assistant message's, replayed
+_JSON_TYPES: dict[type, str] = {
+    dict: "an object",
+    list: "an array",
+    str: "a string",
+    bool: "a boolean",
+    int: "an integer",
+    float: "a number",
+    type(None): "null",
+}
+
+
+def _malformed_item(items: list[dict[str, Any]]) -> _Problem | None:
+    """The API's 400 for the first input item whose shape it refuses, naming the field as it
+    does (`input[3].output`). Item types other than the four this fake serves are refused too."""
+    for n, item in enumerate(items):
+        at, kind = f"input[{n}]", _item_type(item)
+        if kind is None:
+            return _missing(f"{at}.type")
+        if not isinstance(kind, str) or kind not in _ITEM_FIELDS:
+            return _invalid_value(kind, tuple(_ITEM_FIELDS), f"{at}.type")
+        for key, types in _ITEM_FIELDS[kind].items():
+            if problem := _field_problem(item, key, types, at):
+                return problem
+        problem = None
+        match kind:
+            case "message" if item["role"] not in _ROLES:
+                problem = _invalid_value(item["role"], _ROLES, f"{at}.role")
+            case "message":
+                # Replayed assistant text must be output_text: input_text there is refused.
+                parts = _OUTPUT_PARTS if item["role"] == "assistant" else _INPUT_PARTS
+                problem = _malformed_parts(item["content"], parts, f"{at}.content")
+            case "function_call_output":
+                problem = _malformed_parts(item["output"], _INPUT_PARTS, f"{at}.output")
+            case "reasoning":
+                encrypted = item.get("encrypted_content")
+                if encrypted is not None and not isinstance(encrypted, str):
+                    problem = _invalid_type(f"{at}.encrypted_content", (str,), encrypted)
+                else:
+                    problem = _malformed_parts(item["summary"], ("summary_text",), f"{at}.summary")
+        if problem:
+            return problem
+    return None
+
+
+def _malformed_parts(parts: str | list[Any], types: tuple[str, ...], at: str) -> _Problem | None:
+    """The first content part the API refuses (a string is plain text, never refused)."""
+    for i, part in enumerate(parts if isinstance(parts, list) else []):
+        where = f"{at}[{i}]"
+        if not isinstance(part, dict):
+            return _invalid_type(where, (dict,), part)
+        if problem := _field_problem(part, "type", (str,), where):
+            return problem
+        if part["type"] not in types:
+            return _invalid_value(part["type"], types, where)
+        if part["type"].endswith("_text") and (
+            problem := _field_problem(part, "text", (str,), where)
+        ):
+            return problem
+    return None
+
+
+def _field_problem(
+    obj: dict[str, Any], key: str, types: tuple[type, ...], at: str
+) -> _Problem | None:
+    """The API's 400 if field `key` of the object at `at` is missing or of the wrong JSON type."""
+    if key not in obj:
+        return _missing(f"{at}.{key}")
+    if not isinstance(obj[key], types):
+        return _invalid_type(f"{at}.{key}", types, obj[key])
+    return None
+
+
+def _missing(param: str) -> _Problem:
+    return f"Missing required parameter: '{param}'.", param, "missing_required_parameter"
+
+
+def _invalid_type(param: str, types: tuple[type, ...], got: object) -> _Problem:
+    names = [_JSON_TYPES[t] for t in types]
+    want = names[0] if len(names) == 1 else "one of " + " or ".join(names)
+    message = (
+        f"Invalid type for '{param}': expected {want}, but got {_JSON_TYPES[type(got)]} instead."
+    )
+    return message, param, "invalid_type"
+
+
+def _invalid_value(got: object, supported: tuple[str, ...], param: str) -> _Problem:
+    *rest, last = [f"'{value}'" for value in supported]
+    listed = f"{', '.join(rest)}{',' if len(rest) > 1 else ''} and {last}" if rest else last
+    return f"Invalid value: '{got}'. Supported values are: {listed}.", param, "invalid_value"
+
+
 def _input_items(body: dict[str, Any]) -> list[dict[str, Any]]:
     """The request's `input` as items (a string is one user message, as the API reads it)."""
     items = body["input"]
@@ -890,18 +996,19 @@ def _done_reasoning(spec: dict[str, Any], summarized: bool) -> dict[str, Any]:
     }
 
 
-def _scripted_reasoning(scenario: Scenario) -> dict[str, dict[str, Any]]:
-    """Reasoning id -> the op of every scripted reasoning item, done or cut short."""
+def _scripted_reasoning(scenario: Scenario, before: int) -> dict[str, dict[str, Any]]:
+    """Reasoning id -> the op of every reasoning item (done or cut short) scripted for the
+    requests before request `before` (0-based) of a cursor: the only ones it can have got."""
     return {
         op["reasoning_item"]["id"]: op
-        for exchange in scenario.exchanges
+        for exchange in scenario.exchanges[:before]
         for op in exchange["respond"].get("stream", [])
         if "reasoning_item" in op
     }
 
 
 def _responses_strict(
-    strict: dict[str, Any], body: dict[str, Any], scenario: Scenario
+    strict: dict[str, Any], body: dict[str, Any], scenario: Scenario, index: int
 ) -> Reply | None:
     for key in strict.get("reject_params", []):
         if key in body:
@@ -909,8 +1016,9 @@ def _responses_strict(
     if not strict.get("reject_unencrypted_reasoning"):
         return None
     # As the API does with `store: false`: a reasoning item is known only by its encrypted
-    # content, which must be the complete one a done event sent for that id.
-    scripted = _scripted_reasoning(scenario)
+    # content, which must be the complete one a done event sent for that id. A later
+    # exchange's item was never sent, so its scripted content does not verify either.
+    scripted = _scripted_reasoning(scenario, index)
     for item in _input_items(body):
         if _item_type(item) != "reasoning":
             continue
@@ -928,8 +1036,11 @@ def _responses_strict(
     return None
 
 
-def _input_failures(expect: dict[str, Any], body: dict[str, Any], scenario: Scenario) -> list[str]:
-    """The Responses `expect` checks on `input` (after the system prompt) and the system prompt."""
+def _input_failures(
+    expect: dict[str, Any], body: dict[str, Any], scenario: Scenario, index: int
+) -> list[str]:
+    """The Responses `expect` checks on `input` (after the system prompt) and the system prompt
+    of request `index`."""
     system, items = _split_system(body)
     failures = []
     if "system_contains" in expect and expect["system_contains"] not in system:
@@ -969,7 +1080,7 @@ def _input_failures(expect: dict[str, Any], body: dict[str, Any], scenario: Scen
                 failures.append(f"input item {i} {key} is {got[key]!r}, expected {check[key]!r}")
         if "contains" in check and check["contains"] not in _item_text(item):
             failures.append(f"input item {i} lacks {check['contains']!r}")
-    scripted = _scripted_reasoning(scenario)
+    scripted = _scripted_reasoning(scenario, index)  # the loader checks each id is in it
     for rid in expect.get("reasoning_replayed", []):
         # A thread's model config is fixed, so this request asks for summaries if the one that
         # got the item did.
