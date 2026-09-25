@@ -1,14 +1,16 @@
 # Ported from Pi (MIT): packages/ai/src/api/{openai-responses.ts,openai-responses-shared.ts,openai-prompt-cache.ts} @ 5fd446ca1843682e8da3fec4ceb71c42f56fbace
-# Changes: Python; one request shape (store false); done output items replayed verbatim; calls used once done.
+# Changes: Python; one request shape (store false, encrypted reasoning always asked for); done output items replayed verbatim; calls used once done.
 """OpenAI's Responses API: the request's fixed part, history items as `input` items, and the
 streamed-event accumulator.
 
-From Pi: the request parameters (`store: false` with `include: ["reasoning.encrypted_content"]`
-when reasoning is on, a reasoning summary unless the effort is "none", `max_output_tokens` of
-at least 16, a `prompt_cache_key` of at most 64 characters, flat function tools with
-`strict: false`, the system prompt as a developer message), the conversion of chat-shaped
-messages to input items, which events carry text and reasoning (a blank line between summary
-parts; between messages too, which Pi keeps apart as blocks), and the ends of a stream:
+From Pi: the request parameters (`store: false` with `include: ["reasoning.encrypted_content"]`,
+here always, not only when reasoning is on; a reasoning summary unless the effort is "none",
+`max_output_tokens` of at least 16, a `prompt_cache_key` of at most 64 characters, flat function
+tools with `strict: false`, the system prompt as a developer message), the conversion of
+chat-shaped messages to input items, replaying output items without their ids when their
+reasoning item is not replayed (Pi: calls from another model), which events carry text and
+reasoning (a blank line between summary parts; between messages too, which Pi keeps apart as
+blocks), and the ends of a stream:
 `response.completed`, `.incomplete` (max_output_tokens is a truncation, any other reason an
 error), `.failed`, the `error` event, and a stream that ends before any of them.
 
@@ -56,7 +58,9 @@ def static_body(
         # A summary streams while the model reasons; the effort "none" has nothing to sum up.
         auto = {} if model.reasoning.get("effort") == "none" else {"summary": "auto"}
         body["reasoning"] = {**auto, **model.reasoning}
-        body["include"] = ["reasoning.encrypted_content"]
+    # Asked for even without a reasoning config: a model may reason at its default effort, and
+    # with store false its reasoning can go back only as this content (none if it did not reason).
+    body["include"] = ["reasoning.encrypted_content"]
     if tools:
         body["tools"] = [
             {
@@ -111,6 +115,7 @@ class ResponsesStream(Stream):
         super().__init__()
         self.native: list[dict[str, Any]] = []
         self.parts = 0  # reasoning summary parts so far, over all reasoning items
+        self.unpaired = False  # the last reasoning item was dropped (see _done)
 
     def feed(self, event: dict[str, Any]) -> Event | StreamedCall | None:
         """Take one event. Returns an event to publish, or a function call that just completed."""
@@ -146,11 +151,19 @@ class ResponsesStream(Stream):
         return None
 
     def _done(self, item: dict[str, Any]) -> StreamedCall | None:
-        # With store false the API knows a reasoning item only by its encrypted_content: one
-        # without it could never be replayed (404), so it is not kept.
-        if item.get("type") != "reasoning" or item.get("encrypted_content"):
-            self.native.append(item)
-        if item.get("type") != "function_call":
+        kind = item.get("type")
+        if kind == "reasoning":
+            # With store false the API knows a reasoning item only by its encrypted_content: one
+            # without it could never be replayed (404), so it is not kept.
+            self.unpaired = not item.get("encrypted_content")
+            if not self.unpaired:
+                self.native.append(item)
+            return None
+        # The API pairs an output item's id with the reasoning item before it, and refuses the id
+        # without that item ("provided without its required 'reasoning' item"): after a dropped
+        # one, the items go back without their ids, as new input.
+        self.native.append({k: v for k, v in item.items() if k != "id"} if self.unpaired else item)
+        if kind != "function_call":
             return None
         call = self.calls[item["call_id"]] = StreamedCall()
         call.id, call.name, call.parts = item["call_id"], item["name"], [item["arguments"]]

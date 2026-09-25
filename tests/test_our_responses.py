@@ -178,14 +178,12 @@ async def test_request_shape_and_a_reasoned_answer() -> None:
 async def test_calls_start_once_done_and_output_items_replay_verbatim() -> None:
     tools = StubTools()
     seen: list[tuple[bool, int]] = []
-    plain = {"id": "rs_2", "type": "reasoning", "summary": []}  # no encrypted_content
     describe = fcall("c0", "describe_component", '{"name": "a"}')
     write = fcall("c1", "write_file", '{"path": "x.pipe", "content": "{}"}')
 
     async def body() -> AsyncIterator[bytes]:
         yield stream_bytes(
             done(REASONING),
-            done(plain),
             event("response.function_call_arguments.delta", delta='{"name": "a"}'),
             done(describe),
         )
@@ -201,7 +199,7 @@ async def test_calls_start_once_done_and_output_items_replay_verbatim() -> None:
     assert [e["call_id"] for e in of(events, "tool_call.ready")] == ["c0", "c1"]
     assert tools.run_counts == {"c0": 1, "c1": 1}
     reply = items(events)[0]
-    assert reply.native == [REASONING, describe, write]  # reasoning without its content is dropped
+    assert reply.native == [REASONING, describe, write]
     assert [c["id"] for c in reply.message["tool_calls"]] == ["c0", "c1"]
     first_body, second_body = server.bodies
     assert json.loads(second_body)["input"][1:] == [
@@ -214,6 +212,32 @@ async def test_calls_start_once_done_and_output_items_replay_verbatim() -> None:
     ]
     assert second_body.startswith(first_body[:-2] + b",")  # the same bytes, then the new items
     assert server.paths == ["/v1/responses"] * 2
+
+
+async def test_reasoning_at_the_default_effort_goes_back_with_its_calls() -> None:
+    """No reasoning config: the model may still reason, so its encrypted content is asked for.
+    A reasoning item that comes without it anyway is dropped (it could never be replayed), and
+    the items after it go back without their ids, which the API would pair with it."""
+    plain = {"id": "rs_2", "type": "reasoning", "summary": []}  # no encrypted_content
+    say = {**message("On it."), "phase": "commentary"}
+    describe = fcall("c0", "describe_component", '{"name": "a"}')
+    server = Recorder(
+        response(done(REASONING), done(plain), done(say), done(describe), completed()),
+        answer("done"),
+    )
+    first = user("go")
+    events = await run(server.loop(), [first], StubTools(), model=replace(MODEL, reasoning=None))
+    first_body, second_body = (json.loads(b) for b in server.bodies)
+    assert "reasoning" not in first_body
+    assert first_body["include"] == ["reasoning.encrypted_content"]
+    unpaired = [{k: v for k, v in it.items() if k != "id"} for it in (say, describe)]
+    assert items(events)[0].native == [REASONING, *unpaired]
+    assert second_body["input"][1:] == [
+        first.message,
+        REASONING,  # kept: its items keep their ids
+        *unpaired,
+        {"type": "function_call_output", "call_id": "c0", "output": "describe_component ok"},
+    ]
 
 
 @pytest.mark.parametrize(
@@ -319,10 +343,6 @@ def test_request_options_and_items_without_native() -> None:
     assert body["temperature"] == 0.2 and body["max_output_tokens"] == 16
     assert body["reasoning"] == {"effort": "none"} and len(body["prompt_cache_key"]) == 64
     assert "tools" not in body
-    assert (
-        not {"reasoning", "include"}
-        & static_body(replace(MODEL, reasoning=None), "", [], "t").keys()
-    )
     # Items the runner wrote, or a chat completions turn wrote, are converted.
     tool_calls = [{"id": "c0", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
     assistant = Item(
