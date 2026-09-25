@@ -463,16 +463,22 @@ async def test_max_steps_stops_after_exactly_that_many_requests(loop):
         Reply([*tool_call(0, f"c{i}", "read_file", '{"path": "a"}'), done("tool_calls")])
         for i in range(3)
     ]
+    tools = StubTools()
     with SSEServer(*looping) as srv:
-        events = await run(
-            loop, turn([user("go")], config(srv), limits=Limits(max_steps=2)), StubTools()
-        )
+        events = await run(loop, turn([user("go")], config(srv), limits=Limits(max_steps=2)), tools)
 
     assert len(srv.bodies) == 2
     assert of(events, "turn.end") == [{"stop": "max_steps", "steps": 2}]
     calls = [c["id"] for i in items(events) for c in i.message.get("tool_calls", [])]
-    results = [i.message["tool_call_id"] for i in items(events) if i.message["role"] == "tool"]
-    assert calls == results == ["c0", "c1"]  # no orphan calls
+    results = {
+        i.message["tool_call_id"]: i.message["content"]
+        for i in items(events)
+        if i.message["role"] == "tool"
+    }
+    assert calls == list(results) == ["c0", "c1"]  # no orphan calls
+    # c1 came in the last allowed response: its result could never be sent, so it does not run.
+    assert [c.id for c in tools.runs] == ["c0"]
+    assert results["c1"] == "Not run: the turn reached its step limit."
 
 
 async def test_cost_without_provider_cost_is_labelled(loop):

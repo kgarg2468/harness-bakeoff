@@ -37,6 +37,7 @@ from pydantic_ai import (
     PartStartEvent,
     RunCancelled,
     RunContext,
+    SkipToolExecution,
     TextPart,
     TextPartDelta,
     ThinkingPart,
@@ -68,14 +69,17 @@ from bakeoff.shared.contract import (
 
 # The OpenAI SDK retries inside one call and numbers the attempts only in this request header.
 _RETRY_HEADER = "x-stainless-retry-count"
+_STEP_CAP_RESULT = "Not run: the turn reached its step limit."
 
 
 @dataclass
 class _Turn:
-    """Per-turn state: the run's deps (tools reach it as `ctx.deps`) and the HTTP hooks' target."""
+    """Per-turn state: the run's deps (tools and hooks reach it as `ctx.deps`) and the HTTP
+    hooks' target."""
 
     turn_id: str
     tools: ToolHost
+    max_steps: int
     out: asyncio.Queue[Event | None] = field(default_factory=asyncio.Queue)
     steps: int = 0
     failure: tuple[int, float] | None = None  # (status, monotonic time) of the last failed attempt
@@ -159,7 +163,7 @@ class PydanticLoop:
     async def run_turn(
         self, turn: TurnInput, tools: ToolHost, cancel: asyncio.Event
     ) -> AsyncIterator[Event]:
-        state = _Turn(turn.turn_id, tools)
+        state = _Turn(turn.turn_id, tools, turn.limits.max_steps)
         task = asyncio.create_task(self._drive(turn, state, cancel))
         try:
             while (event := await state.out.get()) is not None:
@@ -264,7 +268,7 @@ class PydanticLoop:
                 output_type=[str, DeferredToolRequests],
                 toolsets=[toolset],
                 capabilities=[
-                    Hooks(after_model_request=_billed_cost),
+                    Hooks(after_model_request=_billed_cost, before_tool_execute=_step_cap),
                     ProcessHistory(mapping.replayable),
                 ],
                 name=self.name,
@@ -305,6 +309,16 @@ def _tool(spec: ToolSpec) -> Tool[_Turn]:
 
 def _needs_approval(ctx: RunContext[_Turn], tool_def: ToolDefinition, args: dict[str, Any]) -> bool:
     return ctx.deps.tools.check(_running_call(ctx)) == "ask"
+
+
+def _step_cap(
+    ctx: RunContext[_Turn], /, *, call: ToolCallPart, tool_def: ToolDefinition, args: Any
+) -> Any:
+    """The step cap is checked before the next request, so the calls of the last allowed response
+    would run although their results can never be sent. Skip them; each still gets a result."""
+    if ctx.usage.requests >= ctx.deps.max_steps:
+        raise SkipToolExecution(_STEP_CAP_RESULT)
+    return args
 
 
 def _running_call(ctx: RunContext[_Turn]) -> ToolCall:
