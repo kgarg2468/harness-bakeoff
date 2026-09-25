@@ -368,16 +368,23 @@ OpenCode's `edit.ts` credits the approaches behind its replacer chain, and so
 
 ## Pi (MIT)
 
-`src/bakeoff/our_version/compat.py`, `src/bakeoff/our_version/provider.py` and
-`src/bakeoff/our_version/retry.py` contain code ported (TypeScript to Python) from
-[earendil-works/pi](https://github.com/earendil-works/pi) at commit
-`5fd446ca1843682e8da3fec4ceb71c42f56fbace`:
+`src/bakeoff/our_version/compat.py`, `src/bakeoff/our_version/provider.py`,
+`src/bakeoff/our_version/responses.py` and `src/bakeoff/our_version/retry.py` contain code
+ported (TypeScript to Python) from [earendil-works/pi](https://github.com/earendil-works/pi) at
+commit `5fd446ca1843682e8da3fec4ceb71c42f56fbace`:
 
 - `packages/ai/src/api/openai-completions.ts`: endpoint compat flags, request parameters,
   `reasoning_details` merging, the streamed reasoning field names and usage parsing
   (`compat.py`); tool-call delta accumulation, the finish_reason and stream-end checks,
   skipping assistant messages with neither content nor tool calls on replay, and appending
   OpenRouter's `metadata.raw` to error messages (`provider.py`)
+- `packages/ai/src/api/openai-responses.ts`, `packages/ai/src/api/openai-responses-shared.ts`
+  and `packages/ai/src/api/openai-prompt-cache.ts`: the Responses API request parameters
+  (`store: false` with encrypted reasoning, the reasoning summary, the `max_output_tokens`
+  floor, the `prompt_cache_key` limit, flat function tools, the developer message), converting
+  messages and tool results to input items, which stream events carry text and reasoning, and
+  the terminal-event and error handling (`responses.py`); the Responses API usage field names
+  (`compat.py`)
 - `packages/ai/src/utils/retry.ts`, `packages/ai/src/utils/provider-retry.ts`: retryable-error
   classification, `Retry-After` parsing, backoff
 - `packages/ai/src/utils/overflow.ts`: context-overflow detection

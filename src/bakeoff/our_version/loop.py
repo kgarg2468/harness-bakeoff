@@ -1,4 +1,8 @@
-"""The lean loop: one streamed request per step, eager and parallel tools, cheap cancel."""
+"""The lean loop: one streamed request per step, eager and parallel tools, cheap cancel.
+
+It speaks chat completions, or (`ModelConfig.kind == "openai_responses"`) OpenAI's Responses API:
+the same loop, with another request body and another reader of the stream (`responses.py`).
+"""
 
 from __future__ import annotations
 
@@ -24,6 +28,8 @@ from .provider import (
     replayed,
     stream_error,
 )
+from .responses import ResponsesStream, input_json
+from .responses import static_body as responses_body
 from .retry import backoff
 
 CANCELLED = "Cancelled by user"
@@ -91,7 +97,12 @@ class OurLoop:
         wire = self._wires.pop(turn.thread_id, None)
         if wire is None or wire.key != key:
             session = turn.model.session_id or turn.thread_id
-            wire = Wire(key, static_body(turn.model, turn.system, tools, session))
+            if turn.model.kind == "openai_responses":
+                wire = Wire(
+                    key, responses_body(turn.model, turn.system, tools, session), input_json
+                )
+            else:
+                wire = Wire(key, static_body(turn.model, turn.system, tools, session))
         self._wires[turn.thread_id] = wire  # re-inserted last: most recently used
         if len(self._wires) > _MAX_THREADS:
             del self._wires[next(iter(self._wires))]
@@ -109,7 +120,9 @@ class _Turn:
         specs = tools.specs()
         self.read_only = {s.name for s in specs if s.read_only}
         self.wire = loop._wire(turn, specs)
-        self.url = self.model.base_url.rstrip("/") + "/chat/completions"
+        self.responses = self.model.kind == "openai_responses"
+        path = "/responses" if self.responses else "/chat/completions"
+        self.url = self.model.base_url.rstrip("/") + path
         self.headers = {
             "Authorization": f"Bearer {self.model.api_key}",
             "Content-Type": "application/json",
@@ -164,7 +177,9 @@ class _Turn:
                 body = self.wire.body(self.items)
                 for attempt in itertools.count(1):
                     yield Event("request.start", {"step": self.steps, "attempt": attempt})
-                    stream, failure = Stream(), None
+                    stream = ResponsesStream() if self.responses else Stream()
+                    feed = stream.feed if isinstance(stream, ResponsesStream) else None
+                    failure = None
                     try:
                         lines = (await self._open(body)).aiter_lines()
                         async for line in lines:
@@ -175,6 +190,14 @@ class _Turn:
                                 stream.done = True
                                 break
                             chunk = json.loads(data)
+                            if feed is not None:  # Responses API: one named event per chunk
+                                if (out := feed(chunk)) is not None:
+                                    yield (
+                                        out if isinstance(out, Event) else self._ready(out, stream)
+                                    )
+                                if stream.done:
+                                    break
+                                continue
                             if (error := chunk.get("error")) is not None:
                                 raise stream_error(error)
                             choice = (chunk.get("choices") or _NO_CHOICE)[0]
@@ -239,7 +262,7 @@ class _Turn:
                 for call in stream.calls.values():
                     if not call.ready:
                         yield self._ready(call)
-                yield self._item(stream.message(), usage=usage)
+                yield self._item(stream.message(), usage=usage, native=stream.native)
                 yield Event("usage", usage)
                 if calls := stream.tool_calls():
                     async for event in self._tools_within_cap(calls):
@@ -433,8 +456,9 @@ class _Turn:
         *,
         status: Literal["complete", "incomplete"] = "complete",
         usage: dict[str, Any] | None = None,
+        native: Any = None,
     ) -> Event:
-        item = Item(uuid.uuid4().hex, self.turn.turn_id, message, status, usage=usage)
+        item = Item(uuid.uuid4().hex, self.turn.turn_id, message, status, native, usage)
         if status == "complete":
             self.items.append(item)
         return Event("item", {"item": item})

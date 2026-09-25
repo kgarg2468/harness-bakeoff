@@ -1,5 +1,5 @@
 # Ported from Pi (MIT): packages/ai/src/api/openai-completions.ts @ 5fd446ca1843682e8da3fec4ceb71c42f56fbace
-# Changes: Python; four compat flags with defaults by ModelConfig.kind; reasoning_details also merged by index.
+# Changes: Python; four compat flags with defaults by ModelConfig.kind; reasoning_details also merged by index; Responses API usage names.
 """Per-endpoint request quirks, reasoning_details merging and usage parsing.
 
 Not ported from Pi (this harness does not need them): provider/URL auto-detection, `store`,
@@ -107,17 +107,20 @@ def merge_detail(details: list[dict[str, Any]], fragment: dict[str, Any]) -> Non
 
 
 def usage_fields(usage: dict[str, Any] | None) -> dict[str, Any]:
-    """Token counts and provider-billed cost from an OpenAI/OpenRouter `usage` object."""
+    """Token counts and provider-billed cost from a `usage` object: chat completions (OpenAI,
+    OpenRouter) or the Responses API (`input_tokens`, `input_tokens_details`, ...)."""
     u = usage or {}
     cost = u.get("cost")
+    tokens_in = u.get("prompt_tokens_details") or u.get("input_tokens_details") or {}
+    tokens_out = u.get("completion_tokens_details") or u.get("output_tokens_details") or {}
     return {
-        "input_tokens": u.get("prompt_tokens") or 0,
-        "output_tokens": u.get("completion_tokens") or 0,
-        "cached_tokens": (u.get("prompt_tokens_details") or {}).get("cached_tokens")
+        "input_tokens": u.get("prompt_tokens") or u.get("input_tokens") or 0,
+        "output_tokens": u.get("completion_tokens") or u.get("output_tokens") or 0,
+        "cached_tokens": tokens_in.get("cached_tokens")
         or u.get("prompt_cache_hit_tokens")
         or u.get("cached_tokens")
         or 0,
-        "reasoning_tokens": (u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0,
+        "reasoning_tokens": tokens_out.get("reasoning_tokens") or 0,
         "cost_usd": float(cost) if cost is not None else 0.0,
         "cost_source": "provider" if cost is not None else "none",
     }
