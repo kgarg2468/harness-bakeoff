@@ -1,7 +1,7 @@
-"""`bakeoff` command line: scenarios and the cross-process thread commands.
+"""`bakeoff` command line: scenarios, live runs, chat, and the cross-process thread commands.
 
-The logic lives in `bakeoff.shared.scenario`; this module only parses arguments, installs the
-network guard and prints.
+The logic lives in `bakeoff.shared.scenario` and `bakeoff.live`; this module only parses
+arguments, installs the network guard and prints.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from bakeoff import loops
+from bakeoff import live, loops
 from bakeoff.fakeprov.__main__ import main as fakeprov_main
 from bakeoff.shared import netguard, scenario
 from bakeoff.shared.contract import Limits, Resume
@@ -51,6 +51,27 @@ def _worker_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--max-steps", type=int, default=Limits().max_steps)
     parser.add_argument("--engine-delay-ms", type=int, default=0, help="MockEngine delay")
+    parser.add_argument("--env-file", type=Path, help="env file with OPENAI_API_KEY (live threads)")
+
+
+def _model_args(parser: argparse.ArgumentParser, *, impl_default: str | None) -> None:
+    if impl_default is None:
+        parser.add_argument("--impl", type=_impls, required=True, help="loops, e.g. our,pydantic")
+    else:
+        parser.add_argument("--impl", default=impl_default, choices=list(loops.REGISTRY))
+    parser.add_argument("--model", default="gpt-6-luna")
+    parser.add_argument("--reasoning", help="reasoning effort, e.g. none, low, high")
+    parser.add_argument("--max-steps", type=int, default=8)
+    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--env-file", type=Path, help=f"env file with {live.KEY_NAME}")
+    parser.add_argument(
+        "--base-url",
+        default=live.OPENAI_BASE_URL,
+        help="chat completions endpoint; {impl} is replaced by the loop name",
+    )
+    parser.add_argument("--kind", choices=["openai_compat", "openrouter"], default="openai_compat")
+    parser.add_argument("--out", type=Path, default=Path("out"))
+    parser.add_argument("--run-id", help="default: a new timestamped id")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -64,6 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--impl", type=_impls, help="loops, e.g. our,pydantic (default: all built)")
     p.add_argument("--out", type=Path, default=Path("out"))
     p.add_argument("--run-id", help="default: a new timestamped id")
+
+    p = sub.add_parser("live", help="one prompt against a real model, per loop, side by side")
+    _model_args(p, impl_default=None)
+    p.add_argument("--prompt", required=True)
+    p.add_argument("--interactive", action="store_true", help="ask before writes (stdin)")
+
+    p = sub.add_parser("chat", help="interactive REPL on one loop, with approval prompts")
+    _model_args(p, impl_default="our")
 
     p = sub.add_parser("turn", help="run one user turn of a thread (a worker process)")
     _worker_args(p)
@@ -104,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         return _COMMANDS[args.command](args)
-    except (scenario.DriverError, RuntimeError, ValueError) as exc:
+    except (scenario.DriverError, live.LiveError, RuntimeError, ValueError) as exc:
         print(f"bakeoff {args.command}: error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -152,6 +181,69 @@ def _scenario(args: argparse.Namespace) -> int:
     return 1 if scenario.unexpected(summary) else 0
 
 
+def _live_model(args: argparse.Namespace) -> live.LiveModel:
+    live.guard_network(args.base_url)  # before anything can connect
+    return live.LiveModel(
+        model=args.model,
+        base_url=args.base_url,
+        api_key=live.resolve_api_key(args.base_url, args.env_file),
+        kind=args.kind,
+        reasoning=args.reasoning,
+        max_tokens=args.max_tokens,
+    )
+
+
+def _live(args: argparse.Namespace) -> int:
+    model = _live_model(args)
+    impls = _usable(args.impl)
+    if not impls:
+        return 2
+    term = live.open_terminal()
+    results = asyncio.run(
+        live.run_live(
+            impls,
+            model,
+            args.prompt,
+            out=args.out,
+            run_id=args.run_id or scenario.new_run_id(),
+            term=term,
+            max_steps=args.max_steps,
+            ask=live.stdin_ask(term) if args.interactive else None,
+        )
+    )
+    term.write("\n" + live.format_side_by_side(results) + "\n")
+    term.write(f"results: {args.out / 'live' / results[0]['run_id']}\n")
+    _close(term)
+    return 0 if all(r["passed"] for r in results) else 1
+
+
+def _chat(args: argparse.Namespace) -> int:
+    model = _live_model(args)
+    if not _usable([args.impl]):
+        return 2
+    term = live.open_terminal()
+    result = asyncio.run(
+        live.chat(
+            args.impl,
+            model,
+            out=args.out,
+            run_id=args.run_id or scenario.new_run_id(),
+            term=term,
+            ask=live.stdin_ask(term),
+            max_steps=args.max_steps,
+        )
+    )
+    term.write(f"\nresults: {args.out / 'live' / result['run_id'] / args.impl}\n")
+    _close(term)
+    return 0
+
+
+def _close(term: Any) -> None:
+    term.flush()
+    if term is not sys.stdout:  # our own descriptor (see live.open_terminal)
+        term.close()
+
+
 def _pending(args: argparse.Namespace) -> list[str]:
     log = SessionLog(args.db)
     try:
@@ -169,7 +261,8 @@ def _worker(args: argparse.Namespace) -> int:
         log.close()
     if thread is None:
         raise scenario.DriverError(f"unknown thread {args.thread} in {args.db}")
-    netguard.install()
+    base_url = thread["meta"]["model"]["base_url"]
+    live.guard_network(base_url)
     sinks = []
     user_text, resume = None, None
     if args.command == "turn":
@@ -189,7 +282,7 @@ def _worker(args: argparse.Namespace) -> int:
         scenario.worker_turn(
             args.db,
             args.thread,
-            api_key="dummy",  # scenario threads talk to the local fake provider
+            api_key=live.resolve_api_key(base_url, args.env_file),
             user_text=user_text,
             resume=resume,
             max_steps=args.max_steps,
@@ -224,6 +317,8 @@ def _fakeprov(args: argparse.Namespace) -> int:
 
 _COMMANDS = {
     "scenario": _scenario,
+    "live": _live,
+    "chat": _chat,
     "turn": _worker,
     "approve": _worker,
     "deny": _worker,
