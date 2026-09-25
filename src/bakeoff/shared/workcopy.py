@@ -136,17 +136,23 @@ class WorkCopy:
         await self._git("commit", "-q", "--allow-empty", "--no-edit")
         return await self._head_change()
 
-    async def recover(self, sha: str | None) -> None:
-        """Clean up after a worker that died while git was running.
+    async def recover(self, sha: str | None, *, keep: bool = True) -> None:
+        """Clean up after git: a worker that died while git ran, or a failed turn.
 
         Removes a stale index lock and moves HEAD back to `sha` (None: the initial commit) if
-        commits landed after it that no turn recorded. Their changes stay staged, so the next
-        commit includes them. Call it only while holding the thread's lock: git processes inherit
-        it, so then none of them can still be running.
+        commits landed after it that no turn recorded. With `keep`, their changes (and any
+        other changes) stay staged, so the next commit includes them; without it, a revert in
+        progress is aborted and the index and files are reset to `sha`, dropping them. Call it
+        only while holding the thread's lock: git processes inherit it, so then none of them
+        can still be running.
         """
         (self.root / ".git" / "index.lock").unlink(missing_ok=True)
         target = sha or (await self._git("rev-list", "--max-parents=0", "HEAD")).split()[0]
-        if await self.head() != target:
+        if not keep:
+            with suppress(RuntimeError):  # fails if no revert is in progress
+                await self._git("revert", "--abort")
+            await self._git("reset", "-q", "--hard", target)
+        elif await self.head() != target:
             await self._git("reset", "-q", "--soft", target)
 
     async def head(self) -> str:

@@ -168,20 +168,30 @@ class SessionLog:
         stop: str | None = None,
         pending: list[str] | None = None,
         commit_sha: str | None = None,
+        events: Iterable[EventRow] = (),
+        item: Item | None = None,
     ) -> None:
-        """Record how a turn ended (sets `ended_us` unless the status is "running")."""
-        self._db.execute(
-            "UPDATE turns SET status = ?, stop = ?, pending = ?, commit_sha = ?, ended_us = ?"
-            " WHERE id = ?",
-            (
-                status,
-                stop,
-                None if pending is None else json.dumps(pending),
-                commit_sha,
-                None if status == "running" else now_us(),
-                turn_id,
-            ),
-        )
+        """Record how a turn ended (sets `ended_us` unless the status is "running"), in one
+        transaction with its last `events` and, if given, a last `item` of its thread."""
+        with self._tx() as db:
+            if item is not None:
+                (thread_id,) = db.execute(
+                    "SELECT thread FROM turns WHERE id = ?", (turn_id,)
+                ).fetchone()
+                self._insert_item(db, thread_id, item)
+            self._insert_events(db, events)
+            db.execute(
+                "UPDATE turns SET status = ?, stop = ?, pending = ?, commit_sha = ?, ended_us = ?"
+                " WHERE id = ?",
+                (
+                    status,
+                    stop,
+                    None if pending is None else json.dumps(pending),
+                    commit_sha,
+                    None if status == "running" else now_us(),
+                    turn_id,
+                ),
+            )
 
     def append_late(self, turn_id: str, event: dict[str, Any]) -> None:
         """Add a tool event that came after the loop's `turn.end` to the turn row's `late` list.
@@ -220,16 +230,21 @@ class SessionLog:
 
     def append_item(self, thread_id: str, item: Item, events: Iterable[EventRow] = ()) -> int:
         """Append an item (seq = its position in history) plus `events`, in one transaction."""
-        data = json.dumps(item_to_json(item))
         with self._tx() as db:
-            (seq,) = db.execute(
-                "SELECT COALESCE(MAX(seq) + 1, 0) FROM items WHERE thread = ?", (thread_id,)
-            ).fetchone()
-            db.execute(
-                "INSERT INTO items VALUES (?, ?, ?, ?, ?)",
-                (thread_id, seq, item.turn_id, item.id, data),
-            )
+            seq = self._insert_item(db, thread_id, item)
             self._insert_events(db, events)
+        return seq
+
+    @staticmethod
+    def _insert_item(db: sqlite3.Connection, thread_id: str, item: Item) -> int:
+        data = json.dumps(item_to_json(item))
+        (seq,) = db.execute(
+            "SELECT COALESCE(MAX(seq) + 1, 0) FROM items WHERE thread = ?", (thread_id,)
+        ).fetchone()
+        db.execute(
+            "INSERT INTO items VALUES (?, ?, ?, ?, ?)",
+            (thread_id, seq, item.turn_id, item.id, data),
+        )
         return seq
 
     def items(self, thread_id: str) -> list[Item]:
