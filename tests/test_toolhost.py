@@ -224,3 +224,27 @@ async def test_parallel_runs_overlap(make, events):
 def test_invalid_rules_fail_fast(tmp_path):
     with pytest.raises(ValueError):
         build_toolhost(tmp_path, {"*": "maybe"}, lambda e: None)
+
+
+@pytest.mark.parametrize(
+    ("rules", "name", "args", "error"),
+    [
+        (None, "write_file", {"path": "a.txt", "content": "x"}, None),
+        (None, "write_file", "{not json", "invalid_args"),
+        (None, "write_file", {"path": "a.txt"}, "invalid_args"),
+        (None, "no_such_tool", {}, "invalid_args"),
+        (
+            {"*": "allow", "write_file": "deny"},
+            "write_file",
+            {"path": "a.txt", "content": "x"},
+            "denied",
+        ),
+        (None, "write_file", {"path": "../escape.txt", "content": "x"}, "denied"),
+        (None, "read_file", {"path": "missing.txt"}, "failed"),
+    ],
+)
+async def test_result_error_kind(make, rules, name, args, error):
+    """ToolResult.error says why a call failed, so loops can map it onto their own idioms."""
+    result = await make(rules).run(call(name, args))
+    assert result.error == error
+    assert result.ok is (error is None)

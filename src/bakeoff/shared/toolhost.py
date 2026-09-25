@@ -13,6 +13,7 @@ from jsonschema.exceptions import best_match
 
 from bakeoff.shared import permissions
 from bakeoff.shared.contract import Decision, Event, ToolCall, ToolResult, ToolSpec
+from bakeoff.shared.contract import ToolError as ToolErrorKind
 from bakeoff.shared.engine.base import Engine
 from bakeoff.shared.engine.mock import MockEngine
 from bakeoff.shared.tools import PathError, Tool, ToolContext, ToolError, resolve_path
@@ -74,33 +75,35 @@ class ToolHostImpl:
         start = time.perf_counter()
         ok = False
         try:
-            ok, content = await self._execute(call)
+            error, content = await self._execute(call)
+            ok = error is None
             if len(content) > MAX_OUTPUT:
                 content = (
                     f"{content[:MAX_OUTPUT]}\n... [truncated {len(content) - MAX_OUTPUT} chars]"
                 )
-            return ToolResult(call_id=call.id, ok=ok, content=content)
+            return ToolResult(call_id=call.id, ok=ok, content=content, error=error)
         finally:
             ms = round((time.perf_counter() - start) * 1000, 3)
             self._emit(
                 Event("tool.end", {"call_id": call.id, "name": call.name, "ok": ok, "ms": ms})
             )
 
-    async def _execute(self, call: ToolCall) -> tuple[bool, str]:
+    async def _execute(self, call: ToolCall) -> tuple[ToolErrorKind | None, str]:
+        """(error kind or None on success, content for the model)."""
         prepared = self._prepare(call)
         if isinstance(prepared, str):
-            return False, prepared
+            return "invalid_args", prepared
         tool, args = prepared
         decision, reason = self._decide(tool, args)
         if decision == "deny":
-            return False, reason
+            return "denied", reason
         self.run_counts[call.id] = self.run_counts.get(call.id, 0) + 1
         try:
-            return True, await tool.fn(args, self._ctx)
+            return None, await tool.fn(args, self._ctx)
         except ToolError as e:
-            return False, str(e)
+            return "failed", str(e)
         except Exception as e:  # run() never raises; the model gets a short message instead
-            return False, f"{call.name} failed: {type(e).__name__}: {e}"[:MAX_ERROR]
+            return "failed", f"{call.name} failed: {type(e).__name__}: {e}"[:MAX_ERROR]
 
     def _prepare(self, call: ToolCall) -> tuple[Tool, dict[str, Any]] | str:
         """The tool and parsed arguments, or the error message for the model."""
