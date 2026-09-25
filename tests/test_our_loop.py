@@ -789,11 +789,20 @@ async def test_max_steps_stops_after_exactly_n_requests() -> None:
         *(sse(call(0, "{}", f"c{i}", "describe_component"), finish("tool_calls")) for i in range(3))
     )
     history = [user("loop forever")]
-    events = await run(server.loop(), history, StubTools(), limits=Limits(max_steps=2))
+    tools = StubTools()
+    events = await run(server.loop(), history, tools, limits=Limits(max_steps=2))
     assert len(server.bodies) == 2
     assert events[-1].data == {"stop": "max_steps", "steps": 2}
     assert items(events)[-1].message["role"] == "tool"
     assert_no_orphans(history + items(events))
+    # The call of the last allowed step never runs (not even early, though it is read-only):
+    # no request could send its result. It still gets a result, so nothing is orphaned.
+    assert dict(tools.run_counts) == {"c0": 1}
+    assert items(events)[-1].message == {
+        "role": "tool",
+        "tool_call_id": "c1",
+        "content": "Not run: the turn reached its step limit",
+    }
 
 
 async def test_budget_stops_before_the_next_request() -> None:
