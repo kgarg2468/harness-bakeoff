@@ -12,6 +12,10 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient, omit
+
+# The first OpenAIChatModel loads the SDK's chat resources, which the SDK imports lazily: that
+# blocks the event loop for about 0.25 s (openai 2.x) inside the first turn. Import them here.
+from openai.resources.chat import AsyncChat  # noqa: F401
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.models.openrouter import OpenRouterModel, OpenRouterModelSettings
 from pydantic_ai.profiles.openai import OpenAIModelProfile

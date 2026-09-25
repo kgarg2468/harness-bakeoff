@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import subprocess
+import sys
 import time
 import uuid
 import warnings
@@ -596,6 +598,20 @@ async def test_threads_share_one_model_and_send_their_own_session_id(loop):
     sent = [(body.get("session_id"), body["cache_control"]) for body in srv.requests]
     ephemeral = {"type": "ephemeral"}
     assert sent == [("thread-a", ephemeral), ("thread-b", ephemeral), (None, ephemeral)]
+
+
+def test_the_first_model_imports_nothing_inside_a_turn():
+    """Building a model must not import (and block the event loop, ~0.3 s on openai 2.x): the
+    module pays for the SDK's lazily loaded chat resources at import. Needs a fresh process."""
+    script = (
+        "import sys; import bakeoff.pydantic_version.loop; before = set(sys.modules); "
+        "from bakeoff.pydantic_version.model import build_model; "
+        "from bakeoff.shared.contract import ModelConfig; "
+        "build_model(ModelConfig(base_url='http://127.0.0.1:9/v1', model='anthropic/x'), {}); "
+        "print(sorted(m for m in set(sys.modules) - before if m.startswith('openai')))"
+    )
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "[]"
 
 
 async def test_compaction_item_resets_the_request_prefix(loop):
