@@ -104,7 +104,7 @@ def test_bundle_has_the_five_skills():
 
 def test_bundle_is_text_only_and_records_its_source():
     files = [p for p in SKILLS_DIR.rglob("*") if p.is_file()]
-    assert files and all(p.suffix in {".md", ".json", ".pipe"} for p in files)
+    assert files and all(p.suffix in skills.SKILL_SUFFIXES for p in files)
     source = json.loads((SKILLS_DIR / "SOURCE.json").read_text())
     assert source["repo"] == "rocketride-org/rocketride-server"
     assert source["path"] == "docs/agents/skills"
@@ -384,6 +384,7 @@ def test_sync_copies_text_files_and_records_the_commit(tmp_path):
         "docs/agents/skills/s/SKILL.md": "---\nname: s\ndescription: Use for S — ok.\n---\n",
         "docs/agents/skills/s/ex/a.pipe": "{}",
         "docs/agents/skills/s/index.json": "[]",
+        "docs/agents/skills/s/résumé.md": "non-ASCII name",
         "docs/agents/skills/s/tools/run.py": "print()",
         "docs/other.md": "not a skill",
     }
@@ -406,9 +407,16 @@ def test_sync_copies_text_files_and_records_the_commit(tmp_path):
     (out / "skills" / "stale").mkdir(parents=True)
     (out / "skills" / "stale" / "old.md").write_text("removed upstream")
 
-    assert _sync_module().copy_skills(repo, commit, out) == 4
+    assert _sync_module().copy_skills(repo, commit, out) == 5
     copied = sorted(p.relative_to(out / "skills").as_posix() for p in out.rglob("*.*"))
-    assert copied == ["README.md", "SOURCE.json", "s/SKILL.md", "s/ex/a.pipe", "s/index.json"]
+    assert copied == [
+        "README.md",
+        "SOURCE.json",
+        "s/SKILL.md",
+        "s/ex/a.pipe",
+        "s/index.json",
+        "s/résumé.md",  # git quotes this name unless ls-tree runs with -z
+    ]
     assert (out / "skills" / "s" / "SKILL.md").read_bytes() == files[
         "docs/agents/skills/s/SKILL.md"
     ].encode()

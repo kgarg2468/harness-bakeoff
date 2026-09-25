@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from bakeoff.shared.skills import SKILL_SUFFIXES
+
 REF = "origin/develop"
 UPSTREAM = "rocketride-org/rocketride-server"
 OUT = Path(__file__).resolve().parents[1] / "src" / "bakeoff" / "data"
@@ -53,8 +55,6 @@ FIELD_KEYS = (
 )
 PROFILES_PLACEHOLDER = "*>preconfig.profiles.*.title"
 SKILLS = "docs/agents/skills"
-# Text the model can read. The skills' `tools/*.py` helpers are left out: nothing runs them here.
-SKILL_SUFFIXES = (".md", ".json", ".pipe")
 SKILLS_SOURCE = "SOURCE.json"
 
 
@@ -201,7 +201,9 @@ def copy_skills(repo: Path, commit: str, out: Path) -> int:
     """Replace `out/skills/` with the text files of `docs/agents/skills/`; return how many."""
     dest_root = out / "skills"
     shutil.rmtree(dest_root, ignore_errors=True)  # generated: files removed upstream must go too
-    paths = _git(repo, "ls-tree", "-r", "--name-only", commit, f"{SKILLS}/").splitlines()
+    # -z: without it git quotes non-ASCII paths ("r\303\251sum\303\251.md"), which the suffix
+    # filter would silently drop. SKILL_SUFFIXES leaves out the skills' tools/*.py helpers.
+    paths = _git(repo, "ls-tree", "-r", "-z", "--name-only", commit, f"{SKILLS}/").split("\0")
     copied = [path for path in paths if path.endswith(SKILL_SUFFIXES)]
     for src in copied:
         dest = dest_root / src.removeprefix(f"{SKILLS}/")
