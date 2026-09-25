@@ -143,9 +143,14 @@ lists only `name: description` per skill and tells the model to call `load_skill
 a matching task; it is deterministic, so appending it keeps the thread's system prompt frozen.
 `load_skill` returns the `SKILL.md`, or a file it mentions, after one harness paragraph: the
 ToolHost's real tool names, and that instructions to run scripts or tools not in that list do not
-apply here. `file` is read as the skill writes it, relative to the skill (`GATE_PROTOCOL.md`,
-`../MCP_TOOL_CONTRACT.md`) or to the skills root, and only files of the bundle are ever returned.
-An unknown skill or file is `invalid_args` listing the valid names.
+apply here. `file` is read as the skill writes it: relative to the skill (`GATE_PROTOCOL.md`,
+`../MCP_TOOL_CONTRACT.md`), or to the skills root, or as a bare file name that names exactly one
+file of the bundle (the skills write `PIPELINE_ANTIPATTERNS.md`, which lives in the configuring
+skill). Only files of the bundle (`.md`, `.json`, `.pipe`, no dotfiles) are ever returned. An
+unknown skill or file is `invalid_args` listing the valid names, plus a "did you mean" path when a
+wrong directory names a known file; the model's value is echoed at most 100 characters long.
+`file` may be `null` (= `SKILL.md`). The tool description lists the skill names too, so a thread
+whose system prompt lacks `skills_prompt()` can still find them.
 
 ## Fake model server (`fakeprov`)
 

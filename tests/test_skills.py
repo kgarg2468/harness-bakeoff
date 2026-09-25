@@ -174,6 +174,13 @@ def test_tool_order_is_unchanged_and_load_skill_is_last(host):
     assert len(specs) == 8
 
 
+def test_tool_description_names_the_skills(host):
+    """Without `skills_prompt()` in the system prompt the model still sees the names."""
+    description = host.specs()[7].description
+    assert "system prompt" not in description
+    assert f"Skills: {', '.join(NAMES)}." in description
+
+
 async def test_load_skill_returns_note_then_skill_md(host):
     result = await host.run(call({"name": BUILDING}))
     assert result.ok and result.error is None
@@ -186,6 +193,12 @@ async def test_load_skill_returns_note_then_skill_md(host):
     skill_md = (SKILLS_DIR / BUILDING / "SKILL.md").read_text()
     assert rest == f"{BUILDING}/SKILL.md ---\n{skill_md}"
     assert host.run_counts == {"c1": 1}
+
+
+async def test_null_file_is_skill_md(host):
+    result = await host.run(call({"name": BUILDING, "file": None}))
+    assert result.ok
+    assert result.content == (await host.run(call({"name": BUILDING}, "c2"))).content
 
 
 @pytest.mark.parametrize(

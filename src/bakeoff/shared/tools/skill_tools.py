@@ -48,21 +48,26 @@ async def load_skill(args: dict[str, Any], ctx: ToolContext) -> str:
     return f"{harness_note(name)}\n\n--- {path} ---\n{skills.read(path)}"
 
 
+# The names are in the tool description too, so a thread whose system prompt lacks
+# `skills_prompt()` can still find them without first triggering the unknown-skill error.
+_NAMES = ", ".join(skills.load_skills().skills)
+
 SKILL_TOOLS = (
     Tool(
         ToolSpec(
             name="load_skill",
             description=(
-                "Load a skill listed in the system prompt: its SKILL.md playbook, or one of the "
-                "reference files it mentions. Call it before acting on a task that matches a "
-                "skill."
+                "Load a RocketRide skill, a step-by-step playbook for pipeline work: its SKILL.md, "
+                f"or a reference file it mentions. Skills: {_NAMES}. Call it before acting on a "
+                "task that matches a skill."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Skill name from the system prompt"},
+                    "name": {"type": "string", "description": "One of the skill names"},
                     "file": {
-                        "type": "string",
+                        # null too: models often send null for an optional argument.
+                        "type": ["string", "null"],
                         "description": (
                             "A file the skill mentions, as it writes the path (e.g. "
                             "GATE_PROTOCOL.md, ../MCP_TOOL_CONTRACT.md). Default: SKILL.md"
