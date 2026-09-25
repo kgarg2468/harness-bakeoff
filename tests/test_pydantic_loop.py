@@ -11,17 +11,22 @@ import time
 import uuid
 import warnings
 from collections import defaultdict
+from collections.abc import AsyncIterator
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from pai_sse_server import Reply, SSEServer, chunk, done, text, tool_call
 from pydantic_ai import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.pydantic_version import PydanticLoop, mapping
 from bakeoff.pydantic_version import loop as loop_module
+from bakeoff.pydantic_version.model import build_model
 from bakeoff.shared.contract import (
     Decision,
     Event,
@@ -34,6 +39,7 @@ from bakeoff.shared.contract import (
     ToolSpec,
     TurnInput,
 )
+from bakeoff.shared.invariants import check_prefix, load_wire
 
 PATH = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
 PIPELINE = {  # like the engine's validate_pipeline: `pipeline` is a free-form object
@@ -679,14 +685,16 @@ async def test_threads_share_one_model_and_send_their_own_session_id(loop):
     assert sent == [("thread-a", ephemeral), ("thread-b", ephemeral), (None, ephemeral)]
 
 
-def test_the_first_model_imports_nothing_inside_a_turn():
+@pytest.mark.parametrize("kind", ["openrouter", "openai_compat", "openai_responses"])
+def test_the_first_model_imports_nothing_inside_a_turn(kind):
     """Building a model must not import (and block the event loop, ~0.3 s on openai 2.x): the
-    module pays for the SDK's lazily loaded chat resources at import. Needs a fresh process."""
+    module pays for the SDK's lazily loaded chat and responses resources at import. Needs a
+    fresh process."""
     script = (
         "import sys; import bakeoff.pydantic_version.loop; before = set(sys.modules); "
         "from bakeoff.pydantic_version.model import build_model; "
         "from bakeoff.shared.contract import ModelConfig; "
-        "build_model(ModelConfig(base_url='http://127.0.0.1:9/v1', model='anthropic/x'), {}); "
+        f"build_model(ModelConfig('http://127.0.0.1:9/v1', 'anthropic/x', kind='{kind}'), {{}}); "
         "print(sorted(m for m in set(sys.modules) - before if m.startswith('openai')))"
     )
     out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
@@ -943,6 +951,27 @@ async def test_a_crash_after_a_cancel_never_runs_the_cancelled_call(loop):
     assert len(srv.bodies) == 1  # no request after the resume
 
 
+async def test_a_crash_after_a_stream_that_failed_for_good_ends_with_an_error(loop):
+    """A stream that fails on its last attempt ends the run with its error; the response it cut
+    short is saved, its call closed. After a crash once that response is saved, the resume ends
+    with an error too, not as a cancel (its saved finish reason says a failure cut it), and
+    runs and sends nothing."""
+    tools = StubTools()
+    call = tool_call(0, "w1", "write_file", '{"path": "a", "content": "x"}')
+    with SSEServer(Reply([*text("Writing it."), *call], drop=True)) as srv:
+        first = await run(loop, turn([user("write a")], config(srv)), tools)
+        cut = items(first)[0]
+        history = [user("write a"), cut]  # SIGKILL before the closing item was saved
+        resumed = await run(loop, turn(history, config(srv), resume=Resume("crash")), tools)
+
+    assert of(first, "turn.end")[0]["stop"] == "error"
+    assert of(resumed, "turn.end")[0]["stop"] == "error"
+    assert of(resumed, "turn.end")[0]["error"] == f"UnexpectedModelBehavior: {loop_module._ENDED}"
+    assert [i.message["tool_call_id"] for i in items(resumed)] == ["w1"]
+    assert (tools.runs, len(srv.bodies)) == ([], 1)
+    assert (cut.status, cut.native["finish_reason"]) == ("incomplete", "error")
+
+
 async def test_a_crash_after_the_final_answer_sends_nothing_more(loop):
     tools = StubTools()
     replies = [Reply([*tool_call(0, "c1", "read_file", '{"path": "a"}'), done("tool_calls")])]
@@ -1141,3 +1170,479 @@ async def test_only_an_explicit_allow_approves_an_ask_protected_call(loop, decis
     assert tools.runs == []
     assert of(second, "turn.end")[0]["stop"] == "paused"
     assert of(second, "turn.end")[0]["pending"] == ["c1"]
+
+
+RESPONSES_SCENARIO = {
+    "title": "PydanticLoop on the Responses API",
+    "system": "SYS",
+    "model": {"kind": "openai_responses", "model": "gpt-6-luna"},
+    "rules": {"*": "allow"},
+    "limits": {"max_steps": 4},
+    "engine": {"delay_ms": 0},
+    "strict": {"reject_unencrypted_reasoning": True},
+    "driver": [{"user": "hi"}],
+    "expect": {"stops": ["end_turn"]},
+}
+REASONING = {"id": "rs_1", "encrypted_content": "gAAAAB-rs_1-encrypted", "summary": ["Plan", "Go"]}
+COMPLETED = {"completed": {"input_tokens": 20, "output_tokens": 9, "reasoning_tokens": 6}}
+
+
+def responses_server(tmp_path: Path, *exchanges: dict[str, Any]) -> FakeProvider:
+    """fakeprov in Responses API mode, scripted with these exchanges (scenario "R")."""
+    scenario = {**RESPONSES_SCENARIO, "id": "R", "exchanges": list(exchanges)}
+    (tmp_path / "R.json").write_text(json.dumps(scenario))
+    return FakeProvider(tmp_path, tmp_path / "wire")
+
+
+def responses_config(srv: FakeProvider, run: str = "r1", **kw: Any) -> ModelConfig:
+    kw.setdefault("max_retries", 0)
+    kw.setdefault("reasoning", {"effort": "xhigh", "summary": "auto"})
+    return ModelConfig(
+        base_url=srv.base_url("R", run, "pydantic"),
+        model="gpt-6-luna",
+        kind="openai_responses",
+        temperature=None,
+        **kw,
+    )
+
+
+def sent(tmp_path: Path, run: str = "r1") -> list[bytes]:
+    """The request bodies fakeprov recorded for `responses_config`'s cursor, in order."""
+    return [body for body, _ in load_wire(tmp_path / "wire" / "R" / run / "pydantic")]
+
+
+async def test_responses_reasoning_goes_back_verbatim_and_stays_out_of_the_chat_view(
+    loop, tmp_path
+):
+    """The chat-shaped `Item.message` has no field for a Responses reasoning item, so it shows
+    only the text and the calls; the native replays the item exactly as its done event sent it,
+    in the same run and in a new turn rebuilt from the saved items."""
+    call = {"id": "call_1", "name": "read_file", "arguments": {"path": "a"}}
+    replayed = {"reasoning_replayed": ["rs_1"], "input_at": [{"index": 2, "phase": "commentary"}]}
+    exchanges = [
+        {
+            "respond": {
+                "stream": [
+                    {"reasoning_item": REASONING},
+                    {"text": "Reading it.", "phase": "commentary"},
+                    {"tool_calls": [call]},
+                    COMPLETED,
+                ]
+            }
+        },
+        {"expect": replayed, "respond": {"stream": [{"text": "Done."}, COMPLETED]}},
+        {
+            "expect": {**replayed, "input_len": 7},
+            "respond": {"stream": [{"text": "Hi."}, COMPLETED]},
+        },
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        first = await run(loop, turn([user("go")], responses_config(srv)), StubTools())
+        history = [user("go"), *items(first), user("again")]
+        second = await run(loop, turn(history, responses_config(srv)), StubTools())
+
+    assert [i.message for i in items(first)] == [
+        {
+            "role": "assistant",
+            "content": "Reading it.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "read_file ok"},
+        {"role": "assistant", "content": "Done."},
+    ]
+    # The summary streams because the config asks for one: the API sends none otherwise.
+    assert [d["text"] for d in of(first, "reasoning.delta")] == ["Plan", "Go"]
+    request = json.loads(sent(tmp_path)[0])
+    assert request["reasoning"] == {"effort": "xhigh", "summary": "auto", "context": "all_turns"}
+    assert (request["store"], request["include"]) == (False, ["reasoning.encrypted_content"])
+    assert of(first, "usage")[0]["reasoning_tokens"] == 6
+    assert of(second, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+
+
+async def test_responses_without_a_reasoning_config_still_replays_reasoning(loop, tmp_path):
+    """gpt-6-luna reasons at its default effort with no `reasoning` config. Its encrypted
+    reasoning is asked for and replayed all the same (2.31.1 does not know the model by name),
+    and no summary is asked for (none streams)."""
+    call = {"id": "call_1", "name": "read_file", "arguments": {"path": "a"}}
+    stream = [{"reasoning_item": REASONING}, {"text": "Reading.", "phase": "commentary"}]
+    replayed = {"reasoning_replayed": ["rs_1"], "input_at": [{"index": 2, "phase": "commentary"}]}
+    exchanges = [
+        {"respond": {"stream": [*stream, {"tool_calls": [call]}, COMPLETED]}},
+        {"expect": replayed, "respond": {"stream": [{"text": "Done."}, COMPLETED]}},
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        events = await run(
+            loop, turn([user("go")], responses_config(srv, reasoning=None)), StubTools()
+        )
+
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+    assert of(events, "reasoning.delta") == []
+    request = json.loads(sent(tmp_path)[0])
+    assert (request["include"], request["reasoning"]) == (
+        ["reasoning.encrypted_content"],
+        {"context": "all_turns"},
+    )
+
+
+def test_a_responses_model_that_does_not_reason_is_marked_by_compat():
+    """compat `reasoning_param: "none"` leaves the model the library's name-based profile."""
+    for compat, reasons in (({}, True), ({"reasoning_param": "none"}, False)):
+        cfg = ModelConfig(
+            "http://127.0.0.1:9/v1", "gpt-4.1", kind="openai_responses", compat=compat
+        )
+        assert build_model(cfg, {}).profile.get("openai_supports_reasoning", False) is reasons
+
+
+@pytest.mark.parametrize("end", ["completed", "incomplete"])
+async def test_responses_a_reasoning_only_response_keeps_its_place_in_the_history(
+    loop, tmp_path, end
+):
+    """A response that is only a reasoning item (max_output_tokens ran out while the model
+    reasoned: `.incomplete`) is replayed by the library, so it gets an item with no content. The
+    history rebuilt from the items then sends what the run sent, and the retry prompt stays after
+    the user's message. 2.31.1 asks again within the turn; 2.50.0 ends the turn at the token
+    limit (`.incomplete`), and the next turn replays the reasoning."""
+    usage = {"input_tokens": 20, "output_tokens": 16, "reasoning_tokens": 16}
+    answer = [{"text": "Hello!"}, COMPLETED]
+    exchanges = [
+        {"respond": {"stream": [{"reasoning_item": REASONING}, {end: usage}]}},
+        *[{"expect": {"reasoning_replayed": ["rs_1"]}, "respond": {"stream": answer}}] * 2,
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        first = await run(loop, turn([user("hi")], responses_config(srv)), StubTools())
+        history = [user("hi"), *items(first), user("again")]
+        second = await run(loop, turn(history, responses_config(srv)), StubTools())
+
+    reasoning_only = items(first)[0]
+    assert reasoning_only.message == {"role": "assistant", "content": None}
+    assert reasoning_only.native["parts"][0]["signature"] == REASONING["encrypted_content"]
+    asked_again = of(first, "turn.end")[0]["stop"] == "end_turn"
+    assert asked_again or end == "incomplete"
+    assert of(second, "turn.end")[0]["stop"] == "end_turn"
+    bodies = sent(tmp_path)
+    assert len(bodies) == (3 if asked_again else 2)
+    assert (i1 := check_prefix(bodies)).ok, i1.detail
+
+
+async def test_responses_a_retried_stream_extends_a_reasoning_only_step(loop, tmp_path):
+    """The step after a reasoning-only response fails midway (an `error` event) and is retried
+    from the saved items: the retry sends exactly what the failed attempt sent."""
+    cut = {"respond": {"stream": [{"text": "Hel", "done": False}, {"error": {"message": "boom"}}]}}
+    exchanges = [
+        {"respond": {"stream": [{"reasoning_item": REASONING}, COMPLETED]}},
+        {"expect": {"reasoning_replayed": ["rs_1"]}, **cut},
+        {
+            "expect": {"reasoning_replayed": ["rs_1"]},
+            "respond": {"stream": [{"text": "Hi"}, COMPLETED]},
+        },
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        events = await run(
+            loop, turn([user("hi")], responses_config(srv, max_retries=1)), StubTools()
+        )
+
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+    first, failed, retried = sent(tmp_path)
+    assert retried == failed
+    assert (i1 := check_prefix([first, failed, retried])).ok, i1.detail
+
+
+async def test_responses_a_reasoning_item_cut_short_is_never_replayed(loop, tmp_path):
+    """`.incomplete` can end a response before its reasoning item is done: the item has no
+    encrypted content, which is all the API knows it by with store false (404). The loop drops
+    it from any replay, and the response's empty item keeps the history in order."""
+    usage = {"input_tokens": 20, "output_tokens": 16, "reasoning_tokens": 16}
+    answer = {"respond": {"stream": [{"text": "Hello!"}, COMPLETED]}}
+    exchanges = [
+        {
+            "respond": {
+                "stream": [{"reasoning_item": REASONING, "done": False}, {"incomplete": usage}]
+            }
+        },
+        answer,
+        answer,
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        first = await run(loop, turn([user("hi")], responses_config(srv)), StubTools())
+        history = [user("hi"), *items(first), user("again")]
+        second = await run(loop, turn(history, responses_config(srv)), StubTools())
+
+    assert items(first)[0].message == {"role": "assistant", "content": None}
+    assert of(second, "turn.end")[0]["stop"] == "end_turn"
+    bodies = sent(tmp_path)
+    assert not [
+        i for body in bodies for i in json.loads(body)["input"] if i.get("type") == "reasoning"
+    ]
+    assert (i1 := check_prefix(bodies)).ok, i1.detail
+
+
+async def test_an_empty_chat_response_keeps_its_place_in_the_history(loop):
+    """Chat completions too: the library skips an empty response on the wire and asks again,
+    but without its item the rebuilt history would put the retry prompt before the user's
+    message (the library's merge of consecutive requests moves it first)."""
+    replies = [
+        Reply([done(completion=0)]),
+        Reply([*text("Hello!"), done()]),
+        Reply([*text("Hi"), done()]),
+    ]
+    with SSEServer(*replies) as srv:
+        first = await run(loop, turn([user("hi")], config(srv)), StubTools())
+        history = [user("hi"), *items(first), user("again")]
+        await run(loop, turn(history, config(srv)), StubTools())
+
+    assert items(first)[0].message == {"role": "assistant", "content": None}
+    assert (i1 := check_prefix(srv.bodies)).ok, i1.detail
+
+
+@pytest.mark.parametrize("failure", ["error", "failed"])
+async def test_responses_failed_stream_on_the_last_attempt_ends_the_turn_quietly(
+    tmp_path, capfd, failure
+):
+    """The library ends a stream as if it were done after an `error` event (it has no handler
+    for it and warns) or a `response.failed`. The loop takes a stream that brought no usage for
+    a failed one, and the warning never reaches stderr (rule 1)."""
+    cut = {"respond": {"stream": [{"text": "Hal", "done": False}, {failure: {"message": "boom"}}]}}
+    with warnings.catch_warnings(record=True) as caught, responses_server(tmp_path, cut) as srv:
+        loop = PydanticLoop()
+        events = await run(loop, turn([user("hi")], responses_config(srv)), StubTools())
+        await loop.aclose()
+
+    [error] = of(events, "error")
+    assert error["retryable"] is True
+    assert error["message"].endswith("the stream failed before response.completed")
+    # The last attempt's partial text is kept, as a cancelled one would be.
+    assert [(i.status, i.message["content"]) for i in items(events)] == [("incomplete", "Hal")]
+    assert of(events, "turn.end")[0]["stop"] == "error"
+    assert (caught, capfd.readouterr()) == ([], ("", ""))
+
+
+@pytest.mark.parametrize("retries", [1, 0])
+async def test_responses_a_failed_response_with_usage_is_no_answer(loop, tmp_path, retries):
+    """Greptile #4105933151: a `response.failed` can carry usage, and 2.31.1 parses it exactly
+    like `.incomplete`. It is a failed stream all the same: retried without keeping anything of
+    it, or on the last attempt the turn's error. Its partial text is never the answer."""
+    failed = {"failed": {"message": "boom", "usage": {"input_tokens": 20, "output_tokens": 3}}}
+    exchanges = [
+        {"respond": {"stream": [{"text": "Hal", "done": False}, failed]}},
+        {"expect": {"input_len": 1}, "respond": {"stream": [{"text": "Hello!"}, COMPLETED]}},
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        cfg = responses_config(srv, max_retries=retries)
+        events = await run(loop, turn([user("hi")], cfg), StubTools())
+
+    assert len(sent(tmp_path)) == 1 + retries
+    if retries:
+        assert of(events, "retry")[0]["reason"] == "the stream failed before response.completed"
+        assert [i.message["content"] for i in items(events)] == ["Hello!"]
+        assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+    else:
+        assert [(i.status, i.message["content"]) for i in items(events)] == [("incomplete", "Hal")]
+        assert of(events, "turn.end")[0]["stop"] == "error"
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [
+        {"failed": {"message": "boom", "usage": {"input_tokens": 20, "output_tokens": 3}}},
+        {"error": {"message": "boom"}},
+    ],
+    ids=["failed-with-usage", "error-event"],
+)
+async def test_a_crash_after_a_responses_stream_that_failed_for_good_ends_with_an_error(
+    loop, tmp_path, ending
+):
+    """A failed Responses stream on the last attempt ends the run (r1) with its error. A crash
+    once the response it cut short is saved (run r2) ends the resumed turn with an error too,
+    not as a cancel, and sends nothing."""
+    cut = {"respond": {"stream": [{"text": "Hal", "done": False}, ending]}}
+    with responses_server(tmp_path, cut, cut) as srv:
+        whole = await run(loop, turn([user("hi")], responses_config(srv)), StubTools())
+        cfg = responses_config(srv, run="r2")
+        history = [user("hi")]
+        stream = loop.run_turn(turn(history, cfg), StubTools(), asyncio.Event())
+        async with contextlib.aclosing(stream):
+            async for event in stream:
+                if event.type == "item":
+                    history.append(items([event])[0])
+                    break  # SIGKILL once the response is saved
+        resumed = await run(loop, turn(history, cfg, resume=Resume("crash")), StubTools())
+
+    assert of(whole, "turn.end")[0]["stop"] == "error"
+    assert of(resumed, "turn.end")[0]["stop"] == "error"
+    assert (len(sent(tmp_path)), len(sent(tmp_path, "r2"))) == (1, 1)
+    assert [(i.status, i.native["finish_reason"]) for i in history[1:]] == [("incomplete", "error")]
+
+
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n", b"\r"], ids=["LF", "CRLF", "CR"])
+async def test_the_event_that_ends_a_responses_stream_is_read_across_chunks(eol):
+    """`_note_events` reads SSE event names wherever the bytes are cut, past long data lines,
+    with any SSE line end, and passes the bytes on unchanged."""
+    delta = b'data: {"delta": "' + b"x" * 300 + b'"}' + eol * 2
+    body = b"event: response.output_text.delta" + eol + delta + b"event: response.failed" + eol
+    body += b"data: {}" + eol * 2
+    for size in (1, 5, 64, 100, len(body)):
+
+        async def chunks(size: int = size) -> AsyncIterator[bytes]:
+            for start in range(0, len(body), size):
+                yield body[start : start + size]
+
+        state = loop_module._Turn("t", StubTools(), 1, set(), set(), responses_api=True)
+        passed = [chunk async for chunk in loop_module._note_events(chunks(), state)]
+        assert (b"".join(passed), state.event) == (body, "response.failed")
+
+
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n", b"\r"], ids=["LF", "CRLF", "CR"])
+async def test_an_event_name_belongs_to_its_own_record_only(eol):
+    """Greptile #4106536163: a named non-terminal record followed by an unnamed completion must
+    not leave the earlier name behind (an unnamed record reads as None, a valid end), wherever
+    the bytes are cut, including a CRLF split across two chunks."""
+    body = b"event: response.output_text.delta" + eol + b'data: {"delta": "hi"}' + eol * 2
+    body += b'data: {"type": "response.completed"}' + eol * 2
+    for size in range(1, len(body) + 1):
+
+        async def chunks(size: int = size) -> AsyncIterator[bytes]:
+            for start in range(0, len(body), size):
+                yield body[start : start + size]
+
+        state = loop_module._Turn("t", StubTools(), 1, set(), set(), responses_api=True)
+        passed = [chunk async for chunk in loop_module._note_events(chunks(), state)]
+        assert (b"".join(passed), state.event) == (body, None), size
+
+
+def responses_bytes(tmp_path: Path, stream: list[dict[str, Any]]) -> bytes:
+    """The bytes fakeprov streams for one Responses exchange with these ops."""
+    with responses_server(tmp_path, {"respond": {"stream": stream}}) as srv:
+        url = srv.base_url("R", "bytes", "pydantic") + "/responses"
+        return httpx.post(url, json={"model": "gpt-6-luna", "stream": True, "input": "hi"}).content
+
+
+FAILED = {"failed": {"message": "boom", "usage": {"input_tokens": 20, "output_tokens": 9}}}
+
+
+@pytest.mark.parametrize(
+    ("shape", "ending", "stop"),
+    [
+        ("no event names", COMPLETED, "end_turn"),
+        ("CR line ends", COMPLETED, "end_turn"),
+        ("CR line ends", FAILED, "error"),
+        ("end not dispatched", COMPLETED, "error"),
+    ],
+    ids=["no-names", "CR", "CR-failed", "end-not-dispatched"],
+)
+async def test_a_responses_stream_is_judged_as_the_sdk_reads_it(
+    loop, tmp_path, shape, ending, stop
+):
+    """The OpenAI SDK reads SSE as the spec says: event names are optional (it reads only the
+    data), a line may end with CR, and an event counts once the blank line after it arrives. A
+    stream is a response only with the usage that an end brings and, if the server names its
+    events, a last one that is `response.completed` (or `.incomplete`), not `response.failed`."""
+    body = responses_bytes(tmp_path, [{"text": "Hello!"}, ending])
+    if shape == "no event names":
+        body = b"\n".join(line for line in body.split(b"\n") if not line.startswith(b"event:"))
+    elif shape == "CR line ends":
+        body = body.replace(b"\n", b"\r")
+    else:  # the body ends cleanly before the blank line that would dispatch the last event
+        body = body.rstrip(b"\n") + b"\n"
+    with SSEServer(Reply(raw=body)) as srv:
+        cfg = ModelConfig(srv.base_url, "gpt-6-luna", kind="openai_responses", max_retries=0)
+        events = await run(loop, turn([user("hi")], cfg), StubTools())
+
+    assert of(events, "turn.end")[0]["stop"] == stop
+    usage = [(u["input_tokens"], u["output_tokens"]) for u in of(events, "usage")]
+    assert usage == ([(20, 9)] if stop == "end_turn" else [])
+
+
+BLANK = {"text": "", "phase": "final_answer"}  # a message item with empty text
+
+
+@pytest.mark.parametrize("limit", [None, 1e-7])
+@pytest.mark.parametrize(
+    ("reason", "output", "run_ends"),
+    [
+        ("max_output_tokens", [{"reasoning_item": REASONING}], "length"),
+        ("content_filter", [], "content_filter"),
+        ("content_filter", [BLANK], "content_filter"),
+        ("content_filter", [{"reasoning_item": REASONING}], None),
+    ],
+    ids=["reasoning-length", "empty-filtered", "blank-filtered", "reasoning-filtered"],
+)
+async def test_a_crash_after_a_responses_response_without_output_ends_as_the_run_did(
+    loop, tmp_path, reason, output, run_ends, limit
+):
+    """Greptile #4105933163: 2.50.0 ends the run with the library's token limit error on a
+    reasoning-only `.incomplete` (content filter error on an empty or blank one); 2.31.1 gives
+    `.incomplete` no finish reason and asks again, as 2.50.0 does for filtered reasoning. The
+    library checks the cost limit first: over `max_cost_usd`, each run ends with "budget". A
+    crash right after that response is saved (run r2) ends the resumed turn as the whole run
+    (r1) did, with the same requests."""
+    usage = {"input_tokens": 20, "output_tokens": 16, "reason": reason}
+    exchanges = [
+        {"respond": {"stream": [*output, {"incomplete": usage}]}},
+        {"respond": {"stream": [{"text": "Hello!"}, COMPLETED]}},
+    ]
+    limits = Limits(max_cost_usd=limit)
+    with responses_server(tmp_path, *exchanges) as srv:
+        cfg = responses_config(srv)
+        whole = await run(loop, turn([user("hi")], cfg, limits=limits), StubTools())
+        cfg = responses_config(srv, run="r2")
+        history = [user("hi")]
+        stream = loop.run_turn(turn(history, cfg, limits=limits), StubTools(), asyncio.Event())
+        async with contextlib.aclosing(stream):
+            async for event in stream:
+                if event.type == "item":
+                    history.append(items([event])[0])
+                    break  # SIGKILL once the response is saved
+        [saved] = history[1:]
+        crash = Resume("crash")
+        resumed = await run(loop, turn(history, cfg, resume=crash, limits=limits), StubTools())
+
+    # 2.50.0 saves the finish reason and raises on it; 2.31.1 saves none and asks again.
+    raised = run_ends is not None and saved.native["finish_reason"] == run_ends
+    stop = of(whole, "turn.end")[0]["stop"]
+    assert stop == ("budget" if limit else "error" if raised else "end_turn")
+    assert of(resumed, "turn.end")[0]["stop"] == stop
+    assert len(sent(tmp_path, "r2")) == len(sent(tmp_path))
+
+
+@pytest.mark.parametrize("thought", [False, True])
+async def test_a_crash_after_an_unanswered_chat_response_over_the_budget_ends_with_budget(
+    loop, thought
+):
+    """The library checks the cost limit as it adds a response, before it reads it: an empty
+    (or thinking-only) response out of tokens that also crossed `max_cost_usd` ends the run with
+    "budget", not the token limit error. So does a crash resume after it was saved."""
+    thinking = [chunk({"role": "assistant", "reasoning": "Let me think"})] if thought else []
+    limits = Limits(max_cost_usd=0.001)
+    with SSEServer(Reply([*thinking, done("length", completion=16, cost=0.002)])) as srv:
+        first = await run(loop, turn([user("hi")], config(srv), limits=limits), StubTools())
+        history = [user("hi"), *items(first)]  # SIGKILL after the response was saved
+        crash = Resume("crash")
+        resumed = await run(
+            loop, turn(history, config(srv), resume=crash, limits=limits), StubTools()
+        )
+
+    assert of(first, "turn.end") == of(resumed, "turn.end") == [{"stop": "budget", "steps": 1}]
+    assert len(srv.bodies) == 1
+
+
+@pytest.mark.parametrize("finish", ["length", "content_filter"])
+async def test_a_crash_after_an_empty_chat_response_that_ended_the_run_sends_nothing(loop, finish):
+    """Greptile #4105933163 on chat completions (2.31.1 too): an empty response that ran out of
+    tokens (or was filtered) ends the run with the library's error. After a crash that came once
+    it was saved, the resume ends the turn with an error too, and sends nothing."""
+    with SSEServer(Reply([done(finish, completion=16)]), Reply([*text("Hi"), done()])) as srv:
+        first = await run(loop, turn([user("hi")], config(srv)), StubTools())
+        history = [user("hi"), *items(first)]  # SIGKILL after the response was saved
+        resumed = await run(loop, turn(history, config(srv), resume=Resume("crash")), StubTools())
+
+    assert of(first, "turn.end")[0]["stop"] == "error"
+    assert [e["retryable"] for e in of(resumed, "error")] == [False]
+    assert of(resumed, "turn.end")[0]["stop"] == "error"
+    assert of(resumed, "turn.end")[0]["steps"] == 1
+    assert len(srv.bodies) == 1

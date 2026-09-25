@@ -197,7 +197,7 @@ A scenario with model kind `openai_responses` speaks OpenAI's Responses API inst
 reasoning items (`encrypted_content`, summary deltas if the request asks for them, raw reasoning
 text; the added item's `encrypted_content` is incomplete, as the API documents), messages (with
 `phase`), function calls (the last one optionally done as `incomplete`), `completed` (usage),
-`incomplete` (usage; out of `max_output_tokens`), `error` and `failed` mid-stream, `stall`, and
+`incomplete` (usage; out of `max_output_tokens`), `error` and `failed` (usage optional) mid-stream, `stall`, and
 items cut short before their done events. Its strict mode
 `reject_unencrypted_reasoning` answers as the API does with `store: false`: a replayed reasoning
 item without its `encrypted_content` is 404, one whose `encrypted_content` is not what an earlier

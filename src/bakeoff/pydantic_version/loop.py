@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import random
+import re
 import time
 import uuid
 import warnings
@@ -57,11 +58,12 @@ from pydantic_ai import (
     ToolDefinition,
     ToolDenied,
     ToolFailed,
+    UnexpectedModelBehavior,
     UsageLimitExceeded,
     UsageLimits,
 )
 from pydantic_ai.capabilities import Hooks, ProcessHistory
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models import Model
 from pydantic_ai.toolsets import ApprovalRequiredToolset, FunctionToolset
 from pydantic_ai.usage import RunUsage
 
@@ -90,6 +92,15 @@ _RETRY_HEADER = "x-stainless-retry-count"
 # Backoff before retrying a failed stream: the OpenAI SDK's own schedule (0.5 s doubling, max 8 s).
 _STREAM_RETRY_BASE_S = 0.5
 _STEP_CAP_RESULT = "Not run: the turn reached its step limit."
+# A crash resume's error when the saved last response already ended the turn with an error, whose
+# text is not saved: a failed response, or the library's token limit (or content filter) error.
+_ENDED = "the turn had already ended with an error: the response failed or held no answer"
+# The last event of a Responses stream that the library may take for a response: complete, or
+# out of `max_output_tokens` (the library answers that itself), not `response.failed` or `error`.
+# None: the server names no events (optional in SSE; the OpenAI SDK reads only the data).
+_RESPONSE_ENDS = (None, "response.completed", "response.incomplete")
+# SSE lines end with CRLF, LF or CR, as the OpenAI SDK reads them.
+_LINE_END = re.compile(rb"\r\n|\r|\n")
 
 
 class _StreamRetry(Exception):
@@ -109,11 +120,13 @@ class _Turn:
     max_steps: int
     decided: set[str]  # the calls the user answered in this resume
     read_only: set[str]  # tool names
+    responses_api: bool  # the model speaks OpenAI's Responses API
     out: asyncio.Queue[Event | None] = field(default_factory=asyncio.Queue)
     steps: int = 0
     attempt: int = 0  # of the current step
     # (status, monotonic time, reason) of the last failed attempt, until the next one starts.
     failure: tuple[int | None, float, str] | None = None
+    event: str | None = None  # the last SSE event of the current attempt's Responses stream
     emitted: dict[int, Any] = field(default_factory=dict)  # messages and result parts, by id
     items: list[Item] = field(default_factory=list)  # emitted this turn
     responses: list[tuple[int, ModelResponse]] = field(default_factory=list)  # usage not sent yet
@@ -140,6 +153,7 @@ class _Turn:
                 },
             )
         self.failure = None
+        self.event = None
         self.emit("request.start", {"step": self.steps, "attempt": self.attempt})
 
     def stream_event(self, event: ModelResponseStreamEvent) -> None:
@@ -181,7 +195,7 @@ class _Turn:
                     if id(part := piece.parts[0]) in self.emitted:
                         continue
                     self.emitted[id(part)] = part
-                for openai_message in mapping.to_openai(piece):
+                for openai_message in mapping.to_openai(piece, self.responses_api):
                     item = Item(
                         id=uuid.uuid4().hex,
                         turn_id=self.turn_id,
@@ -206,15 +220,17 @@ class PydanticLoop:
     name = "pydantic"
 
     def __init__(self) -> None:
-        # Nothing may reach stdout/stderr (rule 1): newer releases print a first-run banner, the
-        # library warns each time it drops `temperature` for a reasoning model (it drops it
-        # correctly either way), and it warns at the end of a run with a cost limit that no
-        # price is known for (the usage events already say cost_source="none").
+        # Nothing may reach stdout/stderr (rule 1). Newer releases print a first-run banner, and
+        # the library warns: each time it drops `temperature` for a reasoning model (it drops it
+        # correctly either way); at the end of a run with a cost limit that no price is known for
+        # (the usage events already say cost_source="none"); and for a Responses event it has no
+        # handler for, such as `error` (`_run` retries the stream that event cut short).
         pydantic_ai.BANNER_ENABLED = False
         warnings.filterwarnings("ignore", "Sampling parameters", UserWarning, "pydantic_ai")
+        warnings.filterwarnings("ignore", "Handling of this event type", UserWarning, "pydantic_ai")
         warnings.filterwarnings("ignore", category=CostNotFoundWarning)
         self._agents: dict[str, Agent[_Turn, str | DeferredToolRequests]] = {}
-        self._models: dict[str, OpenAIChatModel] = {}
+        self._models: dict[str, Model] = {}
 
     async def run_turn(
         self, turn: TurnInput, tools: ToolHost, cancel: asyncio.Event
@@ -224,7 +240,8 @@ class PydanticLoop:
         decisions = turn.resume.decisions if turn.resume else {}
         decided = {cid for cid, d in decisions.items() if d in ("allow", "deny")}
         read_only = {spec.name for spec in tools.specs() if spec.read_only}
-        state = _Turn(turn.turn_id, tools, turn.limits.max_steps, decided, read_only)
+        responses_api = turn.model.kind == "openai_responses"
+        state = _Turn(turn.turn_id, tools, turn.limits.max_steps, decided, read_only, responses_api)
         task = asyncio.create_task(self._drive(turn, state, cancel))
         try:
             while (event := await state.out.get()) is not None:
@@ -298,7 +315,10 @@ class PydanticLoop:
             state.steps = usage.requests
             limit = turn.limits.max_cost_usd
             if turn.resume is not None and (stop := mapping.finished(history, limit)):
-                return {"stop": stop}  # a crash came after the turn's end was saved
+                # A crash came after the turn's end was saved: end it as the run did.
+                if stop == "error":
+                    raise UnexpectedModelBehavior(_ENDED)
+                return {"stop": stop}
         deferred = None
         if pending := mapping.pending_calls(history):
             # The library needs an answer for every open call; `_before_execute` asks again for
@@ -344,6 +364,16 @@ class PydanticLoop:
                             try:
                                 async for event in stream:
                                     state.stream_event(event)
+                                # The library ends a stream as if it were done after an
+                                # `error` event (which it skips) or a `response.failed` (which
+                                # 2.31.1 parses like `.incomplete`, usage and all). Only an end
+                                # brings usage, and the last event's name tells which end.
+                                if state.responses_api and not (
+                                    stream.response.usage.has_values()
+                                    and state.event in _RESPONSE_ENDS
+                                ):
+                                    failed = "the stream failed before response.completed"
+                                    raise ModelAPIError(model.model_name, failed)
                             except Exception as exc:
                                 # No tool runs before a response is complete, so a retry is safe.
                                 if _retry_reason(exc) and state.attempt <= turn.model.max_retries:
@@ -366,7 +396,13 @@ class PydanticLoop:
             # history is complete only once the run has unwound, in the RunCancelled snapshot.
             ended = exc if isinstance(exc, RunCancelled) else run
             if ended is not None:
-                state.flush(ended.new_messages())
+                messages = ended.new_messages()
+                for message in messages if ended is run else []:
+                    # A failure, not a cancel, cut this response short: its saved finish reason
+                    # says so, and a crash resume ends with an error too (`mapping.finished`).
+                    if isinstance(message, ModelResponse) and message.state == "interrupted":
+                        message.finish_reason = "error"
+                state.flush(messages)
                 saved = mapping.to_history([*turn.history, *state.items])
                 state.flush(mapping.close_pending(saved))
             raise
@@ -391,13 +427,13 @@ class PydanticLoop:
                         tool_validate_error=_unparsed_args,
                         before_tool_execute=_before_execute,
                     ),
-                    ProcessHistory(mapping.replayable),
+                    ProcessHistory(_replayable),
                 ],
                 name=self.name,
             )
         return agent
 
-    def _model(self, cfg: ModelConfig) -> OpenAIChatModel:
+    def _model(self, cfg: ModelConfig) -> Model:
         key = json.dumps(asdict(replace(cfg, session_id=None)), sort_keys=True)
         if (model := self._models.get(key)) is None:
             hooks = {"request": [_on_request], "response": [_on_response]}
@@ -435,6 +471,10 @@ def _tool(spec: ToolSpec) -> Tool[_Turn]:
     # `validate_pipeline.pipeline` into "must be empty". Our schemas are not strict schemas.
     tool.strict = False
     return tool
+
+
+def _replayable(ctx: RunContext[_Turn], messages: list[ModelMessage]) -> list[ModelMessage]:
+    return mapping.replayable(messages, ctx.deps.responses_api)
 
 
 def _needs_approval(ctx: RunContext[_Turn], tool_def: ToolDefinition, args: dict[str, Any]) -> bool:
@@ -578,6 +618,42 @@ async def _on_request(request: Any) -> None:
 
 
 async def _on_response(response: Any) -> None:
-    if (turn := _TURN.get(None)) is not None and response.status_code >= 400:
+    if (turn := _TURN.get(None)) is None:
+        return
+    if response.status_code >= 400:
         status = response.status_code
         turn.failure = (status, time.monotonic(), f"HTTP {status}")
+    elif turn.responses_api:
+        # The OpenAI SDK reads the SSE stream from these (decoded) bytes.
+        read = response.aiter_bytes
+        response.aiter_bytes = lambda *args, **kw: _note_events(read(*args, **kw), turn)
+
+
+async def _note_events(chunks: AsyncIterator[bytes], turn: _Turn) -> AsyncIterator[bytes]:
+    """Pass a Responses stream's bytes on, noting the name of each dispatched SSE record in
+    `turn.event` (None for an unnamed one): the library gives a failed response no status
+    (2.31.1), so only its event tells it apart. As in the SSE spec, an `event:` field names only
+    its own record, which a blank line dispatches."""
+    line = b""  # the start of the line the next bytes continue
+    name: str | None = None  # the event name of the record being read
+    data = False  # whether that record has a data field (only then is it dispatched)
+    after_cr = False  # the last chunk ended with CR: a leading LF finishes that CRLF
+    async for chunk in chunks:
+        buf = line + chunk
+        if after_cr and not line and buf.startswith(b"\n"):
+            buf = buf[1:]  # not an empty line: the second half of a CRLF split across chunks
+        after_cr = chunk.endswith(b"\r")
+        *lines, rest = _LINE_END.split(buf)
+        line = rest[:64]  # a line's field and event name are all that is read
+        for full in lines:
+            if not full:  # a blank line dispatches the record
+                if data:
+                    turn.event = name
+                name, data = None, False
+                continue
+            field, _, value = full.partition(b":")
+            if field == b"event":
+                name = value.strip().decode()
+            elif field == b"data":
+                data = True
+        yield chunk

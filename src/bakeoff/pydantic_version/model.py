@@ -2,8 +2,9 @@
 
 OpenRouter uses `OpenRouterModel` + `OpenRouterProvider`, as the docs recommend, so
 `reasoning_details` and the billed `cost` are parsed. A BYOK OpenAI-compatible endpoint uses
-`OpenAIChatModel` with a `profile=` built from our endpoint compat flags. A model is built once
-per endpoint and shared by every thread; the per-thread part (`session_id`) is a run setting.
+`OpenAIChatModel` with a `profile=` built from our endpoint compat flags. OpenAI's Responses API
+uses `OpenAIResponsesModel` with `OpenAIResponsesModelSettings`. A model is built once per
+endpoint and shared by every thread; the per-thread part (`session_id`) is a run setting.
 """
 
 from __future__ import annotations
@@ -13,10 +14,18 @@ from typing import Any, get_args
 
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient, omit
 
-# The first OpenAIChatModel loads the SDK's chat resources, which the SDK imports lazily: that
-# blocks the event loop for about 0.25 s (openai 2.x) inside the first turn. Import them here.
+# The first OpenAIChatModel (OpenAIResponsesModel) loads the SDK's chat (responses) resources,
+# which the SDK imports lazily: that blocks the event loop for about 0.25 s (0.09 s) on openai 2.x
+# inside the first turn. Import them here.
 from openai.resources.chat import AsyncChat  # noqa: F401
-from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+from openai.resources.responses import AsyncResponses  # noqa: F401
+from pydantic_ai.models import Model
+from pydantic_ai.models.openai import (
+    OpenAIChatModel,
+    OpenAIChatModelSettings,
+    OpenAIResponsesModel,
+    OpenAIResponsesModelSettings,
+)
 from pydantic_ai.models.openrouter import OpenRouterModel, OpenRouterModelSettings
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -28,7 +37,7 @@ from bakeoff.shared.contract import ModelConfig
 EventHooks = dict[str, list[Callable[[Any], Awaitable[None]]]]
 
 
-def build_model(cfg: ModelConfig, event_hooks: EventHooks) -> OpenAIChatModel:
+def build_model(cfg: ModelConfig, event_hooks: EventHooks) -> Model:
     """The model for `cfg`'s endpoint (`cfg.session_id` is ignored: see `run_settings`).
     Retries are the OpenAI SDK's own (`max_retries`); the hooks only observe."""
     client = AsyncOpenAI(
@@ -48,6 +57,20 @@ def build_model(cfg: ModelConfig, event_hooks: EventHooks) -> OpenAIChatModel:
             provider=OpenRouterProvider(openai_client=client),
             settings=OpenRouterModelSettings(**base, **_openrouter_settings(cfg)),
         )
+    if cfg.kind == "openai_responses":
+        # The harness keeps the history (contract rule 2), so OpenAI stores nothing and a
+        # reasoning item goes back as its encrypted content. The library asks for that content
+        # (`include`) and replays it, with the item ids, for a reasoning profile.
+        settings = OpenAIResponsesModelSettings(**base, openai_store=False, **_effort(cfg))
+        if summary := (cfg.reasoning or {}).get("summary"):
+            settings["openai_reasoning_summary"] = summary  # the API sends none unless asked
+        reasons = cfg.compat.get("reasoning_param") != "none"
+        return OpenAIResponsesModel(
+            cfg.model,
+            provider=OpenAIProvider(openai_client=client),
+            profile=_REASONING_PROFILE if reasons else None,
+            settings=settings,
+        )
     # pydantic-ai picks the profile from the model name, and a custom base URL does not change
     # that, so a non-OpenAI name loses thinking support. The documented `profile=` argument is
     # merged over the name-based profile.
@@ -60,7 +83,7 @@ def build_model(cfg: ModelConfig, event_hooks: EventHooks) -> OpenAIChatModel:
     )
 
 
-def run_settings(model: OpenAIChatModel, cfg: ModelConfig) -> ModelSettings | None:
+def run_settings(model: Model, cfg: ModelConfig) -> ModelSettings | None:
     """The per-thread settings: OpenRouter's sticky routing `session_id`. Run settings replace the
     model's `extra_body` as a whole (settings merge shallowly), so it carries the model's keys."""
     if cfg.kind != "openrouter" or not cfg.session_id:
@@ -99,15 +122,9 @@ def _compat(cfg: ModelConfig) -> tuple[OpenAIModelProfile, OpenAIChatModelSettin
     if flags.get("developer_role"):
         profile["openai_system_prompt_role"] = "developer"
     if cfg.reasoning and reasoning_param == "reasoning_effort":
-        effort = cfg.reasoning.get("effort", True)
-        if isinstance(effort, bool) or effort in get_args(ThinkingEffort):
+        settings.update(_effort(cfg))
+        if "thinking" in settings:
             profile["supports_thinking"] = True
-            settings["thinking"] = effort
-        else:
-            # Values the unified `thinking` setting has no level for ("none" turns reasoning
-            # off, which some models need before they accept tools; "max") go straight through
-            # the documented OpenAI-specific setting.
-            settings["openai_reasoning_effort"] = effort
     elif cfg.reasoning and reasoning_param == "openrouter":
         extra_body["reasoning"] = cfg.reasoning  # OpenAIChatModel has no setting for this shape
     if flags.get("stream_usage") is False:
@@ -117,3 +134,29 @@ def _compat(cfg: ModelConfig) -> tuple[OpenAIModelProfile, OpenAIChatModelSettin
     if extra_body:
         settings["extra_body"] = extra_body
     return profile, settings
+
+
+# pydantic-ai picks the profile from the model name, and 2.31.1 predates gpt-6-luna: it would take
+# the model for one that does not reason, so it would drop the effort and replay no reasoning (and
+# no `phase`). The model reasons even with no `reasoning` config (at its default effort), so a
+# Responses model is taken to reason unless compat `reasoning_param` is "none". With these flags
+# 2.31.1 asks for, replays and configures reasoning as 2.50.0 does for gpt-6-luna.
+_REASONING_PROFILE = OpenAIModelProfile(
+    supports_thinking=True,
+    openai_supports_reasoning=True,
+    openai_supports_encrypted_reasoning_content=True,
+    openai_supports_phase=True,
+    openai_responses_supports_reasoning_context=True,
+)
+
+
+def _effort(cfg: ModelConfig) -> OpenAIChatModelSettings:
+    """The reasoning effort: the unified `thinking` setting where it has the level. The values it
+    has no level for ("none" turns reasoning off, which some models need before they accept
+    tools; "max") go straight through the documented OpenAI-specific setting."""
+    if not cfg.reasoning:
+        return OpenAIChatModelSettings()
+    effort = cfg.reasoning.get("effort", True)
+    if isinstance(effort, bool) or effort in get_args(ThinkingEffort):
+        return OpenAIChatModelSettings(thinking=effort)
+    return OpenAIChatModelSettings(openai_reasoning_effort=effort)

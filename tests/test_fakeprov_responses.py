@@ -270,6 +270,16 @@ def test_a_failed_response(serve):
     assert data["response"]["status"] == "failed"
     assert data["response"]["error"] == {"code": "rate_limit_exceeded", "message": "slow down"}
     assert [item["type"] for item in data["response"]["output"]] == ["message"]
+    assert data["response"]["usage"] is None
+
+
+def test_a_failed_response_that_carries_usage(serve):
+    usage = {"input_tokens": 50, "output_tokens": 3}
+    ops = [{"text": "Hal", "done": False}, {"failed": {"message": "boom", "usage": usage}}]
+    provider = serve(scenario("T", {"respond": {"stream": ops}}))
+    response = events(post(provider, request()))[-1][1]["response"]
+    assert (response["status"], response["error"]["code"]) == ("failed", "server_error")
+    assert response["usage"]["total_tokens"] == 53
 
 
 def test_a_response_that_runs_out_of_output_tokens(serve):

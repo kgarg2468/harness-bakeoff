@@ -4,7 +4,8 @@ The native `ModelMessage` JSON is the source of truth for this loop's history. E
 the native JSON of exactly what it shows: a model response, or one part of a request (a tool
 result or a prompt). pydantic-ai merges consecutive requests again before it sends them, so the
 split never reaches the wire, and a crash between two items of one tool batch loses nothing that
-was saved. `Item.message` is the OpenAI-shaped view, as the model puts it on the wire.
+was saved. `Item.message` is the OpenAI-shaped view, as the model puts it on the wire (for the
+Responses API, the chat-shaped view of it, without the reasoning items).
 """
 
 from __future__ import annotations
@@ -60,11 +61,16 @@ def to_history(items: list[Item]) -> list[ModelMessage]:
     return history
 
 
-def to_openai(message: ModelMessage) -> list[dict[str, Any]]:
+def to_openai(message: ModelMessage, responses_api: bool = False) -> list[dict[str, Any]]:
     """The OpenAI chat messages for one native message: one per tool result or prompt, one per
-    response, none for a response with nothing to send (the model skips those too)."""
+    response. A response cut short with nothing left to send gets none. A complete one with
+    nothing to show (say, only a Responses reasoning item, which the library replays) still gets
+    one, with no content: without it the requests on either side of it merge when the history is
+    rebuilt, and the library's merge puts the retry prompt before the user's message."""
     if isinstance(message, ModelResponse):
-        assistant = _assistant(replayable([message])[0])
+        assistant = _assistant(replayable([message])[0], responses_api)
+        if assistant is None and message.state != "interrupted":
+            assistant = {"role": "assistant", "content": None}
         return [assistant] if assistant is not None else []
     out: list[dict[str, Any]] = []
     for part in message.parts:
@@ -79,15 +85,27 @@ def to_openai(message: ModelMessage) -> list[dict[str, Any]]:
     return out
 
 
-def replayable(messages: list[ModelMessage]) -> list[ModelMessage]:
+def replayable(messages: list[ModelMessage], responses_api: bool = False) -> list[ModelMessage]:
     """The history as the loop replays it (a `ProcessHistory` capability): a response cut short by
     a cancel loses its unsigned thinking. The signature only arrives at the end of a thinking
-    block, and endpoints that check signatures (Anthropic) reject a replay without one."""
+    block, and endpoints that check signatures (Anthropic) reject a replay without one.
+
+    On the Responses API the signature is a reasoning item's encrypted content, the only way the
+    API knows the item with `store: false` (404 without it). It is on the item's first part only,
+    so an item goes whole: kept if a part is signed, else dropped, from any response (one can end,
+    `.incomplete`, before its reasoning item is done)."""
     out: list[ModelMessage] = []
     for message in messages:
-        if isinstance(message, ModelResponse) and message.state == "interrupted":
+        if isinstance(message, ModelResponse):
+            signed = {p.id for p in message.parts if isinstance(p, ThinkingPart) and p.signature}
+            # Unsigned thinking stays if its reasoning item is signed (Responses API), or if the
+            # response is complete (chat completions).
             parts = [
-                p for p in message.parts if not (isinstance(p, ThinkingPart) and not p.signature)
+                p
+                for p in message.parts
+                if not isinstance(p, ThinkingPart)
+                or p.signature
+                or (p.id in signed if responses_api else message.state != "interrupted")
             ]
             if len(parts) < len(message.parts):
                 message = replace(message, parts=parts)
@@ -156,34 +174,50 @@ def spent(history: list[ModelMessage]) -> RunUsage:
 
 
 def finished(history: list[ModelMessage], max_cost_usd: float | None = None) -> str | None:
-    """How the turn ended if its end is already saved (a crash came after it): "end_turn" after
-    the final answer ("budget" if the turn's cost crossed `max_cost_usd`, as the original run
-    reported), "cancelled" after a response cut short (a cancel, or a failed stream that ended
-    the turn). None if the turn goes on."""
+    """How the turn ended if its end is already saved (a crash came after it), as the original run
+    reported it. After a response cut short: "error" if a failure cut it (the loop saves it with
+    finish reason "error"), else "cancelled". After a last response without calls that ends the
+    turn: "budget" if the turn's cost crossed `max_cost_usd` (the library checks the cost as it adds
+    a response, before it reads it), else "end_turn" after the final answer, or "error" after no
+    answer that the library raises on instead of asking again: out of output tokens (finish reason
+    "length", say a reasoning-only `.incomplete` on 2.50.0), or blank and stopped by a content
+    filter. None if the turn goes on: any other response without text (say, reasoning only on
+    2.31.1, which gives `.incomplete` no finish reason) is no answer, and the library asks again."""
     turn = this_turn(history)
     response = next((m for m in reversed(turn) if isinstance(m, ModelResponse)), None)
     if response is not None and response.state == "interrupted":
-        return "cancelled"
-    if turn and turn[-1] is response and not response.tool_calls:
-        cost = spent(history).cost or 0
-        over = max_cost_usd is not None and cost > Decimal(str(max_cost_usd))
-        return "budget" if over else "end_turn"
-    return None
+        return "error" if response.finish_reason == "error" else "cancelled"
+    if response is None or turn[-1] is not response or response.tool_calls:
+        return None
+    # 2.50.0's rule: blank is no parts or only empty text parts. 2.31.1 differs only on empty
+    # text parts, which it never saves with either finish reason.
+    answer = any(isinstance(p, TextPart) and p.content for p in response.parts)
+    blank = all(isinstance(p, TextPart) and not p.content for p in response.parts)
+    filtered = response.finish_reason == "content_filter" and blank
+    if not (answer or response.finish_reason == "length" or filtered):
+        return None
+    cost = spent(history).cost or 0
+    if max_cost_usd is not None and cost > Decimal(str(max_cost_usd)):
+        return "budget"
+    return "end_turn" if answer else "error"
 
 
 def _tool(call_id: str, content: str) -> dict[str, Any]:
     return {"role": "tool", "tool_call_id": call_id, "content": content}
 
 
-def _assistant(response: ModelResponse) -> dict[str, Any] | None:
+def _assistant(response: ModelResponse, responses_api: bool) -> dict[str, Any] | None:
     """The assistant message OpenRouterModel / OpenAIChatModel sends for a response, or None
-    (the library's "auto" rules for thinking; text pieces are joined with a blank line)."""
+    (the library's "auto" rules for thinking; text pieces are joined with a blank line). A
+    Responses API reasoning item has no chat field: only the native replays it (encrypted)."""
     texts: list[str] = []
     details: list[dict[str, Any]] = []
     fields: dict[str, list[str]] = {}
     for part in response.parts:
         if isinstance(part, TextPart):
             texts.append(part.content)
+        elif isinstance(part, ThinkingPart) and responses_api:
+            continue
         elif isinstance(part, ThinkingPart) and part.provider_name == "openrouter":
             details.append(_reasoning_detail(part))
         elif isinstance(part, ThinkingPart) and part.id not in (None, "content"):
