@@ -1,6 +1,6 @@
 import pytest
 
-from bakeoff.shared.permissions import evaluate, match, validate_rules
+from bakeoff.shared.permissions import asks, evaluate, match, validate_rules
 
 DESIGN_RULES = {"*": "allow", "write_file": {"*.pipe": "allow", "*": "ask"}, "edit_file": "ask"}
 
@@ -71,3 +71,48 @@ def test_validate_rules_rejects_bad_decisions(rules):
 
 def test_validate_rules_accepts_design_example():
     validate_rules(DESIGN_RULES)
+
+
+def _probe_asks(rules: dict) -> bool:
+    """Whether `evaluate` answers "ask" for any probe: every tool the rules name plus one they
+    do not, on no path, an unmatched path and a path matching each glob."""
+    globs = [g for rule in rules.values() if isinstance(rule, dict) for g in rule]
+    paths = [None, "unmatched/zz.q", *(g.replace("*", "x").replace("?", "y") for g in globs)]
+    tools = [*(t for t in rules if t != "*"), "other_tool"]
+    return any(evaluate(rules, tool, path) == "ask" for tool in tools for path in paths)
+
+
+@pytest.mark.parametrize(
+    ("rules", "expected"),
+    [
+        ({}, True),  # nothing matches -> ask
+        ({"*": "allow"}, False),
+        ({"*": "deny"}, False),
+        ({"*": "ask"}, True),
+        ({"write_file": "allow"}, True),  # no "*": every other tool asks
+        ({"*": "allow", "write_file": "ask"}, True),
+        (DESIGN_RULES, True),
+        # A path no glob matches falls through to "*" ...
+        ({"*": "allow", "write_file": {"*.pipe": "allow"}}, False),
+        ({"*": "deny", "write_file": {"*.pipe": "allow"}}, False),
+        ({"*": "allow", "write_file": {}}, False),
+        # ... and past a "*" mapping to "ask".
+        ({"*": {"docs/*": "allow"}}, True),
+        ({"*": {}}, True),
+        ({"*": {"docs/*": "allow", "*": "deny"}}, False),
+        # An "ask" glob counts only if a path can reach it.
+        ({"*": "allow", "write_file": {"*.pipe": "ask", "*": "allow"}}, True),
+        ({"*": "allow", "write_file": {"*": "allow", "*.pipe": "ask"}}, False),
+        ({"*": {"**": "allow", "docs/*": "ask"}}, False),
+    ],
+)
+def test_asks_whenever_some_call_evaluates_to_ask(rules, expected):
+    assert _probe_asks(rules) is expected  # the table is what `evaluate` does ...
+    assert asks(rules) is expected  # ... and asks() agrees
+
+
+def test_asks_errs_toward_asking():
+    """ "a.pipe" never runs ("*.pipe" matches first), but asks() does not compare globs: a run
+    that is wrongly unattended would pause with nobody to answer."""
+    rules = {"*": "allow", "write_file": {"*.pipe": "allow", "a.pipe": "ask"}}
+    assert not _probe_asks(rules) and asks(rules)

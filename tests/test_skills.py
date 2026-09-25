@@ -500,14 +500,19 @@ def test_sync_copies_text_files_and_records_the_commit(tmp_path):
 
 
 async def test_unattended_runs_get_the_gate_note_next_to_the_skill(tmp_path):
-    """With no "ask" rule nobody can answer a gate, so load_skill says gates are pre-approved;
+    """When no call can ask, nobody can answer a gate, so load_skill says gates are pre-approved;
     with a person approving, it does not."""
     from bakeoff.shared.contract import ToolCall
     from bakeoff.shared.toolhost import build_toolhost
     from bakeoff.shared.tools.skill_tools import UNATTENDED_NOTE
 
     args = '{"name": "rocketride-building-pipelines"}'
-    for rules, expected in (({"*": "allow"}, True), ({"*": "allow", "write_file": "ask"}, False)):
+    cases = (
+        ({"*": "allow"}, True),
+        ({"*": "allow", "write_file": "ask"}, False),
+        ({"write_file": "allow"}, False),  # load_skill has no rule, so it asks
+    )
+    for rules, expected in cases:
         host = build_toolhost(tmp_path, rules, lambda e: None)
         result = await host.run(ToolCall("c1", "load_skill", args))
         assert result.ok and (UNATTENDED_NOTE in result.content) is expected

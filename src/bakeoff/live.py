@@ -305,7 +305,7 @@ async def _read_line(fd: int, pending: bytearray, stop: asyncio.Future[None]) ->
 
 
 # RocketRide's skills stop at approval gates and wait for a person. In a run with nobody to
-# answer (no "ask" rules), that would end every build at the first gate.
+# answer (no call can evaluate to "ask"), that would end every build at the first gate.
 UNATTENDED = (
     "This run is unattended: nobody can answer approval gates. When a skill says to present a"
     " gate and wait, state what you chose in one line, treat it as approved, and keep going"
@@ -328,7 +328,7 @@ def system_prompt(*, attended: bool = True) -> str:
 
 
 def _attended(rules: dict[str, Any]) -> bool:
-    """Whether a person approves anything in this run (some rule says "ask")."""
+    """Whether a person approves anything in this run (some call can evaluate to "ask")."""
     return permissions.asks(rules)
 
 

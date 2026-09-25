@@ -59,6 +59,28 @@ def validate_rules(rules: Mapping[str, Any]) -> None:
                 raise ValueError(f"Invalid permission rule for {tool!r}: {decision!r}")
 
 
-def asks(rules: dict) -> bool:
-    """Whether any rule answers "ask", i.e. a person approves something in this thread."""
-    return any(v == "ask" or (isinstance(v, dict) and "ask" in v.values()) for v in rules.values())
+def asks(rules: Mapping[str, Any]) -> bool:
+    """Whether some call can evaluate to "ask", i.e. a person may have to approve something in
+    this thread (so it is not unattended).
+
+    Follows `evaluate`: a tool without a key of its own gets the "*" rule, and a path that no
+    glob of the tool's mapping matches falls through to "*", then to "ask". It errs toward True:
+    without a "*" key some tool is taken to have no key of its own, and a glob counts as
+    reachable unless an earlier glob of its mapping matches every path.
+    """
+    default = _reachable(rules.get("*"), {"ask"})  # what a tool without its own key gets
+    return "ask" in default or any(
+        "ask" in _reachable(rule, default) for tool, rule in rules.items() if tool != "*"
+    )
+
+
+def _reachable(rule: Any, unmatched: set[str]) -> set[str]:
+    """The decisions `rule` can give, where `unmatched` is what a path no glob matches gets."""
+    if isinstance(rule, str):
+        return {rule}
+    found: set[str] = set()
+    for pattern, decision in (rule or {}).items():
+        found.add(decision)
+        if not pattern.strip("*"):  # "*" (or "**") matches every path: later globs never run
+            return found
+    return found | unmatched

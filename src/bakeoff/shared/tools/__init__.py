@@ -21,7 +21,7 @@ class ToolContext:
 
     workdir: Path  # the working copy, already resolved
     engine: Engine
-    unattended: bool = False  # no rule asks a person, so nobody can answer approval gates
+    unattended: bool = False  # no call can ask a person, so nobody can answer approval gates
 
 
 @dataclass(slots=True, frozen=True)
