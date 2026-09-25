@@ -73,7 +73,9 @@ bakeoff chat --impl our            # REPL: approvals prompted, /revert N, /compa
 `--api responses` uses OpenAI's Responses API (endpoint kind `openai_responses`, same
 `--base-url`, `https://api.openai.com/v1` by default) instead of chat completions: `gpt-6-luna`
 takes function tools on chat completions only with reasoning effort `none`, so tools plus
-reasoning need it. `--kind` picks the chat completions kind (`openai_compat` or `openrouter`).
+reasoning need it. There `--reasoning EFFORT` also asks for a reasoning summary (`"summary":
+"auto"`, unless the effort is `none`): the API streams none otherwise. `--kind` picks the chat
+completions kind (`openai_compat` or `openrouter`).
 
 In `chat`, Ctrl-C during a turn cancels the turn, and at a prompt it ends the chat. `chat` exits 1
 if any turn stopped short (error, max_steps, budget, cancelled) or an invariant failed, else 0.
