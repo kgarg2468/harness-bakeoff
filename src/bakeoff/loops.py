@@ -45,15 +45,6 @@ REGISTRY: dict[str, LoopEntry] = {
             "our",
             "bakeoff.our_version:OurLoop",
             ("httpx",),
-            known_failures={
-                # The step cap is checked before the next request, after the capped step's
-                # calls ran; a read-only call even starts while its response streams.
-                "S11": KnownFailure(
-                    frozenset({"tool_runs"}),
-                    "runs call_S11_3, the call of the step that hits max_steps, whose result"
-                    " can never be sent (S11 expects it not to run)",
-                ),
-            },
         ),
         LoopEntry(
             "pydantic",

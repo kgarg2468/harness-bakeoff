@@ -153,8 +153,14 @@ def test_live_run_streams_and_writes_the_layout(
     assert (out / "live" / "latest").resolve() == (out / "live" / "t1").resolve()
 
 
-def test_live_sends_the_system_prompt_and_reasoning(endpoint: str, tmp_path: Path) -> None:
-    argv = ["live", "--impl", "our", "--model", "fake-live", "--base-url", endpoint]
+@pytest.mark.parametrize("impl", ["our", "pydantic"])
+def test_live_sends_the_system_prompt_and_reasoning(
+    endpoint: str, tmp_path: Path, impl: str
+) -> None:
+    """Both loops send reasoning_effort "none" (pydantic-ai's unified `thinking` setting has no
+    such level, so A passes it through `openai_reasoning_effort`), and an unattended run tells
+    the model that approval gates are pre-approved."""
+    argv = ["live", "--impl", impl, "--model", "fake-live", "--base-url", endpoint]
     argv += [
         "--reasoning",
         "none",
@@ -167,11 +173,13 @@ def test_live_sends_the_system_prompt_and_reasoning(endpoint: str, tmp_path: Pat
     ]
     code = main(argv)
     assert code == 0
-    body = json.loads((tmp_path / "wire" / "L1" / "r1" / "our" / "001.json").read_text())
+    body = json.loads((tmp_path / "wire" / "L1" / "r1" / impl / "001.json").read_text())
     assert body["reasoning_effort"] == "none"
     assert "temperature" not in body  # reasoning models reject it; the model default applies
-    assert body["messages"][0] == {"role": "system", "content": live.system_prompt()}
-    assert body["messages"][0]["content"].startswith("You are Rocket Agent.")
+    system = live.system_prompt(attended=False)
+    assert body["messages"][0] == {"role": "system", "content": system}
+    assert system.startswith("You are Rocket Agent.") and live.UNATTENDED in system
+    assert live.UNATTENDED not in live.system_prompt(attended=True)
 
 
 async def test_chat_asks_before_writing(tmp_path: Path) -> None:

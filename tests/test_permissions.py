@@ -1,6 +1,8 @@
+import itertools
+
 import pytest
 
-from bakeoff.shared.permissions import evaluate, match, validate_rules
+from bakeoff.shared.permissions import asks, evaluate, match, validate_rules
 
 DESIGN_RULES = {"*": "allow", "write_file": {"*.pipe": "allow", "*": "ask"}, "edit_file": "ask"}
 
@@ -71,3 +73,70 @@ def test_validate_rules_rejects_bad_decisions(rules):
 
 def test_validate_rules_accepts_design_example():
     validate_rules(DESIGN_RULES)
+
+
+def _probe_asks(rules: dict) -> bool:
+    """Whether `evaluate` answers "ask" for any probe: every tool the rules name plus one they
+    do not, on no path, an unmatched path and a path matching each glob."""
+    globs = [g for rule in rules.values() if isinstance(rule, dict) for g in rule]
+    paths = [None, "unmatched/zz.q", *(g.replace("*", "x").replace("?", "y") for g in globs)]
+    tools = [*(t for t in rules if t != "*"), "other_tool"]
+    return any(evaluate(rules, tool, path) == "ask" for tool in tools for path in paths)
+
+
+@pytest.mark.parametrize(
+    ("rules", "expected"),
+    [
+        ({}, True),  # nothing matches -> ask
+        ({"*": "allow"}, False),
+        ({"*": "deny"}, False),
+        ({"*": "ask"}, True),
+        ({"write_file": "allow"}, True),  # no "*": every other tool asks
+        ({"*": "allow", "write_file": "ask"}, True),
+        (DESIGN_RULES, True),
+        # A path no glob matches falls through to "*" ...
+        ({"*": "allow", "write_file": {"*.pipe": "allow"}}, False),
+        ({"*": "deny", "write_file": {"*.pipe": "allow"}}, False),
+        ({"*": "allow", "write_file": {}}, False),
+        # ... and past a "*" mapping to "ask".
+        ({"*": {"docs/*": "allow"}}, True),
+        ({"*": {}}, True),
+        ({"*": {"docs/*": "allow", "*": "deny"}}, False),
+        # An "ask" glob counts only if a path can reach it.
+        ({"*": "allow", "write_file": {"*.pipe": "ask", "*": "allow"}}, True),
+        ({"*": "allow", "write_file": {"*": "allow", "*.pipe": "ask"}}, False),
+        ({"*": {"**": "allow", "docs/*": "ask"}}, False),
+        # "" matches only a call without a path, so a call with one still falls through.
+        ({"*": {"": "allow"}}, True),
+        ({"*": {"": "deny"}}, True),
+        ({"*": {"": "allow", "*": "deny"}}, False),
+    ],
+)
+def test_asks_whenever_some_call_evaluates_to_ask(rules, expected):
+    assert _probe_asks(rules) is expected  # the table is what `evaluate` does ...
+    assert asks(rules) is expected  # ... and asks() agrees
+
+
+def test_asks_never_misses_an_ask():
+    """Every rule set over a small pool (both rule shapes, "" and catch-all globs, any order):
+    whenever some call evaluates to "ask", asks() says so. A miss marks a run unattended that
+    will still pause."""
+    decisions = ["allow", "ask", "deny"]
+    globs = ["", "*", "*.pipe"]
+    mappings = [{}] + [
+        dict(zip(order, picked, strict=True))
+        for n in (1, 2)
+        for order in itertools.permutations(globs, n)
+        for picked in itertools.product(decisions, repeat=n)
+    ]
+    options = [None, *decisions, *mappings]  # None: the key is absent
+    for star, tool in itertools.product(options, repeat=2):
+        rules = {k: v for k, v in (("*", star), ("write_file", tool)) if v is not None}
+        assert asks(rules) or not _probe_asks(rules), rules
+
+
+def test_asks_errs_toward_asking():
+    """ "a.pipe" never runs ("*.pipe" matches first), but asks() does not compare globs: a run
+    that is wrongly unattended would pause with nobody to answer."""
+    rules = {"*": "allow", "write_file": {"*.pipe": "allow", "a.pipe": "ask"}}
+    assert not _probe_asks(rules) and asks(rules)

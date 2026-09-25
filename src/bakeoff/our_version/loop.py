@@ -32,6 +32,9 @@ _DRAIN_S = 0.05  # once the answer is complete, wait this long for the body's en
 _EMPTY: dict[str, Any] = {}
 _NO_CHOICE = (_EMPTY,)
 _UNPRICED = "max_cost_usd is set but the endpoint reports no cost"
+# The calls of the response that used the last allowed step never run: no request could send
+# their results, so running them would only leave side effects the model never sees.
+_STEP_CAP = "Not run: the turn reached its step limit"
 
 
 def _role(item: Item) -> Any:
@@ -140,7 +143,7 @@ class _Turn:
         last = next((_role(it) for it in reversed(history) if it.status == "complete"), None)
         try:
             if pending := self._pending():  # approval or crash resume
-                async for event in self._tools(pending):
+                async for event in self._tools_within_cap(pending):
                     yield event
             elif last == "assistant":
                 yield self._end("end_turn")  # resumed after the final answer: nothing left to do
@@ -226,6 +229,9 @@ class _Turn:
                     cut = stream.partial() or {"role": "assistant", "content": None}
                     yield self._item(cut, status="incomplete", usage=usage)
                     yield Event("usage", usage)
+                    if self.cancel.is_set():  # it came while the body's end drained (rule 6)
+                        yield self._end("cancelled")
+                        return
                     cut_at = f"Output truncated at max_tokens={self.model.max_tokens}"
                     for event in self._abort("output_truncated", cut_at):
                         yield event
@@ -236,10 +242,10 @@ class _Turn:
                 yield self._item(stream.message(), usage=usage)
                 yield Event("usage", usage)
                 if calls := stream.tool_calls():
-                    async for event in self._tools(calls):
+                    async for event in self._tools_within_cap(calls):
                         yield event
-                else:
-                    yield self._end("end_turn")
+                else:  # a cancel while the body's end drained still stopped the turn (rule 6)
+                    yield self._end("cancelled" if self.cancel.is_set() else "end_turn")
         except Exception as exc:  # a bug must still end the turn (contract rule 7)
             await self._stop_jobs()
             for event in self._abort("internal", repr(exc)):
@@ -321,7 +327,9 @@ class _Turn:
     def _start_early(self, stream: Stream) -> None:
         """Start complete, allowed read-only calls while the model is still streaming, in call
         order: a call starts early only if every call before it did, so none can run ahead of
-        an earlier write."""
+        an earlier write. Nothing starts on the last allowed step (see `_STEP_CAP`)."""
+        if self.steps >= self.turn.limits.max_steps:
+            return
         for streamed in stream.calls.values():
             if streamed.id in self.jobs:
                 continue
@@ -331,6 +339,22 @@ class _Turn:
             if self.tools.check(call) != "allow":
                 return
             self._start(call)
+
+    async def _tools_within_cap(self, calls: list[ToolCall]) -> AsyncIterator[Event]:
+        """`_tools`, unless this step was the last one allowed: then no call runs, each still
+        gets a result (no orphans), and the turn ends with max_steps, or cancelled if the
+        cancel came first (contract rule 6)."""
+        if self.steps < self.turn.limits.max_steps:
+            async for event in self._tools(calls):
+                yield event
+            return
+        # A cancel can land at any point here, even while these results are being published
+        # (each yield hands control to the runner): the user stopped the turn, so it must not
+        # be reported as a step limit. Read the flag afresh for every result and for the end.
+        for call in calls:
+            text = CANCELLED if self.cancel.is_set() else _STEP_CAP
+            yield self._result(ToolResult(call.id, False, text))
+        yield self._end("cancelled" if self.cancel.is_set() else "max_steps")
 
     async def _tools(self, calls: list[ToolCall]) -> AsyncIterator[Event]:
         """Run the calls and append one result per call, in call order.
