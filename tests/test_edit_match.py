@@ -1,5 +1,9 @@
+import random
+import time
+
 import pytest
 
+from bakeoff.shared.tools import edit_match
 from bakeoff.shared.tools.edit_match import (
     REPLACERS,
     EditError,
@@ -106,6 +110,51 @@ def test_levenshtein():
     assert levenshtein("kitten", "sitting") == 3
     assert levenshtein("", "abc") == 3
     assert levenshtein("same", "same") == 0
+
+
+def _table_levenshtein(a: str, b: str) -> int:
+    """OpenCode's dynamic-programming version, as the reference."""
+    previous = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        current = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+        previous = current
+    return previous[len(b)]
+
+
+def test_levenshtein_matches_the_table_version():
+    rng = random.Random(7)
+    for _ in range(500):
+        alphabet = rng.choice(["ab", "abcdefgh", "aé日 "])
+        a, b = ("".join(rng.choices(alphabet, k=rng.randrange(20))) for _ in range(2))
+        assert levenshtein(a, b) == _table_levenshtein(a, b), (a, b)
+
+
+def test_long_middle_lines_stay_fast():
+    # The table version took seconds here, blocking the event loop.
+    rng = random.Random(3)
+    line = "".join(rng.choices("abcdefgh", k=10_000))
+    other = "".join(rng.choices("abcdefgh", k=10_000))
+    start = time.perf_counter()
+    with pytest.raises(NoMatch):
+        replace(f"{{\n{line}\n}}\n", f"{{\n{other}\n}}", "x")
+    assert time.perf_counter() - start < 2
+
+
+def test_single_candidate_stops_once_similar_enough(monkeypatch):
+    calls = []
+
+    def counting(a, b):
+        calls.append((a, b))
+        return levenshtein(a, b)
+
+    monkeypatch.setattr(edit_match, "levenshtein", counting)
+    content = "start\n1\n2\n3\n4\nend"
+    # Each identical middle line adds 1/4; the third reaches 0.65.
+    assert list(block_anchor_replacer(content, content)) == [content]
+    assert len(calls) == 3
 
 
 def test_exact_unique_match():

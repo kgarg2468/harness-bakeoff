@@ -1,5 +1,5 @@
 # Ported from OpenCode (MIT): packages/opencode/src/tool/edit.ts @ 16c56fe5ecc3305028d1f0a9cff5806e51c9d480
-# Changes: the replacer chain and replace() only, in Python; empty candidate spans are skipped.
+# Changes: the replacer chain and replace() only, in Python; empty candidate spans are skipped; bit-parallel levenshtein.
 # OpenCode credits these approaches to Cline (Apache-2.0):
 #   evals/diff-edits/diff-apply/diff-06-23-25.ts and diff-06-26-25.ts
 # and gemini-cli (Apache-2.0): packages/core/src/utils/editCorrector.ts
@@ -12,6 +12,7 @@ first span that occurs exactly once is replaced (or every occurrence, with `repl
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Iterator
 
@@ -35,17 +36,37 @@ class MultipleMatches(EditError):
 
 
 def levenshtein(a: str, b: str) -> int:
-    """Edit distance between `a` and `b`."""
-    if a == "" or b == "":
-        return max(len(a), len(b))
-    previous = list(range(len(b) + 1))
-    for i in range(1, len(a) + 1):
-        current = [i] + [0] * len(b)
-        for j in range(1, len(b) + 1):
-            cost = 0 if a[i - 1] == b[j - 1] else 1
-            current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
-        previous = current
-    return previous[len(b)]
+    """Edit distance between `a` and `b`.
+
+    Myers' bit-parallel algorithm (in Hyyrö's form) rather than OpenCode's table: the same
+    result, but a column of the table is a few integer operations, so a multi-KB line takes
+    milliseconds instead of seconds of blocking the event loop.
+    """
+    if len(a) > len(b):
+        a, b = b, a
+    if a == "":
+        return len(b)
+    masks: dict[str, int] = {}  # bit i set where b[i] is the character
+    for i, char in enumerate(b):
+        masks[char] = masks.get(char, 0) | (1 << i)
+    full = (1 << len(b)) - 1
+    top = 1 << (len(b) - 1)
+    pv, mv, distance = full, 0, len(b)  # vertical +1/-1 deltas of the current column
+    for char in a:
+        eq = masks.get(char, 0)
+        xv = eq | mv
+        xh = (((eq & pv) + pv) ^ pv) | eq
+        ph = mv | (~(xh | pv) & full)
+        mh = pv & xh
+        if ph & top:
+            distance += 1
+        elif mh & top:
+            distance -= 1
+        ph = ((ph << 1) | 1) & full
+        mh = (mh << 1) & full
+        pv = mh | (~(xv | ph) & full)
+        mv = ph & xv
+    return distance
 
 
 def _span(lines: list[str], start: int, end: int) -> str:
@@ -72,11 +93,12 @@ def line_trimmed_replacer(content: str, find: str) -> Iterator[str]:
             yield _span(original_lines, i, i + len(search_lines) - 1)
 
 
-def _middle_similarity(original: list[str], search: list[str], start: int, end: int) -> float:
+def _middle_similarity(
+    original: list[str], search: list[str], start: int, end: int, stop_at: float = math.inf
+) -> float:
     """Mean similarity of the lines between the anchors (empty pairs count as 0).
 
-    OpenCode stops early for a single candidate once the threshold is reached; the sum only
-    grows, so computing it in full gives the same decision.
+    Stops adding once the mean reaches `stop_at`, as OpenCode does for a single candidate.
     """
     actual_size = end - start + 1
     lines_to_check = min(len(search) - 2, actual_size - 2)
@@ -89,8 +111,10 @@ def _middle_similarity(original: list[str], search: list[str], start: int, end: 
         max_len = max(len(original_line), len(search_line))
         if max_len == 0:
             continue
-        similarity += 1 - levenshtein(original_line, search_line) / max_len
-    return similarity / lines_to_check
+        similarity += (1 - levenshtein(original_line, search_line) / max_len) / lines_to_check
+        if similarity >= stop_at:
+            break
+    return similarity
 
 
 def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
@@ -119,7 +143,9 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
 
     if len(candidates) == 1:
         start, end = candidates[0]
-        similarity = _middle_similarity(original_lines, search_lines, start, end)
+        similarity = _middle_similarity(
+            original_lines, search_lines, start, end, SINGLE_CANDIDATE_SIMILARITY_THRESHOLD
+        )
         if similarity >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD:
             yield _span(original_lines, start, end)
         return
