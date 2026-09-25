@@ -194,16 +194,17 @@ A scenario with model kind `openai_responses` speaks OpenAI's Responses API inst
 (`response.created`, `response.output_item.added`/`.done`, `response.output_text.delta`,
 `response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`,
 `response.completed` with `usage`, the `error` event, ...), no `[DONE]`. Its primitives are
-reasoning items (`encrypted_content`, summary deltas if the request asks for them; the added
-item's `encrypted_content` is incomplete, as the API documents), messages (with `phase`),
-function calls, `completed` (usage), `incomplete` (usage; out of `max_output_tokens`), `error`
-and `failed` (usage optional) mid-stream, `stall`, and items cut short before their done events. Its
-strict mode `reject_unencrypted_reasoning` answers as the API does with `store: false`: a replayed
-reasoning item without its `encrypted_content` is 404, one whose `encrypted_content` is not what an
-earlier response's done event sent is 400. An input item of the wrong shape (say, a
-`function_call_output` without `output`) is 400 in the API's error shape. Its `expect` checks read
-`input` (e.g. `input_len`, `last_type`, `tool_result_contains` by `call_id`, `reasoning_replayed`:
-the item exactly as sent). Details: `fakeprov/README.md`.
+reasoning items (`encrypted_content`, summary deltas if the request asks for them, raw reasoning
+text; the added item's `encrypted_content` is incomplete, as the API documents), messages (with
+`phase`), function calls (the last one optionally done as `incomplete`), `completed` (usage),
+`incomplete` (usage; out of `max_output_tokens`), `error` and `failed` (usage optional) mid-stream, `stall`, and
+items cut short before their done events. Its strict mode
+`reject_unencrypted_reasoning` answers as the API does with `store: false`: a replayed reasoning
+item without its `encrypted_content` is 404, one whose `encrypted_content` is not what an earlier
+response's done event sent is 400. An input item of the wrong shape (say, a `function_call_output`
+without `output`) is 400 in the API's error shape. Its `expect` checks read `input` (e.g.
+`input_len`, `last_type`, `tool_result_contains` by `call_id`, `reasoning_replayed`: the item
+exactly as sent). Details: `fakeprov/README.md`.
 
 ## Scenarios
 

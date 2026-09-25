@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -41,21 +42,33 @@ def _sendable(msg: dict[str, Any]) -> bool:
     return msg.get("role") != "assistant" or bool(msg.get("content") or msg.get("tool_calls"))
 
 
+def message_json(item: Item) -> bytes:
+    """A history item as its chat-completions message."""
+    return dump(item.message)
+
+
 class Wire:
     """Request bodies for one thread, built by joining cached JSON fragments.
 
     The static prefix (model, params, tools, system message) is serialized once, and each item
     once (items are immutable), so every request repeats the previous one byte for byte.
+    `fragment` serializes one item: its message, or (Responses API) its input items.
     """
 
-    def __init__(self, key: tuple[Any, ...], static: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        key: tuple[Any, ...],
+        static: dict[str, Any],
+        fragment: Callable[[Item], bytes] = message_json,
+    ) -> None:
         self.key = key
         self.prefix = dump(static)[:-2]  # drop the closing "]}" so items can follow
+        self.fragment = fragment
         self.frags: dict[str, bytes] = {}
 
     def body(self, items: list[Item]) -> bytes:
         old = self.frags
-        self.frags = {it.id: old.get(it.id) or dump(it.message) for it in items}
+        self.frags = {it.id: old.get(it.id) or self.fragment(it) for it in items}
         return b",".join([self.prefix, *self.frags.values()]) + b"]}"
 
 
@@ -83,6 +96,8 @@ class StreamedCall:
 
 class Stream:
     """One streamed chat completion, accumulated chunk by chunk."""
+
+    native: list[dict[str, Any]] | None = None  # what its item keeps in Item.native (Responses)
 
     def __init__(self) -> None:
         self.text: list[str] = []

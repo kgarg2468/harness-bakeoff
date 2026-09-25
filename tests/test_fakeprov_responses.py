@@ -299,6 +299,57 @@ def test_a_response_that_runs_out_of_output_tokens(serve):
     assert response["output"] == [DONE_REASONING]
 
 
+def test_raw_reasoning_text_streams_in_content_parts(serve):
+    """Models that stream their reasoning itself send it as reasoning_text parts, whether or not
+    the request asks for a summary; the done item carries them as its `content`."""
+    raw = {**REASONING, "text": ["Think.", "More."]}
+    provider = serve(scenario("T", {"respond": {"stream": [{"reasoning_item": raw, "chunks": 2},
+                                                           COMPLETED]}}))  # fmt: skip
+    got = events(post(provider, request(reasoning={"effort": "xhigh"})))  # no summary asked for
+    assert [name for name, _ in got][2:] == [
+        "response.output_item.added",
+        *["response.content_part.added", "response.reasoning_text.delta",
+          "response.reasoning_text.delta", "response.reasoning_text.done",
+          "response.content_part.done"] * 2,
+        "response.output_item.done",
+        "response.completed",
+    ]  # fmt: skip
+    deltas = [(d["item_id"], d["content_index"], d["delta"]) for n, d in got
+              if n == "response.reasoning_text.delta"]  # fmt: skip
+    assert deltas == [("rs_1", 0, "Thi"), ("rs_1", 0, "nk."), ("rs_1", 1, "Mo"), ("rs_1", 1, "re.")]
+    parts = [d["part"] for n, d in got if n.startswith("response.content_part.")]
+    assert parts == [{"type": "reasoning_text", "text": t} for t in ("", "Think.", "", "More.")]
+    content = [
+        {"type": "reasoning_text", "text": "Think."},
+        {"type": "reasoning_text", "text": "More."},
+    ]
+    done = next(d["item"] for n, d in got if n == "response.output_item.done")
+    assert done == {**DONE_REASONING, "summary": [], "content": content}
+
+
+def test_a_call_cut_at_max_output_tokens_is_done_incomplete(serve):
+    """`status: incomplete` cuts the op's last call: its arguments never finish (no
+    arguments.done), and its done item is marked incomplete, as is the response."""
+    cut = {**CALL, "id": "call_2", "arguments": '{"path": "b.p'}
+    ops = [
+        {"tool_calls": [CALL, cut], "status": "incomplete"},
+        {"incomplete": COMPLETED["completed"]},
+    ]
+    provider = serve(scenario("T", {"respond": {"stream": ops}}))
+    got = events(post(provider, request()))
+    assert [name for name, _ in got][-4:] == [
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.output_item.done",
+        "response.incomplete",
+    ]
+    done = [d["item"] for n, d in got if n == "response.output_item.done"]
+    cut_done = {**DONE_CALL, "id": "fc_2", "call_id": "call_2", "status": "incomplete",
+                "arguments": '{"path": "b.p'}  # fmt: skip
+    assert done == [DONE_CALL, cut_done]
+    assert got[-1][1]["response"]["output"] == done
+
+
 def test_rate_limit_with_retry_after_then_ok(serve):
     limited = {"respond": {"status": 429, "headers": {"retry-after": "1"}}}
     provider = serve(scenario("T", limited, says("ok")))
@@ -676,6 +727,11 @@ def test_reasoning_must_be_replayed_exactly_as_sent(serve, replayed, failure):
             " error, failed or stall",
         ),
         (
+            lambda s: s["exchanges"][0]["respond"]["stream"][1].update(status="incomplete"),
+            "$.exchanges[0].respond.stream[1]: status: incomplete must come right before the"
+            " incomplete, error, failed or stall",
+        ),
+        (
             lambda s: s["exchanges"][0]["respond"]["stream"].insert(0, {"finish": "stop"}),
             "$.exchanges[0].respond.stream[0]: expected exactly one of: text, reasoning_item,"
             " tool_calls, completed, incomplete, error, failed, stall",
@@ -731,10 +787,12 @@ def test_r_scenarios_speak_the_responses_api(sid):
 async def test_the_openai_sdk_parses_every_event(serve):
     """The fake's stream is what the official SDK expects: every event is a typed event."""
     openai = pytest.importorskip("openai")
-    ops = [{"reasoning_item": REASONING}, {"text": "hi", "phase": "final_answer"},
-           {"tool_calls": [CALL]}, COMPLETED]  # fmt: skip
+    ops = [{"reasoning_item": {**REASONING, "text": ["Think."]}},
+           {"text": "hi", "phase": "final_answer"}, {"tool_calls": [CALL]}, COMPLETED]  # fmt: skip
     failing = [{"text": "x", "done": False}, {"error": {"message": "boom"}}]
-    cut = [{"reasoning_item": {**REASONING, "id": "rs_2"}}, {"incomplete": COMPLETED["completed"]}]
+    cut = [{"reasoning_item": {**REASONING, "id": "rs_2"}},
+           {"tool_calls": [{**CALL, "id": "call_2"}], "status": "incomplete"},
+           {"incomplete": COMPLETED["completed"]}]  # fmt: skip
     streams = [{"respond": {"stream": stream}} for stream in (ops, failing, cut)]
     provider = serve(scenario("T", *streams))
     client = openai.AsyncOpenAI(base_url=provider.base_url("T", "r1", "our"), api_key="dummy")
@@ -745,7 +803,7 @@ async def test_the_openai_sdk_parses_every_event(serve):
         final = seen[-1].response
         assert final.usage.input_tokens_details.cached_tokens == 0
         reasoning, message, call = final.output
-        assert reasoning.encrypted_content == ENC
+        assert (reasoning.encrypted_content, reasoning.content[0].text) == (ENC, "Think.")
         assert (message.phase, message.content[0].text) == ("final_answer", "hi")
         assert (call.call_id, call.arguments) == ("call_1", DONE_CALL["arguments"])
         stream = await client.responses.create(model=MODEL, input="hi", stream=True)
@@ -759,3 +817,4 @@ async def test_the_openai_sdk_parses_every_event(serve):
         last = [event async for event in stream][-1]
         assert type(last).__name__ == "ResponseIncompleteEvent"
         assert last.response.incomplete_details.reason == "max_output_tokens"
+        assert last.response.output[-1].status == "incomplete"

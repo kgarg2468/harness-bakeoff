@@ -1,0 +1,197 @@
+{
+ "what": "The live runs behind the README's live-run figures: `bakeoff live --impl our,pydantic --model gpt-6-luna --reasoning none --max-steps 20` on api.openai.com, 2026-09-25. Copied field by field from out/live/<run_id>/<loop>/result.json (no keys, no request bodies).",
+ "runs": [
+  {
+   "run_id": "20260925-123828-e021",
+   "loop": "our",
+   "model": "gpt-6-luna",
+   "base_url": "https://api.openai.com/v1",
+   "reasoning": "none",
+   "max_steps": 20,
+   "attended": false,
+   "prompt": "Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it.",
+   "stops": [
+    "end_turn"
+   ],
+   "steps": 8,
+   "requests": 8,
+   "input_tokens": 163802,
+   "cached_tokens": 125464,
+   "output_tokens": 737,
+   "first_token_ms": null,
+   "duration_ms": 11958.0,
+   "tool_runs": 13,
+   "files": [
+    "chat.pipe"
+   ],
+   "passed": true,
+   "invariants": {
+    "I2": true,
+    "I3": true,
+    "I5": true,
+    "I7": true
+   },
+   "final_text": "Created and validated `chat.pipe`.\n\nIt routes chat questions through OpenAI’s `gpt-4o-mini` model and returns answers. Configure `ROCKETRIDE_OPENAI_KEY` in the environment before running.\n\nValidation: **0 errors, 0 warnings.**"
+  },
+  {
+   "run_id": "20260925-123828-e021",
+   "loop": "pydantic",
+   "model": "gpt-6-luna",
+   "base_url": "https://api.openai.com/v1",
+   "reasoning": "none",
+   "max_steps": 20,
+   "attended": false,
+   "prompt": "Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it.",
+   "stops": [
+    "end_turn"
+   ],
+   "steps": 8,
+   "requests": 8,
+   "input_tokens": 163764,
+   "cached_tokens": 133877,
+   "output_tokens": 746,
+   "first_token_ms": null,
+   "duration_ms": 13301.5,
+   "tool_runs": 13,
+   "files": [
+    "chat.pipe"
+   ],
+   "passed": true,
+   "invariants": {
+    "I2": true,
+    "I3": true,
+    "I5": true,
+    "I7": true
+   },
+   "final_text": "Created `chat.pipe` with a chat source connected to an OpenAI LLM and an answers response node.\n\nValidation passed: **0 errors, 0 warnings**. The LLM uses the `openai-4o-mini` profile and expects `ROCKETRIDE_OPENAI_KEY` to be configured."
+  },
+  {
+   "run_id": "20260925-123857-4210",
+   "loop": "our",
+   "model": "gpt-6-luna",
+   "base_url": "https://api.openai.com/v1",
+   "reasoning": "none",
+   "max_steps": 20,
+   "attended": false,
+   "prompt": "Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it.",
+   "stops": [
+    "end_turn"
+   ],
+   "steps": 8,
+   "requests": 8,
+   "input_tokens": 169384,
+   "cached_tokens": 137384,
+   "output_tokens": 761,
+   "first_token_ms": null,
+   "duration_ms": 15577.0,
+   "tool_runs": 14,
+   "files": [
+    "chat.pipe"
+   ],
+   "passed": true,
+   "invariants": {
+    "I2": true,
+    "I3": true,
+    "I5": true,
+    "I7": true
+   },
+   "final_text": "Created `chat.pipe` with a chat source, an OpenAI LLM, and an answers response. It uses `${ROCKETRIDE_OPENAI_KEY}` for the API key.\n\nValidation passed: **0 errors, 0 warnings**."
+  },
+  {
+   "run_id": "20260925-123857-4210",
+   "loop": "pydantic",
+   "model": "gpt-6-luna",
+   "base_url": "https://api.openai.com/v1",
+   "reasoning": "none",
+   "max_steps": 20,
+   "attended": false,
+   "prompt": "Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it.",
+   "stops": [
+    "end_turn"
+   ],
+   "steps": 8,
+   "requests": 8,
+   "input_tokens": 171463,
+   "cached_tokens": 139468,
+   "output_tokens": 761,
+   "first_token_ms": null,
+   "duration_ms": 12834.8,
+   "tool_runs": 14,
+   "files": [
+    "chat.pipe"
+   ],
+   "passed": true,
+   "invariants": {
+    "I2": true,
+    "I3": true,
+    "I5": true,
+    "I7": true
+   },
+   "final_text": "Created `chat.pipe` with a chat source, an OpenAI LLM, and an answers response. Validation passed: **0 errors, 0 warnings**.\n\nSet `ROCKETRIDE_OPENAI_KEY` in your environment before running it."
+  },
+  {
+   "run_id": "20260925-123930-6e27",
+   "loop": "our",
+   "model": "gpt-6-luna",
+   "base_url": "https://api.openai.com/v1",
+   "reasoning": "none",
+   "max_steps": 20,
+   "attended": false,
+   "prompt": "Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it.",
+   "stops": [
+    "end_turn"
+   ],
+   "steps": 8,
+   "requests": 8,
+   "input_tokens": 154000,
+   "cached_tokens": 126953,
+   "output_tokens": 655,
+   "first_token_ms": null,
+   "duration_ms": 10444.6,
+   "tool_runs": 13,
+   "files": [
+    "chat.pipe"
+   ],
+   "passed": true,
+   "invariants": {
+    "I2": true,
+    "I3": true,
+    "I5": true,
+    "I7": true
+   },
+   "final_text": "Created and validated `chat.pipe`.\n\nThe pipeline routes chat questions to an OpenAI LLM and returns its answers. Validation succeeded: **0 errors, 0 warnings**. It uses the `${ROCKETRIDE_OPENAI_KEY}` environment variable for the API key."
+  },
+  {
+   "run_id": "20260925-123930-6e27",
+   "loop": "pydantic",
+   "model": "gpt-6-luna",
+   "base_url": "https://api.openai.com/v1",
+   "reasoning": "none",
+   "max_steps": 20,
+   "attended": false,
+   "prompt": "Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it.",
+   "stops": [
+    "end_turn"
+   ],
+   "steps": 7,
+   "requests": 7,
+   "input_tokens": 163416,
+   "cached_tokens": 129389,
+   "output_tokens": 762,
+   "first_token_ms": null,
+   "duration_ms": 11160.9,
+   "tool_runs": 15,
+   "files": [
+    "chat.pipe"
+   ],
+   "passed": true,
+   "invariants": {
+    "I2": true,
+    "I3": true,
+    "I5": true,
+    "I7": true
+   },
+   "final_text": "Created `chat.pipe` with a chat source connected to an OpenAI LLM and an answers response node.\n\nValidation passed: **0 errors, 0 warnings**. The pipeline expects `ROCKETRIDE_OPENAI_KEY` to be configured."
+  }
+ ]
+}
