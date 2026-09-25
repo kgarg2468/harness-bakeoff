@@ -269,6 +269,23 @@ def test_a_failed_response(serve):
     assert [item["type"] for item in data["response"]["output"]] == ["message"]
 
 
+def test_a_response_that_runs_out_of_output_tokens(serve):
+    """As the API ends a response whose max_output_tokens ran out, here inside a reasoning item
+    (only the items done so far are in its output)."""
+    usage = {"input_tokens": 50, "output_tokens": 16, "reasoning_tokens": 16}
+    ops = [{"reasoning_item": REASONING}, {"text": "Hel", "done": False}, {"incomplete": usage}]
+    provider = serve(scenario("T", {"respond": {"stream": ops}}))
+    got = events(post(provider, request()))
+    assert [name for name, _ in got][-2:] == ["response.output_text.delta", "response.incomplete"]
+    response = got[-1][1]["response"]
+    assert (response["status"], response["incomplete_details"]) == (
+        "incomplete",
+        {"reason": "max_output_tokens"},
+    )
+    assert response["usage"]["output_tokens_details"] == {"reasoning_tokens": 16}
+    assert response["output"] == [DONE_REASONING]
+
+
 def test_rate_limit_with_retry_after_then_ok(serve):
     limited = {"respond": {"status": 429, "headers": {"retry-after": "1"}}}
     provider = serve(scenario("T", limited, says("ok")))
@@ -469,7 +486,8 @@ def test_reasoning_must_be_replayed_exactly_as_sent(serve, replayed, failure):
     [
         (
             lambda s: s["exchanges"][0]["respond"]["stream"].pop(),
-            "$.exchanges[0].respond.stream: must end with one of completed, error, failed, stall",
+            "$.exchanges[0].respond.stream: must end with one of completed, incomplete, error,"
+            " failed, stall",
         ),
         (
             lambda s: s["exchanges"][0]["respond"]["stream"].insert(0, {"stall": True}),
@@ -477,12 +495,13 @@ def test_reasoning_must_be_replayed_exactly_as_sent(serve, replayed, failure):
         ),
         (
             lambda s: s["exchanges"][0]["respond"]["stream"][0].update(done=False),
-            "$.exchanges[0].respond.stream[0]: done: false must come right before the error",
+            "$.exchanges[0].respond.stream[0]: done: false must come right before the incomplete,"
+            " error, failed or stall",
         ),
         (
             lambda s: s["exchanges"][0]["respond"]["stream"].insert(0, {"finish": "stop"}),
             "$.exchanges[0].respond.stream[0]: expected exactly one of: text, reasoning_item,"
-            " tool_calls, completed, error, failed, stall",
+            " tool_calls, completed, incomplete, error, failed, stall",
         ),
         (lambda s: s.update(style="openai"), "Additional properties are not allowed ('style'"),
         (
@@ -534,7 +553,9 @@ async def test_the_openai_sdk_parses_every_event(serve):
     ops = [{"reasoning_item": REASONING}, {"text": "hi", "phase": "final_answer"},
            {"tool_calls": [CALL]}, COMPLETED]  # fmt: skip
     failing = [{"text": "x", "done": False}, {"error": {"message": "boom"}}]
-    provider = serve(scenario("T", {"respond": {"stream": ops}}, {"respond": {"stream": failing}}))
+    cut = [{"reasoning_item": {**REASONING, "id": "rs_2"}}, {"incomplete": COMPLETED["completed"]}]
+    streams = [{"respond": {"stream": stream}} for stream in (ops, failing, cut)]
+    provider = serve(scenario("T", *streams))
     client = openai.AsyncOpenAI(base_url=provider.base_url("T", "r1", "our"), api_key="dummy")
     async with client:
         stream = await client.responses.create(model=MODEL, input="hi", stream=True)
@@ -553,3 +574,7 @@ async def test_the_openai_sdk_parses_every_event(serve):
             "server_error",
             "boom",
         )
+        stream = await client.responses.create(model=MODEL, input="hi", stream=True)
+        last = [event async for event in stream][-1]
+        assert type(last).__name__ == "ResponseIncompleteEvent"
+        assert last.response.incomplete_details.reason == "max_output_tokens"

@@ -179,7 +179,7 @@ of item objects, or a string (one user message, as the API reads it); else 400.
 `event: <type>\ndata: {"type": <type>, "sequence_number": n, ...}\n\n`, numbered from 0. There
 is no `data: [DONE]`: the stream ends after its last event. It always starts with
 `response.created` and `response.in_progress`. Their response object (and that of
-`response.completed` / `response.failed`) does not echo the request, so every loop gets the
+`response.completed` / `.incomplete` / `.failed`) does not echo the request, so every loop gets the
 same bytes: `{"id": "resp_<scenario>_<NNN>", "object": "response", "created_at": 1758758400,
 "status", "completed_at", "error", "incomplete_details": null, "instructions": null,
 "max_output_tokens": null, "model": <scenario model>, "output", "parallel_tool_calls": true,
@@ -197,16 +197,17 @@ false`. `output_index` counts the response's items from 0.
 | `{"text": str, "chunks"?: n, "phase"?: "commentary" \| "final_answer", "done"?: bool}` | an assistant message: `response.output_item.added` (`{"id": "msg_<scenario>_<NNN>_<output_index>", "type": "message", "status": "in_progress", "content": [], "role": "assistant", "phase"?}`), `response.content_part.added` (`part: {"type": "output_text", "annotations": [], "logprobs": [], "text": ""}`), n `response.output_text.delta` (`delta`, `logprobs: []`), `response.output_text.done`, `response.content_part.done`, `response.output_item.done` (status `completed`, the full `content`). The API asks to resend `phase` on assistant messages |
 | `{"tool_calls": [{"id", "name", "arguments": str \| object}], "pieces"?: n}` | per call, one after the other: `response.output_item.added` (`{"id": "fc_<id without call_>", "type": "function_call", "status": "in_progress", "arguments": "", "call_id": <id>, "name"}`), the arguments in n `response.function_call_arguments.delta`, `response.function_call_arguments.done` (`name`, `arguments`), `response.output_item.done` (status `completed`, full `arguments`) |
 | `{"completed": {"input_tokens", "output_tokens", "cached_tokens"?, "cache_write_tokens"?, "reasoning_tokens"?}}` | `response.completed`: status `completed`, `output` = every done item, `usage: {"input_tokens", "input_tokens_details": {"cached_tokens", "cache_write_tokens"}, "output_tokens", "output_tokens_details": {"reasoning_tokens"}, "total_tokens"}` |
+| `{"incomplete": {"input_tokens", "output_tokens", ...as completed, "reason"?: "max_output_tokens" \| "content_filter"}}` | `response.incomplete`, as the API ends a response that ran out of `max_output_tokens` (say, while it reasoned): status `incomplete`, `incomplete_details: {"reason"}` (default `max_output_tokens`), `output` = the items done so far, `usage` as in `completed` |
 | `{"error": {"code"?: "server_error", "message"}}` | the `error` event after HTTP 200: `{"type": "error", "sequence_number", "code", "message", "param": null}`; the stream ends |
 | `{"failed": {"code"?: "server_error", "message"}}` | `response.failed`: status `failed`, `error: {"code", "message"}`, `output` = the items done so far |
 | `{"stall": true}` | as in chat: nothing more, the socket stays open until the client leaves |
 
-Every stream ends with exactly one of `completed`, `error`, `failed` or `stall`, as its last
-op. `"done": false` (on `text` or `reasoning_item`) cuts the stream before that item is done:
-its added and delta events go out, none of its done events (a reasoning item is cut inside its
-last summary part), and the next op must be `error`, `failed` or `stall`. `delay_ms` works as
-in chat. `status` other than 200 sends OpenAI's error shape (or the script's `body`), e.g. a
-429 with `retry-after`.
+Every stream ends with exactly one of `completed`, `incomplete`, `error`, `failed` or `stall`,
+as its last op. `"done": false` (on `text` or `reasoning_item`) cuts the stream before that
+item is done: its added and delta events go out, none of its done events (a reasoning item is
+cut inside its last summary part), and the next op must be `incomplete`, `error`, `failed` or
+`stall`. `delay_ms` works as in chat. `status` other than 200 sends OpenAI's error shape (or
+the script's `body`), e.g. a 429 with `retry-after`.
 
 **Strict modes** (`strict`, as in chat): `reject_params: [keys]` answers 400 `Unsupported
 parameter: '<key>'.` (`param` = key, `code: "unsupported_parameter"`).
