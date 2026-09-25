@@ -125,6 +125,7 @@ def test_live_run_streams_and_writes_the_layout(
     impls = list(loops.available())
     out = tmp_path / "out"
     argv = ["live", "--impl", ",".join(impls), "--model", "fake-live", "--base-url", endpoint]
+    argv += ["--max-steps", "5"]
     code = main(
         [*argv, "--prompt", "Build chat.pipe and validate it.", "--out", str(out), "--run-id", "t1"]
     )
@@ -142,6 +143,8 @@ def test_live_run_streams_and_writes_the_layout(
         assert result["passed"], result
         assert (result["impl"], result["model"], result["run_id"]) == (impl, "fake-live", "t1")
         assert result["prompt"] == "Build chat.pipe and validate it."
+        # What the session log does not keep: the step cap, and that nobody approved anything.
+        assert (result["max_steps"], result["attended"]) == (5, False)
         assert result["final_text"] == "chat.pipe is saved and validates."
         assert set(result["invariants"]) == {"I2", "I3", "I5", "I7"}  # no wire: no I1
         assert (result["steps"], result["requests"], result["files"]) == (3, 3, ["chat.pipe"])
@@ -280,6 +283,7 @@ async def test_chat_asks_before_writing(tmp_path: Path) -> None:
     assert prompts[1].startswith("allow write_file(path='notes.md', content='# Notes')?")
     assert result["stops"] == ["paused", "end_turn"] and result["final_text"] == "Saved notes.md."
     assert result["passed"] and result["files"] == ["notes.md"]
+    assert (result["max_steps"], result["attended"]) == (12, True)  # a person approves
     assert "?? write_file(path='notes.md', content='# Notes') needs approval" in term.getvalue()
 
 
@@ -312,6 +316,7 @@ def test_a_live_run_that_cannot_start_records_why(
     error = f"RuntimeError: git init failed in {directory / 'wc' / 'live-our'}: simulated"
     assert (result["passed"], result["error"], result["stops"]) == (False, error, [])
     assert (result["impl"], result["prompt"], result["thread"]) == ("our", argv[-5], None)
+    assert (result["max_steps"], result["attended"]) == (8, False)  # known without a thread
     assert f"[our failed: {error}]" in printed
     # The other loop still ran, and both show up side by side.
     assert json.loads((out / "live" / "t1" / "pydantic" / "result.json").read_text())["passed"]
