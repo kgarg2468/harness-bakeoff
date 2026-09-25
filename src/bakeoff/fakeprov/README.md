@@ -121,7 +121,7 @@ OpenAI's shape in the `openai` style). Status 200 needs a `stream` of ops:
 | `{"comment": str}` | an SSE comment line, e.g. `: OPENROUTER PROCESSING` |
 | `{"finish": reason}` | a chunk with `finish_reason` (`stop`, `length`, `tool_calls`, `content_filter`) |
 | `{"usage": {"prompt_tokens", "completion_tokens", "cached_tokens"?, "reasoning_tokens"?, "cost"?, "is_byok"?}}` | OpenRouter style: a chunk that repeats the last `finish_reason` and carries `usage` with `total_tokens`, `cost`, `is_byok`, `prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens`. OpenAI style: a final `"choices": []` chunk without `cost`, sent only if the request had `stream_options.include_usage` |
-| `{"sse_error": {"code"?: 502, "message"}}` | an error chunk after HTTP 200 (`finish_reason: "error"`); ends the stream without `[DONE]` |
+| `{"sse_error": {"code"?: "server_error", "message"}}` | OpenRouter's documented mid-stream error chunk after HTTP 200: a top-level `error`, one choice with `delta: {"content": ""}` and `finish_reason: "error"`; the stream ends without `[DONE]`. The default code is the string OpenRouter documents for mid-stream errors (its pre-stream error bodies use numeric codes). S09 sends exactly that shape |
 | `{"stall": true}` | stop sending but keep the socket open until the client leaves |
 
 Every op also takes `delay_ms` (a pause before each chunk it sends). `sse_error` and `stall`
@@ -160,7 +160,7 @@ because results come from the shared tools and `MockEngine`.
 | S06 | deny with a reason; the reason reaches the model as the tool result |
 | S07 | cancel during a stall (unsigned reasoning in flight), cancel during a 2 s tool; strict `reject_unsigned_reasoning` |
 | S08 | SIGKILL once the `write_file` result is saved (after `tool.end`, before the next request); crash resume must not re-run the tool |
-| S09 | 429 with `retry-after: 1`, then OK; next turn: `sse_error` mid-stream, then OK |
+| S09 | 429 with `retry-after: 1`, then OK; next turn: OpenRouter's mid-stream error chunk (`code: "server_error"`), then OK |
 | S10a | `reasoning_details` round-trip: split text, metadata-only signature, encrypted detail |
 | S10b | as S10a, plus an unknown field on a fragment (informational) |
 | S11 | the model calls tools forever; `max_steps: 3` |

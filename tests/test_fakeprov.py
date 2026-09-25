@@ -203,14 +203,17 @@ def test_rate_limit_with_retry_after_then_ok(serve):
 
 
 def test_sse_error_ends_the_stream_after_http_200(serve):
-    error = {"code": 502, "message": "Provider disconnected"}
+    error = {"message": "Provider disconnected"}
     provider = serve(scenario("T", {"respond": {"stream": [{"text": "Hi"}, {"sse_error": error}]}}))
     response = chat(provider, request())
     chunks = frames(response)
     assert response.status_code == 200
     assert "[DONE]" not in chunks
-    assert chunks[-1]["error"] == error
-    assert chunks[-1]["choices"][0]["finish_reason"] == "error"
+    # OpenRouter's documented mid-stream error: a string code at the top level
+    assert chunks[-1]["error"] == {"code": "server_error", "message": "Provider disconnected"}
+    assert chunks[-1]["choices"] == [
+        {"index": 0, "delta": {"content": ""}, "finish_reason": "error"}
+    ]
 
 
 def test_stall_survives_a_client_that_gives_up(serve):

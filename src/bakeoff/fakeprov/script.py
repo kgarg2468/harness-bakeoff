@@ -501,8 +501,10 @@ class _Stream:
                 return [self._delta({}, self.finish, usage=usage)]
             return [self._frame([], usage=usage)] if self.include_usage else []
         if "sse_error" in op:
-            error = {"code": 502, **op["sse_error"]}
-            return [self._delta({}, "error", error=error)]
+            # OpenRouter's documented mid-stream error chunk, in both styles (OpenAI has none).
+            error = {"code": "server_error", **op["sse_error"]}
+            choice = {"index": 0, "delta": {"content": ""}, "finish_reason": "error"}
+            return [self._frame([choice], error=error)]
         return [Stall()]  # the only kind left
 
     def _detail(self, detail: dict[str, Any]) -> dict[str, Any]:

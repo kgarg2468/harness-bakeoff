@@ -25,13 +25,13 @@
       }
     },
     {
-      "note": "An error chunk after HTTP 200 (finish_reason error). No tool ran yet, so retry.",
+      "note": "OpenRouter's documented mid-stream error: HTTP 200, a string code, finish_reason error, no [DONE]. No tool ran yet, so retry.",
       "expect": {"last_role": "user", "messages_len": 4},
       "respond": {
         "stream": [
           {"text": "Hi ag"},
           {
-            "sse_error": {"code": 502, "message": "Provider disconnected unexpectedly"},
+            "sse_error": {"code": "server_error", "message": "Provider disconnected unexpectedly"},
             "delay_ms": 20
           }
         ]
