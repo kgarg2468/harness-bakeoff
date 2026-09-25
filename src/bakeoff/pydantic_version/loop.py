@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import random
+import re
 import time
 import uuid
 import warnings
@@ -94,9 +95,12 @@ _STEP_CAP_RESULT = "Not run: the turn reached its step limit."
 # A crash resume's error when the saved last response already ended the turn with an error, whose
 # text is not saved: a failed response, or the library's token limit (or content filter) error.
 _ENDED = "the turn had already ended with an error: the response failed or held no answer"
-# The Responses stream events that end a response the library may take: complete, or out of
-# `max_output_tokens` (the library answers that itself). Not `response.failed` or `error`.
-_RESPONSE_ENDS = ("response.completed", "response.incomplete")
+# The last event of a Responses stream that the library may take for a response: complete, or
+# out of `max_output_tokens` (the library answers that itself), not `response.failed` or `error`.
+# None: the server names no events (optional in SSE; the OpenAI SDK reads only the data).
+_RESPONSE_ENDS = (None, "response.completed", "response.incomplete")
+# SSE lines end with CRLF, LF or CR, as the OpenAI SDK reads them.
+_LINE_END = re.compile(rb"\r\n|\r|\n")
 
 
 class _StreamRetry(Exception):
@@ -360,11 +364,14 @@ class PydanticLoop:
                             try:
                                 async for event in stream:
                                     state.stream_event(event)
-                                if state.responses_api and state.event not in _RESPONSE_ENDS:
-                                    # The library ends a stream as if it were done after an
-                                    # `error` event (which it skips) or a `response.failed`
-                                    # (which 2.31.1 parses like `.incomplete`, usage and all),
-                                    # so the event that ended the stream decides.
+                                # The library ends a stream as if it were done after an
+                                # `error` event (which it skips) or a `response.failed` (which
+                                # 2.31.1 parses like `.incomplete`, usage and all). Only an end
+                                # brings usage, and the last event's name tells which end.
+                                if state.responses_api and not (
+                                    stream.response.usage.has_values()
+                                    and state.event in _RESPONSE_ENDS
+                                ):
                                     failed = "the stream failed before response.completed"
                                     raise ModelAPIError(model.model_name, failed)
                             except Exception as exc:
@@ -627,10 +634,10 @@ async def _note_events(chunks: AsyncIterator[bytes], turn: _Turn) -> AsyncIterat
     library gives a failed response no status (2.31.1), so only its event tells it apart."""
     line = b""  # the start of the line the next bytes continue
     async for chunk in chunks:
-        *lines, rest = (line + chunk).split(b"\n")
+        *lines, rest = _LINE_END.split(line + chunk)
         line = rest[:64]  # a line's field and event name are all that is read
         for full in lines:
-            name, _, value = full.rstrip(b"\r").partition(b":")
+            name, _, value = full.partition(b":")
             if name == b"event":
                 turn.event = value.strip().decode()
         yield chunk

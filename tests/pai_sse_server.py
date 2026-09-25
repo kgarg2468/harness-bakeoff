@@ -28,6 +28,7 @@ class Reply:
     body: dict[str, Any] | None = None  # sent as a plain JSON body instead of a stream
     stall: bool = False  # after the chunks, keep the connection open until the server stops
     drop: bool = False  # after the chunks, close the connection before the promised body ends
+    raw: bytes | None = None  # sent verbatim as the whole stream body instead of the chunks
 
 
 def chunk(
@@ -147,6 +148,9 @@ def _handler(server: SSEServer) -> type[BaseHTTPRequestHandler]:
             reply = server.replies.popleft()
             if reply.body is not None or reply.status != 200:
                 self._send(reply.status, reply.headers, json.dumps(reply.body or {}).encode())
+                return
+            if reply.raw is not None:
+                self._send(200, {"Content-Type": "text/event-stream", **reply.headers}, reply.raw)
                 return
             self.send_response(200)
             for key, value in {"Content-Type": "text/event-stream", **reply.headers}.items():

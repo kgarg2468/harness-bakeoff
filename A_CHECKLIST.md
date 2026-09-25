@@ -157,14 +157,18 @@ The library has no mechanism for these, so A has its own code (counted like ever
   only when the whole batch is done.
 - **Waiting for the runner before each request** (`await out.join()`, 1 line; the same wait
   orders `tool.start`).
-- **Retrying a Responses stream that failed** (3 lines in `_run`, `_note_events` and 4 lines in
-  `_on_response`: about 20 lines, and the warning filter). The library ends the stream as if it
-  were done after an `error` event (it has no handler for it) or a `response.failed`, so the
-  partial answer would be the final one. A notes the name of each SSE event in the bytes the
-  OpenAI SDK parses (an httpx response hook): a stream whose last event is not
-  `response.completed` (or `.incomplete`, which the library handles) is raised as a
-  `ModelAPIError`, and the retry above takes over. Usage is no sign: a `response.failed` may
-  carry it.
+- **Retrying a Responses stream that failed** (5 lines in `_run`, `_note_events` and 4 lines in
+  `_on_response`: about 25 lines, and the warning filter). The library ends the stream as if it were
+  done after an `error` event (it has no handler for it) or a `response.failed`, so the partial
+  answer would be the final one. A takes a stream for a response only if it brought usage (only an
+  end brings it: `response.completed`, `.incomplete`, which the library handles, or `.failed`) and
+  its last event is not `response.failed` or `error`: A notes the name of each SSE event in the
+  bytes the OpenAI SDK parses (an httpx response hook, reading lines as the SDK does, with any SSE
+  line end). Any other stream is raised as a `ModelAPIError`, and the retry above takes over. Usage
+  alone is no sign (a `response.failed` may carry it), and neither is the name alone: SSE event
+  names are optional (the SDK reads only the data), and the SDK takes an event only once the blank
+  line after it arrives, which a stream may end before. A server that names no events and sends a
+  `response.failed` with usage still gets its partial answer taken for the final one.
 - **The chat-shaped view of a Responses response** (2 lines in `mapping._assistant`, and a
   `responses_api` flag from `_Turn` through `to_openai`): `Item.message` leaves the reasoning
   items out; without this they would look like BYOK thinking fields.
@@ -200,7 +204,7 @@ The library has no mechanism for these, so A has its own code (counted like ever
 - **Worked around** (bug): the segment behind a streamed response knows that a Responses stream
   ended without a terminal event (state `incomplete`), but the continuation wrapper that
   `node.stream()` returns reports every finished stream as `complete`, so A reads the stream's
-  last event instead (above).
+  usage and last event instead (above).
 - **Worked around** (gap): on 2.31.1 a `response.failed` and a `response.incomplete` come out alike:
   no finish reason (2.50.0 maps them to `error` and `length`), state `complete`, and their usage, so
   nothing in the `ModelResponse` tells them apart: A reads the event that ended the stream, the same

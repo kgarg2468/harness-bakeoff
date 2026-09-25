@@ -16,6 +16,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from pai_sse_server import Reply, SSEServer, chunk, done, text, tool_call
 from pydantic_ai import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
@@ -1478,13 +1479,13 @@ async def test_a_crash_after_a_responses_stream_that_failed_for_good_ends_with_a
     assert [(i.status, i.native["finish_reason"]) for i in history[1:]] == [("incomplete", "error")]
 
 
-async def test_the_event_that_ends_a_responses_stream_is_read_across_chunks():
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n", b"\r"], ids=["LF", "CRLF", "CR"])
+async def test_the_event_that_ends_a_responses_stream_is_read_across_chunks(eol):
     """`_note_events` reads SSE event names wherever the bytes are cut, past long data lines,
-    and passes the bytes on unchanged."""
-    delta = b'data: {"delta": "' + b"x" * 300 + b'"}\n\n'
-    body = (
-        b"event: response.output_text.delta\n" + delta + b"event: response.failed\r\ndata: {}\n\n"
-    )
+    with any SSE line end, and passes the bytes on unchanged."""
+    delta = b'data: {"delta": "' + b"x" * 300 + b'"}' + eol * 2
+    body = b"event: response.output_text.delta" + eol + delta + b"event: response.failed" + eol
+    body += b"data: {}" + eol * 2
     for size in (1, 5, 64, 100, len(body)):
 
         async def chunks(size: int = size) -> AsyncIterator[bytes]:
@@ -1494,6 +1495,49 @@ async def test_the_event_that_ends_a_responses_stream_is_read_across_chunks():
         state = loop_module._Turn("t", StubTools(), 1, set(), set(), responses_api=True)
         passed = [chunk async for chunk in loop_module._note_events(chunks(), state)]
         assert (b"".join(passed), state.event) == (body, "response.failed")
+
+
+def responses_bytes(tmp_path: Path, stream: list[dict[str, Any]]) -> bytes:
+    """The bytes fakeprov streams for one Responses exchange with these ops."""
+    with responses_server(tmp_path, {"respond": {"stream": stream}}) as srv:
+        url = srv.base_url("R", "bytes", "pydantic") + "/responses"
+        return httpx.post(url, json={"model": "gpt-6-luna", "stream": True, "input": "hi"}).content
+
+
+FAILED = {"failed": {"message": "boom", "usage": {"input_tokens": 20, "output_tokens": 9}}}
+
+
+@pytest.mark.parametrize(
+    ("shape", "ending", "stop"),
+    [
+        ("no event names", COMPLETED, "end_turn"),
+        ("CR line ends", COMPLETED, "end_turn"),
+        ("CR line ends", FAILED, "error"),
+        ("end not dispatched", COMPLETED, "error"),
+    ],
+    ids=["no-names", "CR", "CR-failed", "end-not-dispatched"],
+)
+async def test_a_responses_stream_is_judged_as_the_sdk_reads_it(
+    loop, tmp_path, shape, ending, stop
+):
+    """The OpenAI SDK reads SSE as the spec says: event names are optional (it reads only the
+    data), a line may end with CR, and an event counts once the blank line after it arrives. A
+    stream is a response only with the usage that an end brings and, if the server names its
+    events, a last one that is `response.completed` (or `.incomplete`), not `response.failed`."""
+    body = responses_bytes(tmp_path, [{"text": "Hello!"}, ending])
+    if shape == "no event names":
+        body = b"\n".join(line for line in body.split(b"\n") if not line.startswith(b"event:"))
+    elif shape == "CR line ends":
+        body = body.replace(b"\n", b"\r")
+    else:  # the body ends cleanly before the blank line that would dispatch the last event
+        body = body.rstrip(b"\n") + b"\n"
+    with SSEServer(Reply(raw=body)) as srv:
+        cfg = ModelConfig(srv.base_url, "gpt-6-luna", kind="openai_responses", max_retries=0)
+        events = await run(loop, turn([user("hi")], cfg), StubTools())
+
+    assert of(events, "turn.end")[0]["stop"] == stop
+    usage = [(u["input_tokens"], u["output_tokens"]) for u in of(events, "usage")]
+    assert usage == ([(20, 9)] if stop == "end_turn" else [])
 
 
 BLANK = {"text": "", "phase": "final_answer"}  # a message item with empty text
