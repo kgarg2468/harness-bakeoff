@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYDANTIC_AI_NO_BANNER: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --all-extras
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+
+  test:
+    name: test (pydantic-ai ${{ matrix.pydantic_ai }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # "engine" = the pinned 2.31.1 that fits the RocketRide engine today.
+        # "latest" = newest pydantic-ai (needs openai 3.x): does A keep working across upgrades?
+        pydantic_ai: [engine, latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --all-extras
+      - if: matrix.pydantic_ai == 'latest'
+        run: uv pip install --upgrade "pydantic-ai-slim[openai,openrouter]" "openai>=3.19"
+      - run: uv pip list | grep -iE '^(pydantic-ai-slim|openai|httpx|pydantic) '
+      - run: uv run --no-sync pytest -q
+
+  engine-fit:
+    name: engine dependency fit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+      - run: ./scripts/engine_fit.sh
+
+  secrets:
+    name: no secrets committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: scan tracked files for API keys
+        run: |
+          if git grep -nIE '(sk-or-v1-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,})'; then
+            echo "::error::possible API key committed"; exit 1
+          fi
+          if git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example$'; then
+            echo "::error::.env file committed"; exit 1
+          fi
