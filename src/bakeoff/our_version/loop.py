@@ -229,6 +229,9 @@ class _Turn:
                     cut = stream.partial() or {"role": "assistant", "content": None}
                     yield self._item(cut, status="incomplete", usage=usage)
                     yield Event("usage", usage)
+                    if self.cancel.is_set():  # it came while the body's end drained (rule 6)
+                        yield self._end("cancelled")
+                        return
                     cut_at = f"Output truncated at max_tokens={self.model.max_tokens}"
                     for event in self._abort("output_truncated", cut_at):
                         yield event
@@ -241,8 +244,8 @@ class _Turn:
                 if calls := stream.tool_calls():
                     async for event in self._tools_within_cap(calls):
                         yield event
-                else:
-                    yield self._end("end_turn")
+                else:  # a cancel while the body's end drained still stopped the turn (rule 6)
+                    yield self._end("cancelled" if self.cancel.is_set() else "end_turn")
         except Exception as exc:  # a bug must still end the turn (contract rule 7)
             await self._stop_jobs()
             for event in self._abort("internal", repr(exc)):

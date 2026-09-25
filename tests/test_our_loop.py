@@ -807,29 +807,56 @@ async def test_max_steps_stops_after_exactly_n_requests() -> None:
     }
 
 
-async def test_cancel_after_the_last_allowed_answer_ends_cancelled() -> None:
-    """The last allowed step's answer is complete (finish_reason plus usage), and the cancel
-    comes while the loop drains the body's end: the user stopped the turn (contract rule 6),
-    so its call gets "Cancelled by user" and the turn does not end with max_steps."""
-    usage = {"prompt_tokens": 10, "completion_tokens": 1}
-    stall = Stall(sse_bytes(call(0, "{}", "c0", "describe_component"), finish("tool_calls", usage)))
-    server, tools, cancel = Server(httpx.Response(200, stream=stall)), StubTools(), asyncio.Event()
+async def cancel_while_draining(
+    *chunks: dict[str, Any] | str, tools: StubTools | None = None, **kw: Any
+) -> list[Event]:
+    """Run one turn whose answer (`chunks`) is complete, finish_reason plus usage, and set the
+    cancel while the loop drains the body's end."""
+    stall = Stall(sse_bytes(*chunks))
+    server, cancel = Server(httpx.Response(200, stream=stall)), asyncio.Event()
 
-    async def cancel_while_draining() -> None:
+    async def canceller() -> None:
         await stall.stalled.wait()
         cancel.set()
 
-    canceller = asyncio.ensure_future(cancel_while_draining())
-    history = [user("go")]
+    task = asyncio.ensure_future(canceller())
     async with asyncio.timeout(2):
-        events = await run(server.loop(), history, tools, cancel, limits=Limits(max_steps=1))
-    await canceller
+        events = await run(server.loop(), [user("go")], tools or StubTools(), cancel, **kw)
+    await task
+    return events
+
+
+async def test_cancel_after_the_last_allowed_answer_ends_cancelled() -> None:
+    """The last allowed step's answer is complete, and the cancel comes while the loop drains
+    the body's end: the user stopped the turn (contract rule 6), so its call gets "Cancelled by
+    user" and the turn does not end with max_steps."""
+    usage = {"prompt_tokens": 10, "completion_tokens": 1}
+    tools = StubTools()
+    events = await cancel_while_draining(
+        call(0, "{}", "c0", "describe_component"),
+        finish("tool_calls", usage),
+        tools=tools,
+        limits=Limits(max_steps=1),
+    )
     assert events[-1].data == {"stop": "cancelled", "steps": 1}
     answer, result = items(events)
     assert answer.status == "complete" and answer.message["tool_calls"][0]["id"] == "c0"
     assert result.message == {"role": "tool", "tool_call_id": "c0", "content": "Cancelled by user"}
     assert tools.run_counts == {}
-    assert_no_orphans(history + items(events))
+    assert_no_orphans(items(events))
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "stop"])
+async def test_cancel_after_a_complete_answer_ends_cancelled(finish_reason: str) -> None:
+    """A text answer, or one cut off at max_tokens, then the cancel while the body's end
+    drains: the turn ends cancelled (contract rule 6), not output_truncated or end_turn. The
+    answer is kept either way."""
+    usage = {"prompt_tokens": 10, "completion_tokens": 1}
+    events = await cancel_while_draining(delta(content="Done."), finish(finish_reason, usage))
+    assert of(events, "error") == [] and events[-1].data == {"stop": "cancelled", "steps": 1}
+    (answer,) = items(events)
+    assert answer.message == {"role": "assistant", "content": "Done."}
+    assert answer.status == ("incomplete" if finish_reason == "length" else "complete")
 
 
 async def test_cancelled_resume_at_the_step_limit_ends_cancelled() -> None:
