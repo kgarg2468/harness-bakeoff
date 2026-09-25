@@ -27,6 +27,10 @@ Ported from [rocketride-org/rocketride-server](https://github.com/rocketride-org
 - `src/bakeoff/shared/engine/mock.py`: the structural pipeline rules of `PipelineConfig::validate`
   (`packages/server/engine-lib/engLib/store/pipeline/pipeline_config.cpp`) and the lane names of
   `Binder::MethodNames` (`engLib/store/headers/binder.hpp`).
+- `src/bakeoff/shared/engine/base.py`: the pipeline envelope and unknown-provider check of the MCP
+  `validate_pipeline` tool (`packages/ai/src/ai/modules/mcp/tools/introspection.py`).
+- `src/bakeoff/shared/tools/engine_tools.py`: the engine tools' names, descriptions and argument
+  schemas from the same file.
 
 ```
 MIT License

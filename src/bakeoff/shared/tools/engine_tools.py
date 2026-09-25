@@ -1,3 +1,5 @@
+# Ported from RocketRide (MIT): packages/ai/src/ai/modules/mcp/tools/introspection.py @ a1fa4f15b5c61c51e450ffb6d24057b7edcf13d3
+# Changes: tool names, descriptions and schemas over an `Engine`; one-sentence summaries; validate_pipeline also takes `path`.
 """RocketRide engine tools: `list_components`, `describe_component`, `validate_pipeline`.
 
 Names, descriptions and argument schemas follow the engine's built-in MCP tool registry

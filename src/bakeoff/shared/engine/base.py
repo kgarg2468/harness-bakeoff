@@ -1,3 +1,5 @@
+# Ported from RocketRide (MIT): packages/ai/src/ai/modules/mcp/tools/introspection.py @ a1fa4f15b5c61c51e450ffb6d24057b7edcf13d3
+# Changes: _validate_pipeline's envelope and _unknown_provider_errors as sync helpers; string errors; enveloped pipelines get the default version too.
 """The `Engine` protocol behind the RocketRide tools, plus helpers every engine shares."""
 
 from __future__ import annotations
@@ -26,10 +28,11 @@ class Engine(Protocol):
 
 
 def envelope(pipeline: dict[str, Any]) -> dict[str, Any]:
-    """Wrap a pipeline for the engine the way its MCP `validate_pipeline` tool does.
+    """Wrap a pipeline for the engine as its MCP `validate_pipeline` tool does.
 
     An existing `{"pipeline": ...}` wrapper is unwrapped first. A missing version becomes 1,
-    because the engine treats an unversioned pipeline as legacy v0.
+    because the engine treats an unversioned pipeline as legacy v0 (unlike the MCP tool, this
+    applies to an already wrapped pipeline too).
     """
     body = pipeline.get("pipeline", pipeline)
     if isinstance(body, dict):
