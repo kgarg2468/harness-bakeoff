@@ -1,6 +1,7 @@
 # Ported from OpenCode (MIT): packages/opencode/src/tool/edit.ts @ 16c56fe5ecc3305028d1f0a9cff5806e51c9d480
 # Changes: the replacer chain and replace() only, in Python; empty candidate spans are skipped;
-# bit-parallel levenshtein; near-tied block-anchor candidates raise MultipleMatches.
+# bit-parallel levenshtein; near-tied block-anchor candidates are ambiguous (later replacers may
+# still resolve them; otherwise MultipleMatches).
 # OpenCode credits these approaches to Cline (Apache-2.0):
 #   evals/diff-edits/diff-apply/diff-06-23-25.ts and diff-06-26-25.ts
 # and gemini-cli (Apache-2.0): packages/core/src/utils/editCorrector.ts
@@ -23,6 +24,13 @@ Replacer = Callable[[str, str], Iterator[str]]
 SINGLE_CANDIDATE_SIMILARITY_THRESHOLD = 0.65
 MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD = 0.65
 AMBIGUITY_MARGIN = 0.15  # a runner-up this close to the best block makes the match ambiguous
+
+
+class _Ambiguous(str):
+    """Marker a replacer yields when several spans match equally well (compared with `is`)."""
+
+
+AMBIGUOUS = _Ambiguous()
 
 
 class EditError(ValueError):
@@ -166,10 +174,9 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
     # middle matches exactly still wins over near misses.
     best, runner_up = scored[0][0], scored[1][0] if len(scored) > 1 else -1.0
     if runner_up == best or (best < 1.0 and runner_up >= best - AMBIGUITY_MARGIN):
-        raise MultipleMatches(
-            "Found several similar blocks for old_string. Provide more surrounding context to "
-            "make the match unique."
-        )
+        # Don't guess; let later replacers try to pin it down, and report ambiguity if none do.
+        yield AMBIGUOUS
+        return
     yield _span(original_lines, *scored[0][1])
 
 
@@ -333,6 +340,9 @@ def replace(content: str, old: str, new: str, replace_all: bool = False) -> str:
     not_found = True
     for replacer in REPLACERS:
         for search in replacer(content, old):
+            if search is AMBIGUOUS:
+                not_found = False  # something matched, just not uniquely
+                continue
             index = content.find(search)
             # An empty span would "match" between every character.
             if not search or index == -1:

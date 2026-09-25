@@ -202,10 +202,13 @@ def test_empty_candidate_span_is_never_replaced():
 
 
 def test_block_anchor_near_tie_is_ambiguous():
-    """Two anchored blocks that are about equally close to old_string: refuse, don't guess."""
+    """Two anchored blocks about equally close to old_string: no guess, and replace() refuses."""
     content = "start\nalpha one two\nend\nstart\nalpha one tw0\nend\n"
+    assert list(block_anchor_replacer(content, "start\nalpha one twx\nend")) == [
+        edit_match.AMBIGUOUS
+    ]
     with pytest.raises(MultipleMatches):
-        list(block_anchor_replacer(content, "start\nalpha one twx\nend"))
+        replace(content, "start\nalpha one twx\nend", "x")
 
 
 def test_block_anchor_clear_winner_is_used():
@@ -213,3 +216,18 @@ def test_block_anchor_clear_winner_is_used():
     assert list(block_anchor_replacer(content, "start\nalpha one two thrEE\nend")) == [
         "start\nalpha one two three\nend"
     ]
+
+
+def test_block_anchor_tie_resolved_by_a_later_replacer():
+    """Greptile's case: block-anchor similarity can't separate two blocks, but only one has an
+    exact middle line, so the context-aware replacer still edits it."""
+    content = "start\nfoo bar\nbaz quX\nend\nstart\nfoo baR\nbaz quX\nend\n"
+    old = "start\nfoo bar\nbaz qux\nend"
+    assert list(block_anchor_replacer(content, old)) == [edit_match.AMBIGUOUS]
+    assert replace(content, old, "NEW") == "NEW\nstart\nfoo baR\nbaz quX\nend\n"
+
+
+def test_empty_spans_are_not_mistaken_for_ambiguity():
+    empty = "".join([])  # a real (empty) span, as a replacer could produce
+    assert empty is not edit_match.AMBIGUOUS
+    assert isinstance(edit_match.AMBIGUOUS, str)
