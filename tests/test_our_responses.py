@@ -50,11 +50,17 @@ def event(kind: str, **fields: Any) -> dict[str, Any]:
     return {"type": kind, **fields}
 
 
-def stream_bytes(*events: dict[str, Any]) -> bytes:
-    return b"".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode() for e in events)
+DONE = b"data: [DONE]\n\n"  # chat completions' end marker, which some proxies add here too
 
 
-def response(*events: dict[str, Any]) -> httpx.Response:
+def stream_bytes(*events: dict[str, Any] | bytes) -> bytes:
+    return b"".join(
+        e if isinstance(e, bytes) else f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode()
+        for e in events
+    )
+
+
+def response(*events: dict[str, Any] | bytes) -> httpx.Response:
     return httpx.Response(
         200, headers={"content-type": "text/event-stream"}, content=stream_bytes(*events)
     )
@@ -227,11 +233,14 @@ async def test_calls_start_once_done_and_output_items_replay_verbatim() -> None:
             True,
         ),
         (None, "Stream ended without response.completed", True),
+        (DONE, "Stream ended without response.completed", True),
         (completed("incomplete", "content_filter"), "Response incomplete: content_filter", False),
     ],
-    ids=["error-event", "failed", "cut-off", "content-filter"],
+    ids=["error-event", "failed", "cut-off", "done-marker", "content-filter"],
 )
-async def test_failed_responses(end: dict[str, Any] | None, reason: str, retried: bool) -> None:
+async def test_failed_responses(
+    end: dict[str, Any] | bytes | None, reason: str, retried: bool
+) -> None:
     ends = () if end is None else (end,)
     server = Server(response(event("response.output_text.delta", delta="Hel"), *ends), answer("Hi"))
     events = await run(server.loop(sleep=no_wait), [user("hi")], StubTools(), model=MODEL)
@@ -241,6 +250,20 @@ async def test_failed_responses(end: dict[str, Any] | None, reason: str, retried
     else:
         assert len(server.bodies) == 1 and items(events) == []
         assert of(events, "error")[0]["message"] == reason and events[-1].data["stop"] == "error"
+
+
+async def test_a_response_without_done_items_replays_its_text() -> None:
+    server = Server(
+        response(event("response.output_text.delta", delta="Hi"), completed()), answer("Bye")
+    )
+    loop, first = server.loop(), user("hi")
+    events = await run(loop, [first], StubTools(), model=MODEL)
+    (reply,) = items(events)
+    await run(loop, [first, reply, user("again")], StubTools(), model=MODEL)
+    assert json.loads(server.bodies[1])["input"][2:] == [
+        {"role": "assistant", "content": "Hi"},  # converted: no empty fragment, valid JSON
+        {"role": "user", "content": "again"},
+    ]
 
 
 async def test_max_output_tokens_truncates_and_runs_no_call() -> None:

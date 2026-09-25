@@ -80,7 +80,7 @@ def input_json(item: Item) -> bytes:
 def input_items(item: Item) -> list[dict[str, Any]]:
     """A history item as `input` items: a response's done output items verbatim (reasoning with
     its encrypted_content, messages with their phase), else converted from its chat message."""
-    if item.native is not None:
+    if item.native:  # empty if the server sent no done items: then the message is converted
         return item.native
     msg = item.message
     if msg["role"] == "tool":
@@ -149,5 +149,5 @@ class ResponsesStream(Stream):
 
     def check_end(self) -> None:
         """Raise if the stream ended before its terminal event (retried as a cut-off stream)."""
-        if not self.done:
+        if self.finish is None:  # set by response.completed or .incomplete only: [DONE] is no end
             raise classify("stream", "Stream ended without response.completed")
