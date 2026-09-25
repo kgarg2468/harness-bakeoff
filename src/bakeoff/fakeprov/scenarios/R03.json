@@ -1,0 +1,159 @@
+{
+  "id": "R03",
+  "title": "Responses API: commentary plus three function calls in one response (validate and describe allowed, write asks); approve in a new process",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {
+    "kind": "openai_responses",
+    "model": "gpt-6-luna",
+    "reasoning": {"effort": "xhigh"},
+    "temperature": null
+  },
+  "rules": {"*": "allow", "write_file": "ask", "edit_file": "ask"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "strict": {
+    "reject_params": ["temperature", "max_tokens", "max_completion_tokens", "reasoning_effort"],
+    "reject_unencrypted_reasoning": true
+  },
+  "driver": [
+    {"user": "Validate a simple chat pipeline and save a README.md that describes it."},
+    {"approve": {"allow": "all"}, "new_process": true}
+  ],
+  "exchanges": [
+    {
+      "note": "Reasoning, a commentary message, then three calls in one response: validate_pipeline and describe_component are allowed, write_file asks. The turn pauses.",
+      "expect": {"input_len": 1, "last_role": "user"},
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R03_1",
+              "encrypted_content": "gAAAAABpAAmP-1Ni7CmzCneF13cnBxbfvkZWD7AlY820a-AJ3L_kGCoffq0756TF0NpDPzJDD0OmioMNBdLnk43_gyI6T8mYTkxeZ33qRBxG5M9WT2dOGc_AF8B3uDwj8HbyeKH1",
+              "summary": [
+                "**Validate, describe, save**\n\nValidate the chat pipeline, check the LLM node and write README.md in one step."
+              ]
+            },
+            "chunks": 2
+          },
+          {
+            "text": "I'll validate the pipeline, look up the LLM node and save the README.",
+            "chunks": 2,
+            "phase": "commentary"
+          },
+          {
+            "tool_calls": [
+              {
+                "id": "call_R03_1",
+                "name": "validate_pipeline",
+                "arguments": {
+                  "pipeline": {
+                    "project_id": "b0000001-0000-4000-8000-000000000003",
+                    "source": "chat_1",
+                    "components": [
+                      {"id": "chat_1", "provider": "chat", "config": {}},
+                      {
+                        "id": "llm_1",
+                        "provider": "llm_openai_api",
+                        "config": {
+                          "profile": "custom",
+                          "custom": {
+                            "model": "${ROCKETRIDE_OLLAMA_MODEL}",
+                            "base_url": "${ROCKETRIDE_OLLAMA_BASE_URL}",
+                            "apikey": "ollama",
+                            "modelTotalTokens": 32768
+                          }
+                        },
+                        "input": [{"lane": "questions", "from": "chat_1"}]
+                      },
+                      {
+                        "id": "response_1",
+                        "provider": "response_answers",
+                        "config": {},
+                        "input": [{"lane": "answers", "from": "llm_1"}]
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "id": "call_R03_2",
+                "name": "describe_component",
+                "arguments": {"name": "llm_openai_api"}
+              },
+              {
+                "id": "call_R03_3",
+                "name": "write_file",
+                "arguments": {
+                  "path": "README.md",
+                  "content": "# Chat pipeline\n\nchat -> llm_openai_api -> response_answers\n"
+                }
+              }
+            ],
+            "pieces": 2
+          },
+          {
+            "completed": {
+              "input_tokens": 2400,
+              "output_tokens": 420,
+              "cached_tokens": 0,
+              "reasoning_tokens": 256
+            }
+          }
+        ]
+      }
+    },
+    {
+      "note": "Resumed in a new process: the reasoning item as sent, the commentary with its phase, the three calls and their three outputs; each tool ran once.",
+      "expect": {
+        "input_len": 9,
+        "input_at": [
+          {"index": 1, "type": "reasoning"},
+          {
+            "index": 2,
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "contains": "validate the pipeline"
+          },
+          {"index": 3, "type": "function_call"},
+          {"index": 4, "type": "function_call"},
+          {"index": 5, "type": "function_call", "contains": "README.md"}
+        ],
+        "last_type": "function_call_output",
+        "tool_result_contains": {"call_R03_1": "", "call_R03_2": "llm_openai_api", "call_R03_3": ""},
+        "reasoning_replayed": ["rs_R03_1"]
+      },
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R03_2",
+              "encrypted_content": "gAAAAABp9DYQ0NIZ9iPuezlXcCACzP_TLfDWE1UELTehI_JDfDUY7IilsKyu-zI4t2BMF6JKg799MtTCEUA-fETy2zyj19h7o8rikO2p3YHAsk7DSNPoQ-ogB-5Eny2P4JVhObrV"
+            }
+          },
+          {
+            "text": "README.md is saved and the pipeline validates.",
+            "chunks": 3,
+            "phase": "final_answer"
+          },
+          {
+            "completed": {
+              "input_tokens": 3100,
+              "output_tokens": 40,
+              "cached_tokens": 2304,
+              "reasoning_tokens": 16
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["paused", "end_turn"],
+    "requests": 2,
+    "commits": 1,
+    "files": {"README.md": "# Chat pipeline"},
+    "tool_runs": {"call_R03_1": 1, "call_R03_2": 1, "call_R03_3": 1},
+    "text_contains": "README.md is saved"
+  }
+}

@@ -541,6 +541,7 @@ SCENARIO_FILES = sorted(SCENARIOS_DIR.glob("*.json"))
 
 def test_every_designed_scenario_exists():
     expected = {f"S{n:02d}" for n in range(1, 16)} - {"S10"} | {"S10a", "S10b", "S12b"}
+    expected |= {f"R{n:02d}" for n in range(1, 6)}  # the Responses API scenarios
     assert {p.stem for p in SCENARIO_FILES} == expected
 
 

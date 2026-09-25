@@ -308,3 +308,12 @@ The next request replays the done reasoning item verbatim, the function call and
 | S13 | BYOK thinking: `openai_compat`, `qwen3-32b`, `reasoning_effort` on the wire, `reasoning_content` back |
 | S14 | BYOK strict endpoint: 400 on `reasoning`, `reasoning_effort` or `stream_options` |
 | S15 | compaction: after the summary a request is `[system, summary, new user]`, then append-only |
+| R01 | Responses API, `gpt-6-luna` at effort `xhigh`: the request shape (`store: false`, `include` has `reasoning.encrypted_content`, Responses-style tools, no `temperature`/`max_tokens`/`reasoning_effort`); reasoning with a summary, then the answer |
+| R02 | reasoning (two summary parts), one `describe_component` call, its output, then the answer; the reasoning item is replayed exactly as its done event sent it |
+| R03 | reasoning, a `commentary` message and three calls in one response (`validate_pipeline` and `describe_component` allowed, `write_file` asks); approve in a new process; the resumed request replays everything, `phase` included |
+| R04 | 429 with `retry-after: 1`, then OK; next turn: a complete reasoning item, cut text and an `error` event mid-stream, then the same request again, keeping nothing of the failed attempt |
+| R05 | cancel while a reasoning item streams (cut before its done event); strict `reject_unencrypted_reasoning`: the next turn must not replay the cut item |
+
+Every R scenario uses model kind `openai_responses`, `gpt-6-luna`, `reasoning: {"effort":
+"xhigh"}`, `temperature: null`, and strict `reject_params` (`temperature`, `max_tokens`,
+`max_completion_tokens`, `reasoning_effort`) plus `reject_unencrypted_reasoning`.

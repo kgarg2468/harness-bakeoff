@@ -1,0 +1,75 @@
+{
+  "id": "R01",
+  "title": "Responses API: text only at reasoning effort xhigh; a stateless request (store false, encrypted reasoning, tools)",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {
+    "kind": "openai_responses",
+    "model": "gpt-6-luna",
+    "reasoning": {"effort": "xhigh"},
+    "temperature": null
+  },
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "strict": {
+    "reject_params": ["temperature", "max_tokens", "max_completion_tokens", "reasoning_effort"],
+    "reject_unencrypted_reasoning": true
+  },
+  "driver": [{"user": "Say hello to the RocketRide team."}],
+  "exchanges": [
+    {
+      "note": "The request shape: Responses tools, xhigh effort, store false, encrypted reasoning included. A reasoning item with a summary, then the answer.",
+      "expect": {
+        "model": "gpt-6-luna",
+        "body_has": ["tools"],
+        "body_lacks": ["messages", "previous_response_id"],
+        "body_equals": {
+          "stream": true,
+          "store": false,
+          "reasoning.effort": "xhigh",
+          "tools.0.type": "function",
+          "tools.0.name": "list_components"
+        },
+        "body_contains": {"include": "reasoning.encrypted_content"},
+        "system_contains": "You are Rocket Agent.",
+        "input_len": 1,
+        "last_type": "message",
+        "last_role": "user",
+        "last_content_contains": "Say hello"
+      },
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R01_1",
+              "encrypted_content": "gAAAAABpTzsPSL978XCx1Q17SV1TN9JKPBkgq6grYYpBmbZr92JHH1LaVFsXXhz9C5n7dg_To3LLiQdsEdwycvPvdAwI2danTWANjcSWsj9l4AzjYEQXdaQsmvAU57uOU-cKwMUs",
+              "summary": ["**Greeting the team**\n\nA short, friendly hello; no tools are needed."]
+            },
+            "chunks": 2
+          },
+          {
+            "text": "Hello, RocketRide team! Your pipelines are ready when you are.",
+            "chunks": 4,
+            "phase": "final_answer",
+            "delay_ms": 5
+          },
+          {
+            "completed": {
+              "input_tokens": 1812,
+              "output_tokens": 96,
+              "cached_tokens": 0,
+              "reasoning_tokens": 64
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn"],
+    "requests": 1,
+    "commits": 1,
+    "text_contains": "Hello, RocketRide team!",
+    "usage": {"input_tokens": 1812, "output_tokens": 96, "cached_tokens": 0}
+  }
+}

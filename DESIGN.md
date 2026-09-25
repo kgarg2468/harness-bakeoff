@@ -228,6 +228,11 @@ recordings and the session log, never from what a loop says about itself.
 | S13 | BYOK thinking: `openai_compat` endpoint, non-OpenAI model name, reasoning requested | the reasoning parameter reaches the wire |
 | S14 | BYOK strict endpoint: 400 if body has `reasoning`, `reasoning_effort` or `stream_options` (configured via compat flags) | the turn finishes |
 | S15 | compaction hand-off: runner appends a summary item; loop sends [system, summary, new user] | prefix resets only at the compaction boundary |
+| R01 | Responses API (`gpt-6-luna`, effort `xhigh`): text only | `store: false`, `include` has `reasoning.encrypted_content`, Responses tools; exact text; usage from `response.completed` |
+| R02 | reasoning + one function call + its `function_call_output`, then the answer | the reasoning item replayed exactly as sent; tool ran once |
+| R03 | commentary + 3 function calls in one response; `write_file` asks; approve in a new process | as S05; the resumed request replays reasoning, commentary (`phase`) and all calls |
+| R04 | 429 with `retry-after: 1`, then OK; next turn an `error` event mid-stream, then OK | waited per Retry-After; nothing of the failed attempt is replayed |
+| R05 | cancel while reasoning streams | stops within 200 ms; next turn passes `reject_unencrypted_reasoning` |
 
 The driver (`shared/scenario.py`) runs the steps with the real runner, session log, working copy
 and ToolHost on MockEngine. `approve` with `new_process` and the user turn after `crash_after` run

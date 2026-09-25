@@ -309,13 +309,16 @@ class _ScenarioRun:
         # first exchange. Its recordings move to `wire/` afterwards.
         self.cursor = f"{run_id}.{uuid.uuid4().hex[:6]}"
         self.recorded = provider.wire_dir / sc.id / self.cursor / impl
+        # A scenario's `temperature` (null: none) replaces ModelConfig's default only if given.
+        temperature = {"temperature": sc.model["temperature"]} if "temperature" in sc.model else {}
         self.model = ModelConfig(
             base_url=provider.base_url(sc.id, self.cursor, impl),  # claims the recording folder
             model=sc.model["model"],
-            kind=sc.model["kind"],
+            kind=sc.model["kind"],  # as the scenario says: it picks the API a loop must speak
             reasoning=sc.model.get("reasoning"),
             compat=sc.model.get("compat") or {},
             timeout_s=MODEL_TIMEOUT_S,
+            **temperature,
         )
         self.ws = Workspace(
             directory / "log.sqlite", engine_delay_ms=sc.engine["delay_ms"], sinks=[self._on_event]

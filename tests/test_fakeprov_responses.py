@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
-from bakeoff.fakeprov.script import ScenarioError, load_scenario
+from bakeoff.fakeprov.script import SCENARIOS_DIR, ScenarioError, load_scenario
 from bakeoff.fakeprov.server import FakeProvider
 
 MODEL = "gpt-6-luna"
@@ -512,6 +512,20 @@ def test_invalid_responses_scenarios_have_clear_errors(tmp_path: Path, change, e
     with pytest.raises(ScenarioError) as info:
         load_scenario(tmp_path / "T.json")
     assert error in str(info.value)
+
+
+@pytest.mark.parametrize("sid", [f"R0{n}" for n in range(1, 6)])
+def test_r_scenarios_speak_the_responses_api(sid):
+    s = load_scenario(SCENARIOS_DIR / f"{sid}.json")
+    assert (s.api, s.style) == ("responses", "responses")
+    assert s.model == {
+        "kind": "openai_responses",
+        "model": "gpt-6-luna",
+        "reasoning": {"effort": "xhigh"},
+        "temperature": None,
+    }
+    assert s.strict["reject_unencrypted_reasoning"] is True
+    assert "temperature" in s.strict["reject_params"]
 
 
 async def test_the_openai_sdk_parses_every_event(serve):

@@ -19,7 +19,7 @@ from bakeoff.fakeprov.script import SCENARIOS_DIR
 from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.our_version import OurLoop
 from bakeoff.shared import scenario
-from bakeoff.shared.contract import ModelConfig, ToolResult
+from bakeoff.shared.contract import Event, ModelConfig, ToolResult
 from bakeoff.shared.scenario import (
     CancelMark,
     DriverError,
@@ -37,6 +37,7 @@ from bakeoff.shared.scenario import (
     unexpected,
     usage_totals,
 )
+from bakeoff.shared.sessionlog import SessionLog
 
 # The result.json fields of the shared output format, plus the driver's thread and processes.
 RESULT_KEYS = set(
@@ -792,6 +793,43 @@ def test_a_documented_failure_may_name_the_driver_error_it_causes(
     assert scenario.status(result("X02", no_pause, "stops")) == "FAIL"  # an undocumented error
 
 
+async def test_the_scenario_model_reaches_the_loop_unchanged(
+    real_provider: FakeProvider, tmp_path: Path
+) -> None:
+    seen: list[ModelConfig] = []
+
+    class Records(OurLoop):
+        async def run_turn(self, turn, tools, cancel):  # type: ignore[override]
+            seen.append(turn.model)
+            yield Event("turn.end", {"stop": "end_turn", "steps": 0})
+
+    out = tmp_path / "out"
+    await run_scenario(
+        "R01", "our", out=out, run_id="r1", provider=real_provider, loop_factory=Records
+    )
+    [model] = seen
+    assert (model.kind, model.model, model.reasoning) == (
+        "openai_responses",
+        "gpt-6-luna",
+        {"effort": "xhigh"},
+    )
+    assert model.temperature is None  # the scenario's null: reasoning models reject one
+    assert model.base_url.endswith("/v1")
+    # A child process (bakeoff approve/turn) rebuilds the same config from the thread's meta.
+    log = SessionLog(out / "runs" / "r1" / "R01" / "our" / "log.sqlite")
+    try:
+        meta = log.get_thread("R01-our")["meta"]["model"]
+    finally:
+        log.close()
+    assert scenario.model_from_meta(meta, "dummy") == replace(model, api_key="dummy")
+    # Without a `temperature` in the scenario, ModelConfig's default stays.
+    seen.clear()
+    await run_scenario(
+        "S01", "our", out=out, run_id="r1", provider=real_provider, loop_factory=Records
+    )
+    assert (seen[0].kind, seen[0].temperature) == ("openrouter", 0.0)
+
+
 def test_unexpected_lists_failures_and_passes_of_documented_failures() -> None:
     cell = {"passed": False, "reason": "x", "expected_failure": None, "duration_ms": 1.0}
     summary = {
@@ -840,7 +878,7 @@ def test_load_tells_missing_loops_from_broken_ones(
 
 def test_scenario_ids_are_every_file_in_order() -> None:
     ids = scenario.scenario_ids()
-    assert ids[0] == "S01" and ids[-1] == "S15" and "S12b" in ids
+    assert ids[0] == "R01" and ids[-1] == "S15" and {"R05", "S01", "S12b"} <= set(ids)
     assert ids == sorted(p.stem for p in SCENARIOS_DIR.glob("*.json"))
 
 
