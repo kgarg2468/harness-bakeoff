@@ -37,6 +37,8 @@ src/bakeoff/
   fakeprov/            scripted OpenAI/OpenRouter-compatible SSE server + scenario scripts
   metrics/             loc, deps, bench -> out/metrics.json
   report/              builds out/report.html (side-by-side replay, wire diff, scorecard)
+  loops.py             registry of the loops (lazy imports; each loop's documented failures)
+  live.py              `bakeoff live` / `chat` against a real model endpoint
   cli.py               `bakeoff` command
   data/                catalog of RocketRide node definitions + example pipes (MIT, see notices)
 tests/                 pytest; the scenario matrix runs every scenario against every loop
@@ -175,12 +177,22 @@ recordings and the session log, never from what a loop says about itself.
 | S09 | 429 with `retry-after: 1`, then OK; variant: `sse_error` mid-stream | wire: exactly 2 attempts, waited per Retry-After. Observability (a visible `retry` event) is scored separately |
 | S10a | `reasoning_details` round-trip with known fields, split across chunks, incl. metadata-only fragments | semantic equality of {type,text,signature,data,format,index}; byte equality reported as info |
 | S10b | same plus a synthetic unknown field | informational footnote only |
-| S11 | step cap: the model calls tools forever | stop=max_steps after exactly `max_steps` requests; no orphan calls |
+| S11 | step cap: the model calls tools forever | stop=max_steps after exactly `max_steps` requests; no orphan calls; the last step's calls do not run (their results could never be sent) |
 | S12 | cost metering on OpenRouter: provider `cost` per step, across two turns | per-step and per-turn totals exact |
 | S12b | cost metering on a BYOK OpenAI-compatible endpoint: usage only when `stream_options.include_usage` is sent, no `cost` | usage counted; cost reported as unavailable, never guessed |
 | S13 | BYOK thinking: `openai_compat` endpoint, non-OpenAI model name, reasoning requested | the reasoning parameter reaches the wire |
 | S14 | BYOK strict endpoint: 400 if body has `reasoning`, `reasoning_effort` or `stream_options` (configured via compat flags) | the turn finishes |
 | S15 | compaction hand-off: runner appends a summary item; loop sends [system, summary, new user] | prefix resets only at the compaction boundary |
+
+The driver (`shared/scenario.py`) runs the steps with the real runner, session log, working copy
+and ToolHost on MockEngine. `approve` with `new_process` and the user turn after `crash_after` run
+as separate OS processes (`bakeoff approve`, `bakeoff turn`); the crash is a SIGKILL the child
+sends itself from its runner's sink, so for `item`, `tool.start` and `turn.end` (stored before
+they are published) it comes right after the event is durable. Every key of the final `expect`
+and the invariants I1, I2, I3, I5 and I7 decide pass or fail. For I5 the driver captures
+stdout/stderr around the loop's code and reads the child processes' pipes (a worker prints only
+its one-line JSON summary). A loop's documented failures are listed in `bakeoff/loops.py`: the
+matrix runs them as strict xfails, so a fix shows up as well as a regression.
 
 ## Invariants (checked on every scenario)
 
@@ -189,7 +201,8 @@ recordings and the session log, never from what a loop says about itself.
 - **I2** every tool call gets exactly one result; no call id runs twice (`tool.start` count).
 - **I3** `seq` has no gaps; `item` events == item rows.
 - **I5** the loop writes nothing to stdout/stderr.
-- **I6** no connection leaves 127.0.0.1 (socket guard in tests and in `bakeoff` unless `--live`).
+- **I6** no connection leaves 127.0.0.1 (socket guard in tests and in every `bakeoff` command;
+  `live` and `chat` also allow the model endpoint's host).
 - **I7** one commit per completed turn; `turns.commit_sha == git rev-parse`.
 
 ## `our_version`: lean and fast
@@ -246,8 +259,9 @@ both Apache-2.0), credit those too. Never use leaked or unlicensed code.
 ## Safety
 
 - Tests and scripted runs never leave 127.0.0.1.
-- The only live network use is `bakeoff chat --live` / `bakeoff live`, which reads
-  `OPENROUTER_API_KEY` from an env file given by `--env-file` or `BAKEOFF_ENV_FILE`, holds it in
-  memory, never prints or records it, and only talks to `openrouter.ai`.
+- The only live network use is `bakeoff live` / `bakeoff chat`, which read `OPENAI_API_KEY`
+  from the environment or from an env file given by `--env-file` or `BAKEOFF_ENV_FILE`, hold it
+  in memory, never print or record it, and only talk to the endpoint's host (`api.openai.com`
+  by default).
 - Wire recordings contain request bodies only, never headers. Live recordings are not committed.
 - No code path may default to a production RocketRide URI.

@@ -22,12 +22,62 @@ and is identical for both. So the comparison counts only the loop.
 
 ```bash
 uv sync --all-extras
-uv run pytest            # every scenario against every loop, fully offline
-./scripts/engine_fit.sh  # which loop's dependencies fit into the RocketRide engine
+uv run pytest                              # every scenario against every loop, fully offline
+uv run bakeoff scenario --all --impl our   # the scenario matrix, with a one-line reason per failure
+./scripts/engine_fit.sh                    # which loop's dependencies fit into the RocketRide engine
 ```
 
-More commands (`bakeoff scenario`, `bakeoff chat --live`, `bakeoff report`, `bakeoff bench`)
-arrive as the pieces land; see `DESIGN.md`.
+`bakeoff report` and `bakeoff bench` arrive as those pieces land; see `DESIGN.md`.
+
+## CLI
+
+Scenarios run offline against the fake model server (`fakeprov`), with the real runner, session
+log, git working copy and tools. Loops that are not built yet are skipped.
+
+```bash
+bakeoff scenario S01 S05 --impl our,pydantic   # or --all; --out out (default), --run-id ID
+```
+
+It prints a matrix (`pass`, `FAIL`, `xfail` for a failure the loop's registry entry documents,
+`XPASS` when such a failure is fixed) and exits 1 on any unexpected failure. Each run writes:
+
+```
+out/runs/<run_id>/summary.json                   matrix + one-line reasons, git sha, loop versions
+out/runs/<run_id>/<scenario>/<impl>/result.json  every expect key and invariant, with details
+                                    log.sqlite   the session log
+                                    wire/        every request body the fake server received
+                                    events.ndjson, wc/ (the git working copy)
+out/runs/latest -> <run_id>
+```
+
+Live runs talk to a real OpenAI-compatible endpoint (OpenAI by default). The key is
+`OPENAI_API_KEY` from the environment, or from an env file (`--env-file` or `BAKEOFF_ENV_FILE`)
+that the code reads; it is never printed or stored. The network guard allows only loopback and
+the endpoint's host.
+
+```bash
+bakeoff live --impl our,pydantic --model gpt-6-luna --reasoning none --max-steps 8 \
+    --prompt "Build a chat pipeline, save it as chat.pipe, and validate it."
+bakeoff chat --impl our            # REPL: approvals prompted, /revert N, /compact TEXT, /exit
+```
+
+`live` streams each loop's run (text inline, tool calls and results on one line each), then
+prints tokens, time to first token, total time and steps side by side, and writes
+`out/live/<run_id>/<impl>/` (same files as a scenario run; `result.json` adds `model`, `prompt`,
+`final_text`, `latency`). `--interactive` asks before each write; `--base-url` points it at
+another endpoint (`{impl}` in the URL is replaced by the loop name).
+
+The commands below act on one thread of a session log from a separate process. The scenario
+driver uses them for the cross-process steps (approve in a new process, crash and resume):
+
+```bash
+bakeoff turn    THREAD --db out/.../log.sqlite --user TEXT [--crash-after TYPE --call-id ID]
+bakeoff approve THREAD --db ... [--allow ID ...] [--deny ID ... --reason TEXT]
+bakeoff deny    THREAD --db ... [--call ID ...] --reason TEXT
+bakeoff resume  THREAD --db ...    # crash resume
+bakeoff cancel  THREAD --db ...    # stops the turn a worker is running
+bakeoff fakeprov --port 8787       # serve the fake model server
+```
 
 ## Status
 
