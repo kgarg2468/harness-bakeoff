@@ -404,14 +404,16 @@ async def test_reasoning_details_round_trip(loop, record_property):
     ]
     stream = [chunk({"reasoning_details": [f]}) for f in fragments]
     with SSEServer(Reply([*stream, *text("42"), done()]), Reply([*text("ok"), done()])) as srv:
-        events = await run(loop, turn([user("q")], config(srv)), StubTools())
+        model = config(srv, reasoning={"effort": "low"})
+        events = await run(loop, turn([user("q")], model), StubTools())
         history = [user("q"), *items(events), user("again")]
-        await run(loop, turn(history, config(srv)), StubTools())
+        await run(loop, turn(history, model), StubTools())
 
     expected = [
         {"type": "reasoning.text", "text": "Let me think.", "signature": "sig-1", **meta},
         {"type": "reasoning.encrypted", "data": "ENC", "format": "anthropic-claude-v1", "index": 1},
     ]
+    assert srv.requests[0]["reasoning"] == {"effort": "low"}  # openrouter_reasoning setting
     assert [d["text"] for d in of(events, "reasoning.delta")] == ["Let me ", "think."]
     assert items(events)[0].message["reasoning_details"] == expected
     replayed = srv.requests[1]["messages"][2]["reasoning_details"]
@@ -424,42 +426,33 @@ async def test_reasoning_details_round_trip(loop, record_property):
 
 
 async def test_byok_thinking_reaches_the_wire_for_a_non_openai_model(loop):
-    reasoning = {"effort": "low"}
-    with SSEServer(*[Reply([*text("ok"), done()]) for _ in range(3)]) as srv:
-        byok = config(srv, kind="openai_compat", model="qwen3-coder", reasoning=reasoning)
-        await run(loop, turn([user("a")], byok), StubTools())
-        strict = {
-            "max_tokens_field": "max_tokens",
-            "developer_role": True,
-            "stream_usage": False,
-            "reasoning_param": "none",
-            "unknown_flag": 1,
-        }
-        await run(
-            loop,
-            turn(
-                [user("b")],
-                config(srv, kind="openai_compat", model="m", compat=strict, reasoning=reasoning),
-            ),
-            StubTools(),
-        )
-        via_openrouter = config(
-            srv,
-            kind="openai_compat",
-            model="m",
-            reasoning=reasoning,
-            compat={"reasoning_param": "openrouter"},
-        )
-        await run(loop, turn([user("c")], via_openrouter), StubTools())
+    strict = {
+        "max_tokens_field": "max_tokens",
+        "developer_role": True,
+        "stream_usage": False,
+        "reasoning_param": "none",
+        "unknown_flag": 1,
+    }
+    flags = [{}, strict, {"reasoning_param": "openrouter"}]
+    with SSEServer(*[Reply([*text("ok"), done()]) for _ in flags]) as srv:
+        for compat in flags:
+            byok = config(
+                srv,
+                kind="openai_compat",
+                model="qwen3-coder",
+                reasoning={"effort": "low"},
+                compat=compat,
+            )
+            await run(loop, turn([user("hi")], byok), StubTools())
 
     default, strict_body, openrouter_style = srv.requests
     assert (default["reasoning_effort"], default["max_completion_tokens"]) == ("low", 4096)
     assert default["stream_options"] == {"include_usage": True}
     assert strict_body["max_tokens"] == 4096 and strict_body["messages"][0]["role"] == "developer"
-    assert not {"reasoning", "reasoning_effort", "stream_options", "max_completion_tokens"} & set(
-        strict_body
-    )
-    assert openrouter_style["reasoning"] == reasoning and "reasoning_effort" not in openrouter_style
+    rejected = {"reasoning", "reasoning_effort", "stream_options", "max_completion_tokens"}
+    assert not rejected & set(strict_body)
+    assert openrouter_style["reasoning"] == {"effort": "low"}
+    assert "reasoning_effort" not in openrouter_style
     # Why CompatProvider exists: the stock provider's name-based profile has no thinking here.
     stock = OpenAIChatModel(
         "qwen3-coder", provider=OpenAIProvider(base_url=srv.base_url, api_key="k")
@@ -534,3 +527,16 @@ async def test_reasoning_model_with_temperature_stays_quiet(capfd):
 
     assert "temperature" not in srv.requests[0]  # the library drops it for reasoning models
     assert (caught, capfd.readouterr()) == ([], ("", ""))
+
+
+async def test_error_chunk_mid_stream_is_not_retried(loop):
+    error = {**chunk(finish="error"), "error": {"code": 502, "message": "upstream died"}}
+    with SSEServer(Reply([*text("Hal"), error])) as srv:
+        events = await run(loop, turn([user("hi")], config(srv, max_retries=2)), StubTools())
+
+    # Recorded behavior: the OpenAI SDK retries only before a stream starts, and pydantic-ai does
+    # not retry a failed stream, so this is one attempt and an error turn keeping the partial text.
+    assert len(srv.bodies) == 1
+    assert [(i.status, i.message["content"]) for i in items(events)] == [("incomplete", "Hal")]
+    assert of(events, "error")[0]["retryable"] is True
+    assert of(events, "turn.end")[0]["stop"] == "error"
