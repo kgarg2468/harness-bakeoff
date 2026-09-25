@@ -222,7 +222,7 @@ _I2_PROBLEMS = (
     "missing",  # a call without a result
     "extra",  # a call with more than one result
     "orphans",  # a result without a call
-    "misplaced",  # a result that does not answer the latest assistant message before it
+    "misplaced",  # a result not in the run of results right after its assistant message
     "duplicate_calls",  # a call id in more than one assistant message
     "reran",  # more than one tool.start for a call id
     "unknown_runs",  # a tool ran for a call id that is in no assistant message
@@ -236,17 +236,18 @@ def check_tool_results(items: Sequence[Item], events: Sequence[dict[str, Any]]) 
     calls: Counter[Any] = Counter()
     results: Counter[Any] = Counter()
     out_of_place: list[Any] = []
-    latest: list[Any] = []  # call ids of the latest assistant message
+    latest: list[Any] = []  # the calls that the next result may answer
     for item in items:
         role = item.message.get("role")
-        if role == "assistant":
-            latest = [c.get("id") for c in item.message.get("tool_calls") or []]
-            calls.update(latest)
-        elif role == "tool":
+        if role == "tool":
             call_id = item.message.get("tool_call_id")
             results[call_id] += 1
             if call_id not in latest:
                 out_of_place.append(call_id)
+        else:  # any other item ends the results that answer the assistant message before it
+            tool_calls = item.message.get("tool_calls") if role == "assistant" else None
+            latest = [c.get("id") for c in tool_calls or []]
+            calls.update(latest)
     starts: Counter[Any] = Counter()
     late: list[Any] = []
     for e in events:

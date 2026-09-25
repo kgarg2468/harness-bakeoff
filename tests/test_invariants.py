@@ -225,6 +225,7 @@ def test_tool_results_ok():
         ((USER, RESULT), [], "orphans"),
         ((USER, RESULT, CALL), ["c1"], "misplaced"),  # the result before its call
         ((USER, CALL, ANSWER, RESULT), ["c1"], "misplaced"),  # the model answered without it
+        ((USER, CALL, USER, RESULT), ["c1"], "misplaced"),  # a new user message came between
         ((USER, CALL, RESULT, CALL), ["c1"], "duplicate_calls"),  # e.g. re-emitted on resume
         ((USER, CALL, RESULT), ["c1", "c1"], "reran"),
         ((USER,), ["ghost"], "unknown_runs"),  # e.g. an eager tool of a retried stream
