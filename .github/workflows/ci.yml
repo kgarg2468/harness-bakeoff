@@ -48,6 +48,8 @@ jobs:
         run: uv pip install --upgrade "pydantic-ai-slim[openai,openrouter]" "openai>=3.19"
       - run: uv pip list | grep -iE '^(pydantic-ai-slim|openai|httpx|pydantic) '
       - run: uv run --no-sync pytest -q
+      - name: harness overhead smoke benchmark (fails on large regressions or a loop that does not import)
+        run: uv run --no-sync python -m bakeoff.metrics.bench --quick
 
   engine-fit:
     name: engine dependency fit
