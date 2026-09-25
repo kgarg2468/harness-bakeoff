@@ -116,6 +116,7 @@ class ResponsesStream(Stream):
         self.native: list[dict[str, Any]] = []
         self.parts = 0  # reasoning summary parts so far, over all reasoning items
         self.unpaired = False  # the last reasoning item was dropped (see _done)
+        self.cut = False  # a call's done item came incomplete: out of max_output_tokens
 
     def feed(self, event: dict[str, Any]) -> Event | StreamedCall | None:
         """Take one event. Returns an event to publish, or a function call that just completed."""
@@ -143,7 +144,7 @@ class ResponsesStream(Stream):
             reason = (response.get("incomplete_details") or {}).get("reason")
             if kind == "response.incomplete" and reason != "max_output_tokens":
                 raise classify("stream", f"Response incomplete: {reason}")
-            self.finish = "length" if reason == "max_output_tokens" else "stop"
+            self.finish = "length" if reason == "max_output_tokens" or self.cut else "stop"
         elif kind == "error":  # after HTTP 200; its fields are top-level, or in `error`
             raise stream_error(event.get("error") or event)
         elif kind == "response.failed":
@@ -158,6 +159,11 @@ class ResponsesStream(Stream):
             self.unpaired = not item.get("encrypted_content")
             if not self.unpaired:
                 self.native.append(item)
+            return None
+        if kind == "function_call" and item.get("status") == "incomplete":
+            # Cut at max_output_tokens, its arguments too: it never runs, not even early, and the
+            # response is a truncated one whatever event ends it.
+            self.cut = True
             return None
         # The API pairs an output item's id with the reasoning item before it, and refuses the id
         # without that item ("provided without its required 'reasoning' item"): after a dropped

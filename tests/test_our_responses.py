@@ -337,6 +337,31 @@ async def test_max_output_tokens_truncates_and_runs_no_call() -> None:
     assert events[-1].data["stop"] == "error"
 
 
+@pytest.mark.parametrize(
+    "end",
+    [completed("incomplete", "max_output_tokens", output_tokens=4096), completed()],
+    ids=["incomplete", "completed"],
+)
+async def test_a_call_done_incomplete_never_runs(end: dict[str, Any]) -> None:
+    """max_output_tokens cut the call (its done item says so, arguments cut too): it is never
+    ready, not even for an eager start, and the turn is truncated whatever event ends it."""
+    tools = StubTools()
+    cut = {**fcall("c0", "describe_component", '{"name": "a"}'), "status": "incomplete"}
+
+    async def body() -> AsyncIterator[bytes]:
+        yield stream_bytes(done(cut))
+        await asyncio.sleep(0.05)  # time enough for an eager start to run the tool
+        yield stream_bytes(end)
+
+    server = Server(lambda: httpx.Response(200, content=body()))
+    events = await run(server.loop(), [user("go")], tools, model=MODEL)
+    assert of(events, "tool_call.ready") == [] and tools.run_counts == {}
+    assert of(events, "error")[0]["kind"] == "output_truncated"
+    (item,) = items(events)  # kept as cut output, never replayed
+    assert item.status == "incomplete" and "tool_calls" not in item.message
+    assert events[-1].data["stop"] == "error"
+
+
 def test_request_options_and_items_without_native() -> None:
     model = replace(MODEL, temperature=0.2, max_tokens=4, reasoning={"effort": "none"})
     body = static_body(model, SYSTEM, [], "t" * 80)
