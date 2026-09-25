@@ -30,6 +30,8 @@ FIRST_SEVEN = [
     "edit_file",
 ]
 BUILDING = "rocketride-building-pipelines"
+CONFIGURING = "rocketride-configuring-pipelines"
+DESIGNING = "rocketride-designing-pipelines"
 
 
 def call(args, call_id="c1"):
@@ -129,6 +131,20 @@ def test_folders_without_skill_md_are_not_skills(tmp_path):
     assert bundle.skills["a"].files == ("SKILL.md", "ref/x.md", "../SHARED.md")
 
 
+def test_stray_files_are_not_skill_files(tmp_path):
+    (tmp_path / "a" / "tools").mkdir(parents=True)
+    (tmp_path / "a" / "SKILL.md").write_text("---\nname: a\ndescription: Use for A.\n---\n")
+    (tmp_path / "a" / "tools" / "run.py").write_text("print()")
+    (tmp_path / "a" / ".SKILL.md.swp").write_bytes(b"\xff")
+    (tmp_path / "a" / "SKILL.md~").write_text("backup")
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / ".hidden" / "x.md").write_text("x")
+    (tmp_path / ".DS_Store").write_bytes(b"\x00\xff")
+    bundle = load_skills(tmp_path)
+    assert bundle.paths == {"a/SKILL.md"}
+    assert bundle.skills["a"].files == ("SKILL.md",)
+
+
 # --- the prompt -------------------------------------------------------------------------------
 
 
@@ -196,6 +212,20 @@ async def test_load_skill_returns_note_then_skill_md(host):
             "examples/simple-chat-rag.pipe",
             "rocketride-designing-pipelines/examples/simple-chat-rag.pipe",
         ),
+        # Bare file names, as the skills write them for files in another skill or a subfolder.
+        (BUILDING, "PIPELINE_ANTIPATTERNS.md", f"{CONFIGURING}/PIPELINE_ANTIPATTERNS.md"),
+        (BUILDING, "PIPELINE_RULES_SUMMARY.md", f"{DESIGNING}/PIPELINE_RULES_SUMMARY.md"),
+        (BUILDING, "LAYER1_NODE_INDEX.json", f"{DESIGNING}/LAYER1_NODE_INDEX.json"),
+        (
+            "rocketride-debugging-pipelines",
+            "PIPELINE_ANTIPATTERNS.md",
+            f"{CONFIGURING}/PIPELINE_ANTIPATTERNS.md",
+        ),
+        (DESIGNING, "FAILURE_SCENARIOS.md", f"{DESIGNING}/examples/FAILURE_SCENARIOS.md"),
+        (DESIGNING, "agentic-chat.pipe", f"{DESIGNING}/examples/agentic-chat.pipe"),
+        # Bare names that exist in several places keep their direct meaning.
+        (DESIGNING, "README.md", "README.md"),
+        (DESIGNING, "SKILL.md", f"{DESIGNING}/SKILL.md"),
     ],
 )
 async def test_load_skill_reference_files(host, name, file, path):
@@ -203,6 +233,24 @@ async def test_load_skill_reference_files(host, name, file, path):
     assert result.ok
     assert result.content.endswith(f"\n\n--- {path} ---\n{(SKILLS_DIR / path).read_text()}")
     assert f"Files of {name}: " in result.content
+
+
+def test_every_bundle_file_a_skill_mentions_loads_by_that_name():
+    """Guards the next sync: a new duplicate file name would break the skills' bare references."""
+    bundle = load_skills()
+    names = {path.rpartition("/")[2] for path in bundle.paths}
+    checked = 0
+    for path in sorted(bundle.paths):
+        skill = path.partition("/")[0]
+        if skill not in bundle.skills:
+            continue  # the shared files at the top belong to no skill
+        text = (SKILLS_DIR / path).read_text()
+        for mentioned in sorted(
+            n for n in names if re.search(rf"(?<![\w./-]){re.escape(n)}", text)
+        ):
+            skills.resolve(skill, mentioned)
+            checked += 1
+    assert checked > 10  # 17 at the synced commit: the scan itself still finds references
 
 
 async def test_largest_file_is_not_truncated(host):
@@ -245,12 +293,52 @@ async def test_unknown_skill_lists_the_valid_names(host):
 async def test_unknown_or_escaping_files_are_invalid_args(host, file):
     result = await host.run(call({"name": BUILDING, "file": file}))
     assert (result.ok, result.error) == (False, "invalid_args")
-    assert result.content.startswith(
-        f"Invalid arguments for load_skill: Unknown file {file!r} in skill {BUILDING!r}. "
+    assert result.content.startswith("Invalid arguments for load_skill: Unknown file ")
+    assert result.content.endswith(
+        f" in skill {BUILDING!r}. Files: SKILL.md, GATE_PROTOCOL.md, ROCKETRIDE_DOC_MAP.md, "
+        "pipeline-patterns.md, ../MCP_TOOL_CONTRACT.md, ../README.md"
+    )
+    assert host.run_counts == {}
+
+
+async def test_unknown_file_message_echoes_the_value(host):
+    result = await host.run(call({"name": BUILDING, "file": "NOPE.md"}))
+    assert result.content == (
+        f"Invalid arguments for load_skill: Unknown file 'NOPE.md' in skill {BUILDING!r}. "
         "Files: SKILL.md, GATE_PROTOCOL.md, ROCKETRIDE_DOC_MAP.md, pipeline-patterns.md, "
         "../MCP_TOOL_CONTRACT.md, ../README.md"
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "file", "hint"),
+    [
+        # A wrong directory for a known file name: point at where it is, as the skill writes it.
+        (
+            BUILDING,
+            f"../{DESIGNING}/PIPELINE_ANTIPATTERNS.md",
+            f"../{CONFIGURING}/PIPELINE_ANTIPATTERNS.md",
+        ),
+        (DESIGNING, "./FAILURE_SCENARIOS.md", "examples/FAILURE_SCENARIOS.md"),
+        (CONFIGURING, "/etc/PIPELINE_ANTIPATTERNS.md", "PIPELINE_ANTIPATTERNS.md"),
+    ],
+)
+async def test_wrong_directory_gets_a_hint_not_the_file(host, name, file, hint):
+    result = await host.run(call({"name": name, "file": file}))
+    assert (result.ok, result.error) == (False, "invalid_args")
+    assert (
+        f"Unknown file {file!r} in skill {name!r}. Did you mean {hint}? Files: " in result.content
+    )
     assert host.run_counts == {}
+
+
+@pytest.mark.parametrize("field", ["name", "file"])
+async def test_huge_values_are_not_echoed_back(host, field):
+    args = {"name": BUILDING, field: "x" * 100_000}
+    result = await host.run(call(args))
+    assert (result.ok, result.error) == (False, "invalid_args")
+    assert f"{'x' * 100}'... (100000 chars)" in result.content
+    assert len(result.content) < 500
 
 
 def test_read_refuses_paths_resolve_would_not_return():

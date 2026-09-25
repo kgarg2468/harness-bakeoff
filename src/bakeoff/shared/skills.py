@@ -19,6 +19,9 @@ from pathlib import Path
 SKILLS_DIR = Path(__file__).resolve().parents[1] / "data" / "skills"
 SKILL_FILE = "SKILL.md"
 SOURCE_FILE = "SOURCE.json"  # provenance written by the sync script, not skill content
+# The text the model can read; the sync script copies exactly these (not the `tools/*.py` shims).
+SKILL_SUFFIXES = (".md", ".json", ".pipe")
+_ECHO = 100  # longest argument value an error message repeats back to the model
 _BLOCK_SCALARS = frozenset({">", "|", ">-", "|-", ">+", "|+"})
 
 
@@ -84,10 +87,16 @@ def _unquote(value: str) -> str:
     return value
 
 
+def _is_skill_file(path: Path) -> bool:
+    """Skill text only: a stray `.DS_Store` or editor swap file would be listed and unreadable."""
+    hidden = any(part.startswith(".") for part in path.parts)
+    return path.suffix in SKILL_SUFFIXES and not hidden and path.as_posix() != SOURCE_FILE
+
+
 @functools.cache
 def _load(root: Path) -> Bundle:
-    files = (p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
-    paths = frozenset(path for path in files if path != SOURCE_FILE)
+    files = (p.relative_to(root) for p in root.rglob("*") if p.is_file())
+    paths = frozenset(path.as_posix() for path in files if _is_skill_file(path))
     shared = sorted(f"../{p}" for p in paths if "/" not in p)
     skills: dict[str, Skill] = {}
     for skill_md in sorted(root.glob(f"*/{SKILL_FILE}")):
@@ -131,26 +140,47 @@ def resolve(name: str, file: str | None = None, root: Path | None = None) -> str
     """The bundle path (relative to the skills root) of a skill's `SKILL.md` or of `file`.
 
     `file` is read as the skill text writes it: relative to the skill's directory
-    (`GATE_PROTOCOL.md`, `../MCP_TOOL_CONTRACT.md`), or else relative to the skills root
-    (`rocketride-designing-pipelines/LAYER1_NODE_INDEX.json`). Only files in the bundle are
-    ever returned, so no argument can reach outside it. Raises `SkillError`.
+    (`GATE_PROTOCOL.md`, `../MCP_TOOL_CONTRACT.md`), else relative to the skills root
+    (`rocketride-designing-pipelines/LAYER1_NODE_INDEX.json`), else, for a bare file name, the
+    one bundle file of that name (the skills write `PIPELINE_ANTIPATTERNS.md` although it lives in
+    the configuring skill). Only files in the bundle are ever returned, so no argument can reach
+    outside it. Raises `SkillError`.
     """
     bundle = load_skills(root)
     skill = bundle.skills.get(name)
     if skill is None:
-        raise SkillError(f"Unknown skill: {name!r}. Skills: {', '.join(bundle.skills) or 'none'}")
+        valid = ", ".join(bundle.skills) or "none"
+        raise SkillError(f"Unknown skill: {_shown(name)}. Skills: {valid}")
     if file is None:
         return f"{name}/{SKILL_FILE}"
     for candidate in (posixpath.join(name, file), file):
         path = posixpath.normpath(candidate)
         if path in bundle.paths:
             return path
-    raise SkillError(f"Unknown file {file!r} in skill {name!r}. Files: {', '.join(skill.files)}")
+    base = posixpath.basename(file)
+    same_name = [path for path in bundle.paths if posixpath.basename(path) == base]
+    if len(same_name) == 1 and "/" not in file:
+        return same_name[0]
+    # A path with a wrong directory: point at the file of that name, as this skill would write it.
+    hint = f" Did you mean {_as_written(name, same_name[0])}?" if len(same_name) == 1 else ""
+    raise SkillError(
+        f"Unknown file {_shown(file)} in skill {name!r}.{hint} Files: {', '.join(skill.files)}"
+    )
+
+
+def _as_written(name: str, path: str) -> str:
+    """A bundle path relative to skill `name`'s directory, the way `Skill.files` lists it."""
+    return path.removeprefix(f"{name}/") if path.startswith(f"{name}/") else f"../{path}"
+
+
+def _shown(value: str) -> str:
+    """A model-supplied value for an error message, cut so a huge argument is not echoed back."""
+    return repr(value) if len(value) <= _ECHO else f"{value[:_ECHO]!r}... ({len(value)} chars)"
 
 
 def read(path: str, root: Path | None = None) -> str:
     """The text of a bundle path returned by `resolve`."""
     bundle = load_skills(root)
     if path not in bundle.paths:  # never read anything `resolve` would not return
-        raise SkillError(f"Not a skill file: {path!r}")
+        raise SkillError(f"Not a skill file: {_shown(path)}")
     return (bundle.root / path).read_text(encoding="utf-8")
