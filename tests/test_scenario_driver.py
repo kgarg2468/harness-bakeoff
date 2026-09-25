@@ -846,3 +846,16 @@ async def test_cancel_command_reaches_a_worker_turn(
     assert err == b""
     summary = json.loads(out)
     assert (summary["stop"], summary["pid"]) == ("cancelled", worker.pid)
+
+
+async def test_two_matrices_with_one_run_id_cannot_both_start(tmp_path):
+    """Greptile #4104014805: the run directory is reserved atomically, so of two matrices
+    started at once on the same run id exactly one runs; the other is refused."""
+    from bakeoff.shared.scenario import DriverError, run_matrix
+
+    first = run_matrix(["S01"], ["our"], out=tmp_path, run_id="race")
+    second = run_matrix(["S01"], ["our"], out=tmp_path, run_id="race")
+    outcomes = await asyncio.gather(first, second, return_exceptions=True)
+    assert sum(isinstance(o, DriverError) for o in outcomes) == 1
+    assert any(isinstance(o, dict) for o in outcomes)
+    assert (tmp_path / "runs" / "race" / "S01" / "our" / "result.json").is_file()

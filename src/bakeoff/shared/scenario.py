@@ -946,8 +946,15 @@ async def run_matrix(
     summary covers the runs so far, and its `stopped` says which run leaked what. The caller
     must not wait for those tasks either (see `cli._scenario`)."""
     run_id = run_id or new_run_id()
-    if (out / "runs" / run_id).exists():  # its summary.json and cells would be replaced
-        raise DriverError(f"{out / 'runs' / run_id} already exists: pick another --run-id")
+    # Reserve the run directory atomically (mkdir fails if it exists), so two commands started
+    # at once with the same --run-id cannot both pass a check and overwrite one summary.json.
+    (out / "runs").mkdir(parents=True, exist_ok=True)
+    try:
+        (out / "runs" / run_id).mkdir()
+    except FileExistsError:
+        raise DriverError(
+            f"{out / 'runs' / run_id} already exists: pick another --run-id"
+        ) from None
     staging = out / "runs" / run_id / ".wire"  # fakeprov records here; each run moves its part
     runs = [(sid, impl) for sid in scenarios for impl in impls]
     results: list[dict[str, Any]] = []
