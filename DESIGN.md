@@ -35,7 +35,7 @@ src/bakeoff/
   our_version/         loop B   (counted)
   pydantic_version/    loop A   (counted)
   hybrid_version/      loop A'  (our loop + pydantic_ai.direct model layer; counted; phase 3)
-  fakeprov/            scripted OpenAI/OpenRouter-compatible SSE server + scenario scripts
+  fakeprov/            scripted OpenAI/OpenRouter-compatible SSE server (chat + Responses API) + scenarios
   metrics/             loc, deps, bench -> out/metrics.json
   report/              builds out/report.html (side-by-side replay, wire diff, scorecard)
   loops.py             registry of the loops (lazy imports; each loop's documented failures)
@@ -188,6 +188,20 @@ repeats `finish_reason`, carries `cost`, `prompt_tokens_details.cached_tokens`,
 Strict modes emulate real providers: `reject_params: [...]` returns 400 if the body contains any
 listed top-level key. `reject_unsigned_reasoning` returns 400 if any assistant message
 replays a `reasoning.text` detail without a signature, as Anthropic does.
+
+A scenario with model kind `openai_responses` speaks OpenAI's Responses API instead, on
+`<base_url>/responses` only (the other endpoint gets 404): named SSE events
+(`response.created`, `response.output_item.added`/`.done`, `response.output_text.delta`,
+`response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`,
+`response.completed` with `usage`, the `error` event, ...), no `[DONE]`. Its primitives are
+reasoning items (`encrypted_content`, optional summary deltas; the added item's
+`encrypted_content` is incomplete, as the API documents), messages (with `phase`), function
+calls, `completed` (usage), `error` and `failed` mid-stream, `stall`, and items cut short
+before their done events. Its strict mode `reject_unencrypted_reasoning` answers as the API
+does with `store: false`: a replayed reasoning item without its `encrypted_content` is 404,
+one whose `encrypted_content` is not what its done event sent is 400. Its `expect` checks read
+`input` (e.g. `input_len`, `last_type`, `tool_result_contains` by `call_id`,
+`reasoning_replayed`: the item exactly as sent). Details: `fakeprov/README.md`.
 
 ## Scenarios
 

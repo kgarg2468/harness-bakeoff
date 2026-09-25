@@ -1,4 +1,5 @@
-"""Scripted OpenAI/OpenRouter-compatible streaming server on 127.0.0.1.
+"""Scripted OpenAI/OpenRouter-compatible streaming server on 127.0.0.1 (chat completions and
+OpenAI's Responses API).
 
 `FakeProvider` serves every scenario in `scenarios_dir` on one port. The URL picks the script
 and the cursor: `http://127.0.0.1:<port>/s/<scenario>/<run>/<impl>/v1`. Each request body is
@@ -24,7 +25,9 @@ from typing import Any, Self
 
 from bakeoff.fakeprov.script import (
     CREATED,
+    ENDPOINTS,
     SCENARIOS_DIR,
+    Api,
     Op,
     Reply,
     Scenario,
@@ -39,8 +42,9 @@ from bakeoff.fakeprov.script import (
 _SEGMENT = r"[A-Za-z0-9_-][A-Za-z0-9_.-]*"  # never "." or "..": segments become directories
 _ROUTE = re.compile(
     rf"/s/(?P<scenario>{_SEGMENT})/(?P<run>{_SEGMENT})/(?P<impl>{_SEGMENT})/v1"
-    r"/(?P<endpoint>chat/completions|models)"
+    r"/(?P<endpoint>chat/completions|responses|models)"
 )
+_APIS: dict[str, Api] = {path: api for api, path in ENDPOINTS.items()}
 
 
 class FakeProvider:
@@ -147,8 +151,11 @@ class FakeProvider:
                 self._claimed.add(key)
         return wire
 
-    def _chat(self, key: tuple[str, str, str], raw: bytes, meta: dict[str, Any]) -> Reply:
-        """Answer one chat request from its cursor and record it as NNN.json + NNN.meta.json."""
+    def _chat(
+        self, key: tuple[str, str, str], raw: bytes, meta: dict[str, Any], api: Api = "chat"
+    ) -> Reply:
+        """Answer one model request (to the endpoint of `api`) from its cursor and record it as
+        NNN.json + NNN.meta.json."""
         t_us = (time.monotonic_ns() - self._t0_ns) // 1000
         with self._lock:
             index = self._cursors.get(key, 0)
@@ -156,7 +163,7 @@ class FakeProvider:
             prev_us, self._last_us[key] = self._last_us.get(key), t_us
         gap_ms = None if prev_us is None else (t_us - prev_us) / 1000
         try:
-            answer = reply(self._scenario(key[0]), index, raw, gap_ms)
+            answer = reply(self._scenario(key[0]), index, raw, gap_ms, api)
         except ScenarioError as exc:
             answer = rejected(500, str(exc))
         meta |= {"t_us": t_us, "status": answer.status}
@@ -225,11 +232,11 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         route = _ROUTE.fullmatch(self.path)
-        if route is None or route["endpoint"] != "chat/completions":
+        if route is None or route["endpoint"] not in _APIS:
             return self._send(rejected(404, f"no route for POST {self.path}"))
         key = (route["scenario"], route["run"], route["impl"])
         meta = {"conn_id": self.conn_id, "path": self.path}
-        self._send(self.server.provider._chat(key, raw, meta))
+        self._send(self.server.provider._chat(key, raw, meta, _APIS[route["endpoint"]]))
 
     def _send(self, answer: Reply) -> None:
         self.send_response(answer.status)

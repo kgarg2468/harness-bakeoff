@@ -3,18 +3,22 @@
 `load_scenario()` reads and validates a scenario file. `reply()` answers one request against
 a scenario's exchange: it enforces the strict modes and the exchange's `expect`, then turns
 the scripted `respond` into the SSE frames and control ops that the server plays back.
+A scenario speaks one API, chosen by its model kind: chat completions (OpenRouter or OpenAI
+style), or OpenAI's Responses API (`openai_responses`, section "Responses API" below).
 Everything here is deterministic: the same script and request always give the same bytes.
 The file format is documented in `fakeprov/README.md`.
 """
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
+import string
 from dataclasses import dataclass, field
 from http.client import responses
 from pathlib import Path
-from typing import Any, NoReturn, get_args
+from typing import Any, Literal, NoReturn, get_args
 
 from jsonschema import Draft202012Validator, ValidationError
 from jsonschema.exceptions import best_match
@@ -24,6 +28,9 @@ from bakeoff.shared.contract import LOOP_EVENTS, SHARED_EVENTS, StopReason
 SCENARIOS_DIR = Path(__file__).parent / "scenarios"
 CREATED = 1758758400  # the fixed `created` of every chunk
 PROVIDER = "FakeProvider"
+type Api = Literal["chat", "responses"]
+# The path under `<base_url>` that each API answers on.
+ENDPOINTS: dict[Api, str] = {"chat": "chat/completions", "responses": "responses"}
 
 
 class ScenarioError(ValueError):
@@ -44,8 +51,15 @@ class Scenario:
     driver: list[dict[str, Any]]
     exchanges: list[dict[str, Any]]
     expect: dict[str, Any]
-    style: str  # wire style of every exchange that does not set its own
+    # Wire style of every exchange that does not set its own: "openrouter" or "openai" (chat
+    # completions), or "responses" (the Responses API, the only style of its scenarios).
+    style: str
     strict: dict[str, Any]
+
+    @property
+    def api(self) -> Api:
+        """The API the scenario is scripted for, which decides the endpoint it answers on."""
+        return "responses" if self.style == "responses" else "chat"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +119,17 @@ def _op(kind: str, value: dict[str, Any], **options: dict[str, Any]) -> dict[str
     return _obj({kind: value, "delay_ms": _INT0, **options}, kind)
 
 
-_OPS = {
+_CALLS = {
+    "type": "array",
+    "minItems": 1,
+    "items": _obj(
+        {"id": _STR, "name": _STR, "arguments": {"type": ["string", "object"]}},
+        "id",
+        "name",
+        "arguments",
+    ),
+}
+_OPS = {  # chat completions
     "text": _op("text", _STR, chunks=_INT1),
     "reasoning": _op(
         "reasoning", _STR, chunks=_INT1, field={"enum": ["reasoning", "reasoning_content"]}
@@ -113,21 +137,7 @@ _OPS = {
     "reasoning_details": _op(
         "reasoning_details", {"type": "array", "items": {"type": "object", "required": ["type"]}}
     ),
-    "tool_calls": _op(
-        "tool_calls",
-        {
-            "type": "array",
-            "minItems": 1,
-            "items": _obj(
-                {"id": _STR, "name": _STR, "arguments": {"type": ["string", "object"]}},
-                "id",
-                "name",
-                "arguments",
-            ),
-        },
-        pieces=_INT1,
-        interleave=_BOOL,
-    ),
+    "tool_calls": _op("tool_calls", _CALLS, pieces=_INT1, interleave=_BOOL),
     "comment": _op("comment", _STR),
     "finish": _op("finish", {"enum": ["stop", "length", "tool_calls", "content_filter"]}),
     "usage": _op(
@@ -150,6 +160,44 @@ _OPS = {
     ),
     "stall": _op("stall", {"const": True}),
 }
+_ERROR = _obj({"code": _STR, "message": _STR}, "message")
+# `done: false` cuts the stream before the item is done: its done events are never sent.
+_RESPONSES_OPS = {
+    "text": _op(
+        "text", _STR, chunks=_INT1, phase={"enum": ["commentary", "final_answer"]}, done=_BOOL
+    ),
+    "reasoning_item": _op(
+        "reasoning_item",
+        _obj(
+            # minLength 2: the added event sends its first half, which must differ from it.
+            {"id": _STR, "encrypted_content": {"type": "string", "minLength": 2}, "summary": _STRS},
+            "id",
+            "encrypted_content",
+        ),
+        chunks=_INT1,
+        done=_BOOL,
+    ),
+    "tool_calls": _op("tool_calls", _CALLS, pieces=_INT1),
+    "completed": _op(
+        "completed",
+        _obj(
+            {
+                "input_tokens": _INT0,
+                "output_tokens": _INT0,
+                "cached_tokens": _INT0,
+                "cache_write_tokens": _INT0,
+                "reasoning_tokens": _INT0,
+            },
+            "input_tokens",
+            "output_tokens",
+        ),
+    ),
+    "error": _op("error", _ERROR),
+    "failed": _op("failed", _ERROR),
+    "stall": _op("stall", {"const": True}),
+}
+# The ops that end a Responses stream: every stream has exactly one, as its last op.
+_RESPONSES_ENDS = ("completed", "error", "failed", "stall")
 
 _STEPS = {
     "user": _obj({"user": _STR, "cancel_after_ms": _INT0}, "user"),
@@ -175,37 +223,73 @@ _REQUIRED = tuple("id title system model rules limits engine driver exchanges ex
 # Event types a `crash_after` step can narrow down to one tool call (see fakeprov/README.md).
 _CALL_EVENTS = ("tool_call.ready", "permission.asked", "tool.start", "tool.end", "item")
 _DECISION = {"enum": ["allow", "ask", "deny"]}
+_KINDS = {"enum": ["openrouter", "openai_compat", "openai_responses"]}
 _STYLE = {"enum": ["openrouter", "openai"]}
-_STRICT = _obj({"reject_params": _STRS, "reject_unsigned_reasoning": _BOOL})
-_EXCHANGE_EXPECT = _obj(
-    {
-        "body_has": _STRS,
-        "body_lacks": _STRS,
-        "model": _STR,
-        "last_role": {"enum": ["system", "developer", "user", "assistant", "tool"]},
-        "last_content_contains": _STR,
-        "messages_len": _INT1,
-        "tool_result_contains": {"type": "object", "additionalProperties": _STR},
-        # Checks on specific messages; `index` may be negative (from the end).
-        "messages_at": {
-            "type": "array",
-            "items": _obj({"index": {"type": "integer"}, "role": _STR, "contains": _STR}),
-        },
-        # The request must arrive at least this long after the cursor's previous request
-        # (e.g. a retry that honours `retry-after`).
-        "min_gap_ms": {"type": "number", "minimum": 0},
-        # {"dotted.path": value}: the body's value at that path equals it exactly.
-        "body_equals": {"type": "object"},
-    }
-)
-_RESPOND = _obj(
-    {
-        "status": {"type": "integer", "minimum": 200, "maximum": 599},
-        "headers": {"type": "object", "additionalProperties": _STR},
-        "body": {"type": "object"},
-        "stream": {"type": "array", "items": _kinds(_OPS)},
-    }
-)
+_STRICT = {
+    "chat": _obj({"reject_params": _STRS, "reject_unsigned_reasoning": _BOOL}),
+    "responses": _obj({"reject_params": _STRS, "reject_unencrypted_reasoning": _BOOL}),
+}
+# Exchange `expect` keys that read the body as it is, in both APIs.
+_BODY_EXPECT = {
+    "body_has": _STRS,
+    "body_lacks": _STRS,
+    "model": _STR,
+    # {"dotted.path": value}: the body's value at that path equals it exactly. A path segment
+    # that is an integer indexes a list (negative from the end), e.g. "tools.0.name".
+    "body_equals": {"type": "object"},
+    # {"dotted.path": value}: the body's value at that path is a list that contains it.
+    "body_contains": {"type": "object"},
+    # The request must arrive at least this long after the cursor's previous request
+    # (e.g. a retry that honours `retry-after`).
+    "min_gap_ms": {"type": "number", "minimum": 0},
+}
+_EXCHANGE_EXPECT = {
+    "chat": _obj(
+        {
+            **_BODY_EXPECT,
+            "last_role": {"enum": ["system", "developer", "user", "assistant", "tool"]},
+            "last_content_contains": _STR,
+            "messages_len": _INT1,
+            "tool_result_contains": {"type": "object", "additionalProperties": _STR},
+            # Checks on specific messages; `index` may be negative (from the end).
+            "messages_at": {
+                "type": "array",
+                "items": _obj({"index": {"type": "integer"}, "role": _STR, "contains": _STR}),
+            },
+        }
+    ),
+    # The input checks skip the system prompt (`instructions`, or leading system/developer
+    # messages in `input`), so they hold wherever a loop puts it; `system_contains` checks it.
+    "responses": _obj(
+        {
+            **_BODY_EXPECT,
+            "input_len": _INT1,
+            "last_type": {
+                "enum": ["message", "function_call", "function_call_output", "reasoning"]
+            },
+            "last_role": {"enum": ["user", "assistant"]},
+            "last_content_contains": _STR,
+            "input_at": {
+                "type": "array",
+                "items": _obj(
+                    {
+                        "index": {"type": "integer"},
+                        "type": _STR,
+                        "role": _STR,
+                        "contains": _STR,
+                        "phase": _STR,
+                    },
+                    "index",
+                ),
+            },
+            # {call_id: substring}: a function_call_output for that call contains it.
+            "tool_result_contains": {"type": "object", "additionalProperties": _STR},
+            # Reasoning ids whose done item must be in `input` exactly as it was sent.
+            "reasoning_replayed": {"type": "array", "items": _STR, "minItems": 1},
+            "system_contains": _STR,
+        }
+    ),
+}
 _FINAL_EXPECT = _obj(
     {
         "stops": {"type": "array", "items": {"enum": list(get_args(StopReason))}},
@@ -224,51 +308,67 @@ _FINAL_EXPECT = _obj(
     },
     "stops",
 )
-_SCHEMA = _obj(
-    {
-        "id": _STR,
-        "title": _STR,
-        "system": _STR,
-        "model": _obj(
-            {
-                "kind": {"enum": ["openrouter", "openai_compat"]},
-                "model": _STR,
-                "reasoning": {"type": ["object", "null"]},
-                "compat": {"type": "object"},
-            },
-            "kind",
-            "model",
-        ),
-        "rules": {
-            "type": "object",
-            "additionalProperties": {
-                "anyOf": [_DECISION, {"type": "object", "additionalProperties": _DECISION}]
-            },
+
+
+def _schema(api: Api) -> dict[str, Any]:
+    """The scenario file schema for one API. Only chat scenarios have wire styles."""
+    ops = _OPS if api == "chat" else _RESPONSES_OPS
+    styles = {"style": _STYLE} if api == "chat" else {}
+    respond = _obj(
+        {
+            "status": {"type": "integer", "minimum": 200, "maximum": 599},
+            "headers": {"type": "object", "additionalProperties": _STR},
+            "body": {"type": "object"},
+            "stream": {"type": "array", "items": _kinds(ops)},
+        }
+    )
+    exchange = {
+        "note": _STR,
+        **styles,
+        "strict": _STRICT[api],
+        "expect": _EXCHANGE_EXPECT[api],
+        "respond": respond,
+    }
+    model = {
+        "kind": _KINDS,
+        "model": _STR,
+        "reasoning": {"type": ["object", "null"]},
+        # null: send no temperature (reasoning models reject one); absent: ModelConfig's default
+        "temperature": {"type": ["number", "null"]},
+        "compat": {"type": "object"},
+    }
+    rules = {
+        "type": "object",
+        "additionalProperties": {
+            "anyOf": [_DECISION, {"type": "object", "additionalProperties": _DECISION}]
         },
-        "limits": _obj({"max_steps": _INT1}, "max_steps"),
-        "engine": _obj({"delay_ms": _INT0}, "delay_ms"),
-        "style": _STYLE,
-        "strict": _STRICT,
-        "driver": {"type": "array", "minItems": 1, "items": _kinds(_STEPS)},
-        "exchanges": {
-            "type": "array",
-            "minItems": 1,
-            "items": _obj(
-                {
-                    "note": _STR,
-                    "style": _STYLE,
-                    "strict": _STRICT,
-                    "expect": _EXCHANGE_EXPECT,
-                    "respond": _RESPOND,
-                },
-                "respond",
-            ),
+    }
+    return _obj(
+        {
+            "id": _STR,
+            "title": _STR,
+            "system": _STR,
+            "model": _obj(model, "kind", "model"),
+            "rules": rules,
+            "limits": _obj({"max_steps": _INT1}, "max_steps"),
+            "engine": _obj({"delay_ms": _INT0}, "delay_ms"),
+            **styles,
+            "strict": _STRICT[api],
+            "driver": {"type": "array", "minItems": 1, "items": _kinds(_STEPS)},
+            "exchanges": {
+                "type": "array",
+                "minItems": 1,
+                "items": _obj(exchange, "respond"),
+            },
+            "expect": _FINAL_EXPECT,
         },
-        "expect": _FINAL_EXPECT,
-    },
-    *_REQUIRED,
-)
-_VALIDATOR = Draft202012Validator(_SCHEMA)
+        *_REQUIRED,
+    )
+
+
+_VALIDATORS: dict[Api, Draft202012Validator] = {
+    api: Draft202012Validator(_schema(api)) for api in ("chat", "responses")
+}
 
 
 # --- loading --------------------------------------------------------------------------------
@@ -280,15 +380,18 @@ def load_scenario(path: Path) -> Scenario:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ScenarioError(f"{path.name}: {exc}") from exc
-    if (error := best_match(_VALIDATOR.iter_errors(data))) is not None:
+    model = data.get("model") if isinstance(data, dict) else None
+    kind = model.get("kind") if isinstance(model, dict) else None
+    api: Api = "responses" if kind == "openai_responses" else "chat"
+    if (error := best_match(_VALIDATORS[api].iter_errors(data))) is not None:
         raise ScenarioError(f"{path.name}: {_describe(error)}")
     if data["id"] != path.stem:
         raise ScenarioError(f"{path.name}: $.id: {data['id']!r} must match the file name")
-    _check_semantics(path.name, data)
-    byok = data["model"]["kind"] == "openai_compat"
+    _check_semantics(path.name, data, api)
+    default_style = {"openai_compat": "openai", "openai_responses": "responses"}.get(kind)
     return Scenario(
         **{key: data[key] for key in _REQUIRED},
-        style=data.get("style", "openai" if byok else "openrouter"),
+        style=data.get("style", default_style or "openrouter"),
         strict=data.get("strict", {}),
     )
 
@@ -302,29 +405,47 @@ def _describe(error: ValidationError) -> str:
     return f"{error.json_path}: {error.message}"
 
 
-def _check_semantics(name: str, data: dict[str, Any]) -> None:
+def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
     """Rules the JSON schema cannot express."""
 
     def fail(where: str, message: str) -> NoReturn:
         raise ScenarioError(f"{name}: {where}: {message}")
 
     call_ids: list[str] = []
+    reasoning_ids: list[str] = []
     for n, exchange in enumerate(data["exchanges"]):
         respond = exchange["respond"]
+        where = f"$.exchanges[{n}].respond"
         if (respond.get("status", 200) == 200) != ("stream" in respond):
-            fail(f"$.exchanges[{n}].respond", "status 200 needs a stream; other statuses take none")
+            fail(where, "status 200 needs a stream; other statuses take none")
         ops = respond.get("stream", [])
-        for i, op in enumerate(ops[:-1]):
-            if "sse_error" in op or "stall" in op:
-                fail(f"$.exchanges[{n}].respond.stream[{i}]", "sse_error and stall must be last")
+        if api == "chat":
+            for i, op in enumerate(ops[:-1]):
+                if "sse_error" in op or "stall" in op:
+                    fail(f"{where}.stream[{i}]", "sse_error and stall must be last")
+        elif "stream" in respond:
+            ends = [i for i, op in enumerate(ops) if any(k in op for k in _RESPONSES_ENDS)]
+            if ends != [len(ops) - 1]:
+                fail(f"{where}.stream", f"must end with one of {', '.join(_RESPONSES_ENDS)}")
+            for i, op in enumerate(ops[:-1]):
+                # An item cut short is the last one of a stream that fails or stalls.
+                if op.get("done") is False and (i != len(ops) - 2 or "completed" in ops[-1]):
+                    fail(f"{where}.stream[{i}]", "done: false must come right before the error,"
+                         " failed or stall that ends the stream")  # fmt: skip
+            reasoning_ids += [op["reasoning_item"]["id"] for op in ops if "reasoning_item" in op]
         call_ids += [call["id"] for op in ops for call in op.get("tool_calls", [])]
-    if duplicates := sorted({c for c in call_ids if call_ids.count(c) > 1}):
-        fail("$.exchanges", f"tool call ids must be unique: {duplicates}")
+    for what, ids in (("tool call", call_ids), ("reasoning", reasoning_ids)):
+        if duplicates := sorted({c for c in ids if ids.count(c) > 1}):
+            fail("$.exchanges", f"{what} ids must be unique: {duplicates}")
 
     referenced = set(data["expect"].get("tool_runs", {}))
     referenced |= set(data["expect"].get("tools_overlap", []))
+    replayed: set[str] = set()
     for exchange in data["exchanges"]:
         referenced |= set(exchange.get("expect", {}).get("tool_result_contains", {}))
+        replayed |= set(exchange.get("expect", {}).get("reasoning_replayed", []))
+    if unknown := sorted(replayed - set(reasoning_ids)):
+        fail("$.exchanges", f"unknown reasoning ids: {unknown}")
     steps = data["driver"]
     turns = 0  # steps that run a turn to its end in this process
     for i, step in enumerate(steps):
@@ -352,36 +473,50 @@ def _check_semantics(name: str, data: dict[str, Any]) -> None:
 # --- answering ------------------------------------------------------------------------------
 
 
-def rejected(status: int, message: str, param: str | None = None) -> Reply:
+def rejected(status: int, message: str, param: str | None = None, code: str | None = None) -> Reply:
     """A request the fake server refuses itself (bad request, strict mode, failed expect)."""
     kind = "invalid_request_error" if status < 500 else "fake_provider_error"
-    body = {"error": {"message": message, "type": kind, "param": param, "code": None}}
+    body = {"error": {"message": message, "type": kind, "param": param, "code": code}}
     # The OpenAI SDK honours this header, so a harness failure is not retried into the script.
     return Reply(status, body, headers={"x-should-retry": "false"}, error=message)
 
 
-def reply(scenario: Scenario, index: int, raw: bytes, gap_ms: float | None = None) -> Reply:
-    """Answer request number `index` (0-based) of one (scenario, run, impl) cursor.
+def reply(
+    scenario: Scenario, index: int, raw: bytes, gap_ms: float | None = None, api: Api = "chat"
+) -> Reply:
+    """Answer request number `index` (0-based) of one (scenario, run, impl) cursor, which was
+    sent to the endpoint of `api`.
 
     `gap_ms` is the time since the cursor's previous request (None for the first one)."""
+    if api != scenario.api:
+        return rejected(
+            404,
+            f"scenario {scenario.id} is scripted for POST <base_url>/{ENDPOINTS[scenario.api]},"
+            f" not /{ENDPOINTS[api]}",
+        )
     try:
         body = json.loads(raw)
     except ValueError as exc:
         return rejected(400, f"request body is not JSON: {exc}")
-    messages = body.get("messages") if isinstance(body, dict) else None
-    if not messages or not isinstance(messages, list):
-        return rejected(400, "request body needs a non-empty `messages` list")
-    if not all(isinstance(m, dict) for m in messages):
-        return rejected(400, "every message must be an object")
+    if problem := (_chat_body_problem if api == "chat" else _responses_body_problem)(body):
+        return rejected(400, problem)
     if body.get("stream") is not True:
         return rejected(400, "the fake provider only serves stream=true")
     if index >= len(scenario.exchanges):
         return rejected(500, "script exhausted")
     exchange = scenario.exchanges[index]
     strict = scenario.strict | exchange.get("strict", {})
-    if problem := _strict_violation(strict, body):
-        return rejected(400, *problem)
-    if failures := _expect_failures(exchange.get("expect", {}), body, gap_ms):
+    expect = exchange.get("expect", {})
+    if api == "chat":
+        if problem := _strict_violation(strict, body):
+            return rejected(400, *problem)
+        failures = _expect_failures(expect, body, gap_ms)
+    else:
+        if refused := _responses_strict(strict, body, scenario):
+            return refused
+        failures = _body_failures(expect, body, gap_ms)
+        failures += _input_failures(expect, body, scenario)
+    if failures:
         return rejected(500, f"expect failed (exchange {index + 1}): " + "; ".join(failures))
 
     style = exchange.get("style", scenario.style)
@@ -390,15 +525,34 @@ def reply(scenario: Scenario, index: int, raw: bytes, gap_ms: float | None = Non
     if status != 200:
         body = respond.get("body") or _error_body(status, style)
         return Reply(status, body, headers=respond.get("headers", {}))
-    prefix = "gen" if style == "openrouter" else "chatcmpl"
     options = body.get("stream_options")
-    stream = _Stream(
-        chunk_id=f"{prefix}-{scenario.id}-{index + 1:03d}",
-        model=scenario.model["model"],
-        style=style,
-        include_usage=isinstance(options, dict) and options.get("include_usage") is True,
-    )
+    options = options if isinstance(options, dict) else {}
+    stream: _Stream | _ResponsesStream
+    if api == "responses":
+        stream = _ResponsesStream(
+            response_id=f"resp_{scenario.id}_{index + 1:03d}",
+            model=scenario.model["model"],
+            effort=(scenario.model.get("reasoning") or {}).get("effort"),
+            obfuscate=options.get("include_obfuscation") is not False,
+        )
+    else:
+        prefix = "gen" if style == "openrouter" else "chatcmpl"
+        stream = _Stream(
+            chunk_id=f"{prefix}-{scenario.id}-{index + 1:03d}",
+            model=scenario.model["model"],
+            style=style,
+            include_usage=options.get("include_usage") is True,
+        )
     return Reply(200, headers=respond.get("headers", {}), stream=stream.render(respond["stream"]))
+
+
+def _chat_body_problem(body: object) -> str | None:
+    messages = body.get("messages") if isinstance(body, dict) else None
+    if not messages or not isinstance(messages, list):
+        return "request body needs a non-empty `messages` list"
+    if not all(isinstance(m, dict) for m in messages):
+        return "every message must be an object"
+    return None
 
 
 def _strict_violation(strict: dict[str, Any], body: dict[str, Any]) -> tuple[str, str] | None:
@@ -428,15 +582,52 @@ def _unsigned_reasoning(details: object) -> list[str]:
 _MISSING = object()
 
 
+def _body_failures(
+    expect: dict[str, Any], body: dict[str, Any], gap_ms: float | None = None
+) -> list[str]:
+    """The `expect` checks that read the body as it is (both APIs)."""
+    failures = [f"body lacks {key!r}" for key in expect.get("body_has", []) if key not in body]
+    failures += [f"body has {key!r}" for key in expect.get("body_lacks", []) if key in body]
+    if "model" in expect and body.get("model") != expect["model"]:
+        failures.append(f"model is {body.get('model')!r}, expected {expect['model']!r}")
+    for path, want in expect.get("body_equals", {}).items():
+        got = _at(body, path)
+        if got is _MISSING:
+            failures.append(f"body lacks {path!r}")
+        elif got != want:
+            failures.append(f"body {path} is {got!r}, expected {want!r}")
+    for path, want in expect.get("body_contains", {}).items():
+        got = _at(body, path)
+        if not isinstance(got, list) or want not in got:
+            shown = "nothing" if got is _MISSING else repr(got)
+            failures.append(f"body {path} is {shown}, expected a list containing {want!r}")
+    if "min_gap_ms" in expect and (gap_ms is None or gap_ms < expect["min_gap_ms"]):
+        got = "no previous request" if gap_ms is None else f"{gap_ms:.0f} ms"
+        failures.append(f"arrived after {got}, expected at least {expect['min_gap_ms']} ms")
+    return failures
+
+
+def _at(body: Any, path: str) -> Any:
+    """The value at a dotted path; an integer segment indexes a list. _MISSING if absent."""
+    got = body
+    for key in path.split("."):
+        if isinstance(got, dict):
+            got = got.get(key, _MISSING)
+        elif (
+            isinstance(got, list) and key.lstrip("-").isdigit() and -len(got) <= int(key) < len(got)
+        ):
+            got = got[int(key)]
+        else:
+            return _MISSING
+    return got
+
+
 def _expect_failures(
     expect: dict[str, Any], body: dict[str, Any], gap_ms: float | None = None
 ) -> list[str]:
     messages: list[dict[str, Any]] = body["messages"]
     last = messages[-1]
-    failures = [f"body lacks {key!r}" for key in expect.get("body_has", []) if key not in body]
-    failures += [f"body has {key!r}" for key in expect.get("body_lacks", []) if key in body]
-    if "model" in expect and body.get("model") != expect["model"]:
-        failures.append(f"model is {body.get('model')!r}, expected {expect['model']!r}")
+    failures = _body_failures(expect, body, gap_ms)
     if "messages_len" in expect and len(messages) != expect["messages_len"]:
         failures.append(f"{len(messages)} messages, expected {expect['messages_len']}")
     if "last_role" in expect and last.get("role") != expect["last_role"]:
@@ -467,17 +658,6 @@ def _expect_failures(
             )
         if "contains" in check and check["contains"] not in _text(message.get("content")):
             failures.append(f"message {i} lacks {check['contains']!r}")
-    for path, want in expect.get("body_equals", {}).items():
-        got: Any = body
-        for key in path.split("."):
-            got = got.get(key, _MISSING) if isinstance(got, dict) else _MISSING
-        if got is _MISSING:
-            failures.append(f"body lacks {path!r}")
-        elif got != want:
-            failures.append(f"body {path} is {got!r}, expected {want!r}")
-    if "min_gap_ms" in expect and (gap_ms is None or gap_ms < expect["min_gap_ms"]):
-        got = "no previous request" if gap_ms is None else f"{gap_ms:.0f} ms"
-        failures.append(f"arrived after {got}, expected at least {expect['min_gap_ms']} ms")
     return failures
 
 
@@ -617,3 +797,405 @@ class _Stream:
         chunk = {**chunk, "choices": choices, **extra}
         data = json.dumps(chunk, ensure_ascii=False, separators=(",", ":"))
         return b"data: " + data.encode() + b"\n\n"
+
+
+# --- Responses API ----------------------------------------------------------------------------
+#
+# Scenarios with model kind "openai_responses" answer on `POST <base_url>/responses`, as OpenAI's
+# Responses API does (API reference, "Streaming events"): named SSE events (`event: <type>` and
+# `data: {"type": <type>, "sequence_number": n, ...}`), no `data: [DONE]`. The response object in
+# `response.created` / `.completed` / `.failed` does not echo the request, so every loop gets the
+# same bytes. Item ids are fixed: reasoning ids come from the script, function calls are
+# `fc_<call id without "call_">`, messages `msg_<scenario>_<NNN>_<output index>`.
+
+_OBFUSCATION = string.ascii_letters + string.digits
+_SYSTEM_ROLES = ("system", "developer")
+_STORE_FALSE = (
+    "Items are not persisted when `store` is set to false. Try again with `store` set to true,"
+    " or remove this item from your input."
+)
+
+
+def _responses_body_problem(body: object) -> str | None:
+    items = body.get("input") if isinstance(body, dict) else None
+    if isinstance(items, str) and items:
+        return None
+    if not items or not isinstance(items, list):
+        return "request body needs `input`: a non-empty string or list of items"
+    if not all(isinstance(item, dict) for item in items):
+        return "every input item must be an object"
+    return None
+
+
+def _input_items(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """The request's `input` as items (a string is one user message, as the API reads it)."""
+    items = body["input"]
+    return [{"role": "user", "content": items}] if isinstance(items, str) else items
+
+
+def _item_type(item: dict[str, Any]) -> str | None:
+    """An input item's type; a message may leave it out (`{"role": ..., "content": ...}`)."""
+    return item.get("type") or ("message" if "role" in item else None)
+
+
+def _item_text(item: dict[str, Any]) -> str:
+    """The text an input item carries, for `contains` checks."""
+    match _item_type(item):
+        case "message":
+            return _text(item.get("content"))
+        case "function_call_output":
+            return _text(item.get("output"))
+        case "function_call":
+            return str(item.get("arguments", ""))
+        case "reasoning":
+            parts = item.get("summary")
+            return _text(parts if isinstance(parts, list) else None)
+    return ""
+
+
+def _split_system(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """(the system prompt, the other input items). The system prompt is `instructions` plus any
+    system/developer messages that `input` starts with: loops may put it in either place."""
+    items = _input_items(body)
+    n = next(
+        (i for i, item in enumerate(items) if item.get("role") not in _SYSTEM_ROLES), len(items)
+    )
+    system = [_text(body.get("instructions"))] + [_text(i.get("content")) for i in items[:n]]
+    return "\n".join(t for t in system if t), items[n:]
+
+
+def _done_reasoning(spec: dict[str, Any]) -> dict[str, Any]:
+    """The done reasoning item of a scripted `reasoning_item`: what `response.output_item.done`
+    sends, and exactly what a request must replay (`reasoning_replayed`)."""
+    summary = [{"type": "summary_text", "text": text} for text in spec.get("summary", [])]
+    return {
+        "id": spec["id"],
+        "type": "reasoning",
+        "summary": summary,
+        "encrypted_content": spec["encrypted_content"],
+    }
+
+
+def _scripted_reasoning(scenario: Scenario) -> dict[str, dict[str, Any]]:
+    """Reasoning id -> the op of every scripted reasoning item, done or cut short."""
+    return {
+        op["reasoning_item"]["id"]: op
+        for exchange in scenario.exchanges
+        for op in exchange["respond"].get("stream", [])
+        if "reasoning_item" in op
+    }
+
+
+def _responses_strict(
+    strict: dict[str, Any], body: dict[str, Any], scenario: Scenario
+) -> Reply | None:
+    for key in strict.get("reject_params", []):
+        if key in body:
+            return rejected(400, f"Unsupported parameter: '{key}'.", key, "unsupported_parameter")
+    if not strict.get("reject_unencrypted_reasoning"):
+        return None
+    # As the API does with `store: false`: a reasoning item is known only by its encrypted
+    # content, which must be the complete one a done event sent for that id.
+    scripted = _scripted_reasoning(scenario)
+    for item in _input_items(body):
+        if _item_type(item) != "reasoning":
+            continue
+        item_id, encrypted = item.get("id"), item.get("encrypted_content")
+        if not encrypted:
+            return rejected(404, f"Item with id '{item_id}' not found. {_STORE_FALSE}", "input")
+        op = scripted.get(str(item_id))
+        if (
+            op is None
+            or op.get("done") is False
+            or op["reasoning_item"]["encrypted_content"] != encrypted
+        ):
+            message = f"The encrypted content for item {item_id} could not be verified."
+            return rejected(400, message, None, "invalid_encrypted_content")
+    return None
+
+
+def _input_failures(expect: dict[str, Any], body: dict[str, Any], scenario: Scenario) -> list[str]:
+    """The Responses `expect` checks on `input` (after the system prompt) and the system prompt."""
+    system, items = _split_system(body)
+    failures = []
+    if "system_contains" in expect and expect["system_contains"] not in system:
+        failures.append(f"system prompt lacks {expect['system_contains']!r}: {system[:200]!r}")
+    if "input_len" in expect and len(items) != expect["input_len"]:
+        failures.append(f"{len(items)} input items, expected {expect['input_len']}")
+    last = items[-1] if items else {}
+    if "last_type" in expect and _item_type(last) != expect["last_type"]:
+        failures.append(f"last item is {_item_type(last)!r}, expected {expect['last_type']!r}")
+    if "last_role" in expect and last.get("role") != expect["last_role"]:
+        failures.append(f"last role is {last.get('role')!r}, expected {expect['last_role']!r}")
+    if "last_content_contains" in expect:
+        needle, text = expect["last_content_contains"], _item_text(last)
+        if needle not in text:
+            failures.append(f"last item lacks {needle!r}: {text[:200]!r}")
+    for call_id, needle in expect.get("tool_result_contains", {}).items():
+        outputs = [
+            _item_text(item)
+            for item in items
+            if _item_type(item) == "function_call_output" and item.get("call_id") == call_id
+        ]
+        if not outputs:
+            failures.append(f"no function_call_output for {call_id}")
+        elif not any(needle in output for output in outputs):
+            failures.append(
+                f"function_call_output {call_id} lacks {needle!r}: {outputs[0][:200]!r}"
+            )
+    for check in expect.get("input_at", []):
+        i = check["index"]
+        if not -len(items) <= i < len(items):
+            failures.append(f"no input item at index {i}")
+            continue
+        item = items[i]
+        got = {"type": _item_type(item), "role": item.get("role"), "phase": item.get("phase")}
+        for key in ("type", "role", "phase"):
+            if key in check and got[key] != check[key]:
+                failures.append(f"input item {i} {key} is {got[key]!r}, expected {check[key]!r}")
+        if "contains" in check and check["contains"] not in _item_text(item):
+            failures.append(f"input item {i} lacks {check['contains']!r}")
+    scripted = _scripted_reasoning(scenario)
+    for rid in expect.get("reasoning_replayed", []):
+        sent = _done_reasoning(scripted[rid]["reasoning_item"])
+        found = [
+            item for item in items if _item_type(item) == "reasoning" and item.get("id") == rid
+        ]
+        if len(found) != 1:
+            failures.append(f"reasoning {rid} is replayed {len(found)} times, expected once")
+        elif found[0] != sent:
+            failures.append(f"reasoning {rid} is not replayed as sent ({_diff(sent, found[0])})")
+    return failures
+
+
+def _diff(want: dict[str, Any], got: dict[str, Any]) -> str:
+    """Which keys of a replayed item differ from what was sent."""
+    parts = [f"lacks {k!r}" for k in want if k not in got]
+    parts += [f"adds {k!r}" for k in got if k not in want]
+    parts += [f"changes {k!r}" for k in want if k in got and got[k] != want[k]]
+    return ", ".join(parts)
+
+
+def _responses_usage(spec: dict[str, Any]) -> dict[str, Any]:
+    tokens_in, tokens_out = spec["input_tokens"], spec["output_tokens"]
+    return {
+        "input_tokens": tokens_in,
+        "input_tokens_details": {
+            "cached_tokens": spec.get("cached_tokens", 0),
+            "cache_write_tokens": spec.get("cache_write_tokens", 0),
+        },
+        "output_tokens": tokens_out,
+        "output_tokens_details": {"reasoning_tokens": spec.get("reasoning_tokens", 0)},
+        "total_tokens": tokens_in + tokens_out,
+    }
+
+
+class _ResponsesStream:
+    """Renders one scripted response as the Responses API's named SSE events."""
+
+    def __init__(
+        self, *, response_id: str, model: str, effort: str | None, obfuscate: bool
+    ) -> None:
+        self.response_id = response_id
+        self.model = model
+        self.effort = effort
+        # Delta events carry an `obfuscation` pad by default (`stream_options.include_obfuscation`).
+        self.obfuscate = obfuscate
+        self.seq = 0  # sequence_number of the next event
+        self.started = 0  # output items started (the next output_index)
+        self.output: list[dict[str, Any]] = []  # done items, for response.completed / .failed
+
+    def render(self, ops: list[dict[str, Any]]) -> list[Op]:
+        created = self._response("in_progress")
+        out: list[Op] = [
+            self._event("response.created", response=created),
+            self._event("response.in_progress", response=created),
+        ]
+        for op in ops:
+            delay = op.get("delay_ms", 0) / 1000
+            for frame in self._op(op):
+                if delay:
+                    out.append(Sleep(delay))
+                out.append(frame)
+        return out  # the stream ends after its last event: no [DONE] in this API
+
+    def _op(self, op: dict[str, Any]) -> list[Op]:
+        if "text" in op:
+            return self._message(op)
+        if "reasoning_item" in op:
+            return self._reasoning(op)
+        if "tool_calls" in op:
+            return [f for call in op["tool_calls"] for f in self._call(call, op.get("pieces", 1))]
+        if "completed" in op:
+            usage = _responses_usage(op["completed"])
+            return [self._event("response.completed", response=self._response("completed", usage))]
+        if "error" in op:
+            error = {"code": "server_error", **op["error"]}
+            return [self._event("error", code=error["code"], message=error["message"], param=None)]
+        if "failed" in op:
+            error = {"code": "server_error", **op["failed"]}
+            failed = self._response("failed", error=error)
+            return [self._event("response.failed", response=failed)]
+        return [Stall()]  # the only kind left
+
+    def _message(self, op: dict[str, Any]) -> list[Op]:
+        index = self._start()
+        item_id = f"msg_{self.response_id.removeprefix('resp_')}_{index}"
+        item: dict[str, Any] = {
+            "id": item_id,
+            "type": "message",
+            "status": "in_progress",
+            "content": [],
+            "role": "assistant",
+        }
+        if "phase" in op:
+            item["phase"] = op["phase"]
+        at = {"item_id": item_id, "output_index": index, "content_index": 0}
+        empty = {"type": "output_text", "annotations": [], "logprobs": [], "text": ""}
+        frames: list[Op] = [
+            self._event("response.output_item.added", output_index=index, item=item),
+            self._event("response.content_part.added", **at, part=empty),
+        ]
+        for piece in _split(op["text"], op.get("chunks", 1)):
+            frames.append(
+                self._event("response.output_text.delta", **at, delta=piece, logprobs=[], pad=True)
+            )
+        if op.get("done") is False:
+            return frames
+        part = {**empty, "text": op["text"]}
+        done = {**item, "status": "completed", "content": [part]}
+        self.output.append(done)
+        return [
+            *frames,
+            self._event("response.output_text.done", **at, text=op["text"], logprobs=[]),
+            self._event("response.content_part.done", **at, part=part),
+            self._event("response.output_item.done", output_index=index, item=done),
+        ]
+
+    def _reasoning(self, op: dict[str, Any]) -> list[Op]:
+        spec = op["reasoning_item"]
+        index = self._start()
+        at = {"item_id": spec["id"], "output_index": index}
+        encrypted = spec["encrypted_content"]
+        # The API documents that the added item's encrypted_content may be incomplete: only the
+        # done item may be replayed. Half of it makes a replay of the added item fail to verify.
+        added = {
+            "id": spec["id"],
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": encrypted[: len(encrypted) // 2],
+        }
+        frames: list[Op] = [
+            self._event("response.output_item.added", output_index=index, item=added)
+        ]
+        summary = spec.get("summary", [])
+        for n, text in enumerate(summary):
+            part_at = {**at, "summary_index": n}
+            frames.append(
+                self._event(
+                    "response.reasoning_summary_part.added",
+                    **part_at,
+                    part={"type": "summary_text", "text": ""},
+                )
+            )
+            for piece in _split(text, op.get("chunks", 1)):
+                frames.append(
+                    self._event(
+                        "response.reasoning_summary_text.delta", **part_at, delta=piece, pad=True
+                    )
+                )
+            if op.get("done") is False and n == len(summary) - 1:
+                return frames  # cut inside the last summary part
+            frames += [
+                self._event("response.reasoning_summary_text.done", **part_at, text=text),
+                self._event(
+                    "response.reasoning_summary_part.done",
+                    **part_at,
+                    part={"type": "summary_text", "text": text},
+                ),
+            ]
+        if op.get("done") is False:
+            return frames
+        done = _done_reasoning(spec)
+        self.output.append(done)
+        return [*frames, self._event("response.output_item.done", output_index=index, item=done)]
+
+    def _call(self, call: dict[str, Any], pieces: int) -> list[Op]:
+        index = self._start()
+        args = call["arguments"]
+        args = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+        item_id = "fc_" + call["id"].removeprefix("call_")
+        item = {
+            "id": item_id,
+            "type": "function_call",
+            "status": "in_progress",
+            "arguments": "",
+            "call_id": call["id"],
+            "name": call["name"],
+        }
+        at = {"item_id": item_id, "output_index": index}
+        frames: list[Op] = [
+            self._event("response.output_item.added", output_index=index, item=item)
+        ]
+        for piece in _split(args, pieces):
+            frames.append(
+                self._event("response.function_call_arguments.delta", **at, delta=piece, pad=True)
+            )
+        done = {**item, "status": "completed", "arguments": args}
+        self.output.append(done)
+        return [
+            *frames,
+            self._event(
+                "response.function_call_arguments.done", **at, name=call["name"], arguments=args
+            ),
+            self._event("response.output_item.done", output_index=index, item=done),
+        ]
+
+    def _start(self) -> int:
+        index, self.started = self.started, self.started + 1
+        return index
+
+    def _response(
+        self,
+        status: str,
+        usage: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "id": self.response_id,
+            "object": "response",
+            "created_at": CREATED,
+            "status": status,
+            "completed_at": CREATED + 1 if status == "completed" else None,
+            "error": error,
+            "incomplete_details": None,
+            "instructions": None,
+            "max_output_tokens": None,
+            "model": self.model,
+            "output": list(self.output),
+            "parallel_tool_calls": True,
+            "previous_response_id": None,
+            "reasoning": {"effort": self.effort, "summary": None},
+            "store": False,
+            "temperature": 1,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1,
+            "truncation": "disabled",
+            "usage": usage,
+            "user": None,
+            "metadata": {},
+        }
+
+    def _event(self, kind: str, *, pad: bool = False, **fields: Any) -> bytes:
+        event = {"type": kind, "sequence_number": self.seq, **fields}
+        if pad and self.obfuscate:
+            # Random-looking and deterministic: the same for every run and impl.
+            digest = hashlib.sha256(f"{self.response_id}:{self.seq}".encode()).digest()
+            event["obfuscation"] = "".join(
+                _OBFUSCATION[b % len(_OBFUSCATION)] for b in digest[: 4 + digest[-1] % 12]
+            )
+        self.seq += 1
+        data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        return f"event: {kind}\ndata: {data}\n\n".encode()
