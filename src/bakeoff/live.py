@@ -380,6 +380,7 @@ class LiveThread:
         self.impl, self.dir, self.term = impl, directory, term
         self.must_answer = must_answer
         self.model = model.config(impl)
+        self.base_url_template = model.base_url
         self.limits = Limits(max_steps=max_steps)
         self.attended = _attended(rules)
         self.loop = loop or loops.load(impl)()
@@ -481,6 +482,7 @@ class LiveThread:
             error,
             max_steps=self.limits.max_steps,
             attended=self.attended,
+            base_url_template=self.base_url_template,
         )
         return base | {
             "final_text": obs.last_text,
@@ -542,6 +544,7 @@ def empty_result(
     *,
     max_steps: int,
     attended: bool,
+    base_url_template: str,
 ) -> dict[str, Any]:
     """A live result.json with nothing observed: the base of every result, and all that a run
     whose thread could not be set up leaves."""
@@ -555,6 +558,9 @@ def empty_result(
         # (limits go to each turn, never to the log) and whether a person answers approvals.
         "max_steps": max_steps,
         "attended": attended,
+        # --base-url before "{impl}" became the loop's name: the report compares the loops of
+        # one run by this, so it never has to guess which path segment was substituted.
+        "base_url_template": base_url_template,
         "prompt": prompt,
         "final_text": "",
         "stops": [],
@@ -599,6 +605,7 @@ async def _finish(
         error,
         max_steps=max_steps,
         attended=_attended(rules),
+        base_url_template=model.base_url,
     )
     write_json(directory / "result.json", result)
     return result

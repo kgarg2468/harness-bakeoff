@@ -660,9 +660,10 @@ def write_live(
     system prompt and the model config (minus the key), as `bakeoff live` saves them. `{impl}` in
     `base_url` becomes the loop's name, as `--base-url` does."""
     folder = live / run_id / impl
-    base_url = base_url.replace("{impl}", impl)
+    template, base_url = base_url, base_url.replace("{impl}", impl)
     write_json(folder / "result.json", {
         "v": 1, "run_id": run_id, "impl": impl, "model": model, "base_url": base_url,
+        "base_url_template": template,
         "max_steps": max_steps, "attended": attended, "prompt": prompt, "final_text": "ok",
         "stops": ["end_turn"], "steps": 1, "requests": 1, "usage": {"input_tokens": 100},
         "duration_ms": seconds * 1000, "passed": True, "error": None, "thread": f"live-{impl}",
@@ -935,3 +936,17 @@ def test_bakeoff_report_command_builds_the_page(out: Path) -> None:
     target = out / "page.html"
     assert main(["report", "--out-dir", str(out), "-o", str(target)]) == 0
     assert target.read_text().startswith("<!doctype html>")
+
+
+def test_a_fixed_path_segment_named_like_a_loop_does_not_split_runs(
+    out: Path, tmp_path: Path
+) -> None:
+    """Greptile #4104656556: both loops used one fixed base URL whose path has a segment named
+    "our" (no "{impl}"). They compare, because the route comes from the recorded template, not
+    from guessing which segment was a loop's name."""
+    live = tmp_path / "live"
+    for run_id, ours in (("L1", 1.0), ("L2", 1.1)):
+        for impl, seconds in (("our", ours), ("pydantic", 2.0)):
+            write_live(live, run_id, impl, seconds, base_url="http://127.0.0.1:8787/our/v1")
+    text = re.sub(r"<[^>]+>", "", make(out, live=live))
+    assert "over 2 live runs of one prompt and setup" in text
