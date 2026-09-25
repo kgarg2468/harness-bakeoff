@@ -250,7 +250,7 @@ _I2_PROBLEMS = (
     "misplaced",  # a result not in the run of results right after its assistant message
     "duplicate_calls",  # a call id in more than one assistant message
     "reran",  # more than one tool.start for a call id
-    "unknown_runs",  # a tool ran for a call id that is in no assistant message
+    "unknown_runs",  # a tool that can have side effects ran for a call id in no assistant message
     "late_runs",  # a tool started after the loop's turn.end (kept in the turn row's `late`)
 )
 
@@ -279,7 +279,9 @@ def check_tool_results(
             tool_calls = item.message.get("tool_calls") if role == "assistant" else None
             latest = [c.get("id") for c in tool_calls or []]
             calls.update(latest)
-    starts = Counter(e["data"].get("call_id") for e in events if e["type"] == "tool.start")
+    start_events = [e["data"] for e in events if e["type"] == "tool.start"]
+    starts = Counter(d.get("call_id") for d in start_events)
+    read_only = {d.get("call_id") for d in start_events if d.get("read_only")}
     late = [
         x["data"].get("call_id")
         for turn in turns
@@ -296,7 +298,10 @@ def check_tool_results(
         "misplaced": [c for c in out_of_place if c in calls],
         "duplicate_calls": [c for c, n in calls.items() if n > 1],
         "reran": [c for c, n in starts.items() if n > 1],
-        "unknown_runs": [c for c in starts if c not in calls],
+        "unknown_runs": [c for c in starts if c not in calls and c not in read_only],
+        # Read-only runs whose call never reached history: a loop started a read early and the
+        # response then failed or was cut off. Harmless, so reported but not a problem.
+        "speculative_runs": [c for c in starts if c not in calls and c in read_only],
         "late_runs": late,
     }
     problems = [f"{k}: {info[k]}" for k in _I2_PROBLEMS if info[k]]

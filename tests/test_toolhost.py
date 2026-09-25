@@ -63,7 +63,7 @@ async def test_run_emits_start_and_end_and_counts(make, events, tmp_path):
         ("tool.start", "c1", "write_file"),
         ("tool.end", "c1", "write_file"),
     ]
-    assert events[0].data == {"call_id": "c1", "name": "write_file"}
+    assert events[0].data == {"call_id": "c1", "name": "write_file", "read_only": False}
     assert set(events[1].data) == {"call_id", "name", "ok", "ms"}
     assert events[1].data["ok"] is True and events[1].data["ms"] >= 0
     assert host.run_counts == {"c1": 1}

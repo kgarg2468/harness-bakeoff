@@ -72,7 +72,13 @@ class ToolHostImpl:
 
     async def run(self, call: ToolCall) -> ToolResult:
         """Validate, enforce deny, execute. Never raises, except `asyncio.CancelledError`."""
-        self._safe_emit(Event("tool.start", {"call_id": call.id, "name": call.name}))
+        tool = _BY_NAME.get(call.name)
+        read_only = tool is not None and tool.spec.read_only
+        # read_only lets the I2 check tell a speculative early read (harmless) from a real
+        # side effect when a run's call never reaches history.
+        self._safe_emit(
+            Event("tool.start", {"call_id": call.id, "name": call.name, "read_only": read_only})
+        )
         start = time.perf_counter()
         ok = False
         try:

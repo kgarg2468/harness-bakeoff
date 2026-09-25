@@ -488,3 +488,23 @@ def test_commits_without_repo_fail(log, tmp_path):
     check = check_commits(log, "th", tmp_path)
     assert not check.ok
     assert "git rev-list failed" in check.detail
+
+
+def test_i2_tolerates_speculative_read_only_runs_but_not_side_effects():
+    """A read started early whose call never reached history is speculative (reported, not a
+    problem); an unrecorded run of a tool with side effects is still a failure."""
+    from bakeoff.shared.contract import Item
+    from bakeoff.shared.invariants import check_tool_results
+
+    items = [Item("u", "t", {"role": "user", "content": "go"})]
+
+    def start(call_id, read_only):
+        return {
+            "type": "tool.start",
+            "data": {"call_id": call_id, "name": "x", "read_only": read_only},
+        }
+
+    ok = check_tool_results(items, [start("spec", True)], [])
+    assert ok.ok and ok.info["speculative_runs"] == ["spec"] and ok.info["unknown_runs"] == []
+    bad = check_tool_results(items, [start("write", False)], [])
+    assert not bad.ok and bad.info["unknown_runs"] == ["write"]
