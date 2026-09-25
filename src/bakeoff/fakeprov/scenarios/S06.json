@@ -1,0 +1,61 @@
+{
+  "id": "S06",
+  "title": "Deny with a reason: the tool does not run and the model sees the denial",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow", "write_file": "ask", "edit_file": "ask"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [
+    {"user": "Save a draft chat pipeline as draft.pipe."},
+    {
+      "approve": {"deny": ["call_S06_1"], "reason": "Do not create files yet."},
+      "new_process": false
+    }
+  ],
+  "exchanges": [
+    {
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S06_1",
+                "name": "write_file",
+                "arguments": {
+                  "path": "draft.pipe",
+                  "content": "{\n  \"project_id\": \"b0000001-0000-4000-8000-000000000001\",\n  \"source\": \"chat_1\",\n  \"components\": [\n    {\n      \"id\": \"chat_1\",\n      \"provider\": \"chat\",\n      \"config\": {}\n    },\n    {\n      \"id\": \"llm_1\",\n      \"provider\": \"llm_openai_api\",\n      \"config\": {\n        \"profile\": \"custom\",\n        \"custom\": {\n          \"model\": \"${ROCKETRIDE_OLLAMA_MODEL}\",\n          \"base_url\": \"${ROCKETRIDE_OLLAMA_BASE_URL}\",\n          \"apikey\": \"ollama\",\n          \"modelTotalTokens\": 32768\n        }\n      },\n      \"input\": [\n        {\n          \"lane\": \"questions\",\n          \"from\": \"chat_1\"\n        }\n      ]\n    },\n    {\n      \"id\": \"response_1\",\n      \"provider\": \"response_answers\",\n      \"config\": {},\n      \"input\": [\n        {\n          \"lane\": \"answers\",\n          \"from\": \"llm_1\"\n        }\n      ]\n    }\n  ]\n}\n"
+                }
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "The denial reason reaches the model as the tool result.",
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 4,
+        "tool_result_contains": {"call_S06_1": "Do not create files yet."}
+      },
+      "respond": {
+        "stream": [
+          {"text": "Understood, I did not create draft.pipe.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["paused", "end_turn"],
+    "requests": 2,
+    "commits": 1,
+    "files": {"draft.pipe": null},
+    "tool_runs": {"call_S06_1": 0}
+  }
+}

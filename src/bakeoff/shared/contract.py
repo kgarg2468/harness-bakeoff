@@ -21,7 +21,8 @@ Rules every Loop must follow (tests enforce them, see DESIGN.md):
    which enforces deny. On an approval resume, the user's answer replaces
    `check()` for the pending calls: `Resume.decisions[id] == "allow"` goes
    straight to `run()` (`run()` only blocks "deny" rules), and "deny" becomes a
-   `ToolResult(ok=False, content="Denied by user: <reason>")` without running.
+   `ToolResult(ok=False, content="Denied by user: <reason>", error="denied")`
+   without running.
    A crash resume has no decisions, so pending calls go through `check()` again.
 6. When `cancel` is set, stop within 200 ms, leave no orphan tool calls, and
    end with `turn.end` stop="cancelled".
@@ -78,11 +79,18 @@ class ToolCall:
     arguments: str  # raw JSON text exactly as streamed; never re-serialize it
 
 
+ToolError = Literal["invalid_args", "denied", "failed"]
+
+
 @dataclass(slots=True, frozen=True)
 class ToolResult:
     call_id: str
     ok: bool
     content: str  # exactly what the model will see
+    # Why ok=False: the model sent bad arguments (it can retry), the call was denied (by rules
+    # or the user), or the tool itself failed. None when ok=True. Loops may map these onto
+    # their own idioms (e.g. pydantic-ai's ModelRetry for invalid_args).
+    error: ToolError | None = None
 
 
 @dataclass(slots=True)

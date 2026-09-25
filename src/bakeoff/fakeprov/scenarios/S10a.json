@@ -1,0 +1,124 @@
+{
+  "id": "S10a",
+  "title": "reasoning_details round-trip: split fragments, metadata-only signature fragment, encrypted detail",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5", "reasoning": {"effort": "low"}},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "strict": {"reject_unsigned_reasoning": true},
+  "driver": [
+    {"user": "Which components can I use for a RAG pipeline?"},
+    {"user": "Thanks. Summarize that in one sentence."}
+  ],
+  "exchanges": [
+    {
+      "note": "Thinking split over two text fragments, a metadata-only signature fragment and a redacted (encrypted) block, then a tool call.",
+      "expect": {"last_role": "user", "messages_len": 2, "body_has": ["reasoning"]},
+      "respond": {
+        "stream": [
+          {
+            "reasoning_details": [
+              {
+                "type": "reasoning.text",
+                "text": "The user asks about RAG. ",
+                "format": "anthropic-claude-v1",
+                "index": 0
+              },
+              {
+                "type": "reasoning.text",
+                "text": "I should list the components first.",
+                "format": "anthropic-claude-v1",
+                "index": 0
+              },
+              {
+                "type": "reasoning.text",
+                "signature": "EqoBCkgIBxABGAIiQFakeSignatureForTheBakeoffOnlyNotARealAnthropicSignature0001==",
+                "format": "anthropic-claude-v1",
+                "index": 0
+              },
+              {
+                "type": "reasoning.encrypted",
+                "data": "RkFLRS1SRURBQ1RFRC1USElOS0lORw==",
+                "format": "anthropic-claude-v1",
+                "index": 1
+              }
+            ]
+          },
+          {"tool_calls": [{"id": "call_S10a_1", "name": "list_components", "arguments": {}}]},
+          {"finish": "tool_calls"},
+          {
+            "usage": {
+              "prompt_tokens": 950,
+              "completion_tokens": 60,
+              "reasoning_tokens": 24,
+              "cost": 0.00375
+            }
+          }
+        ]
+      }
+    },
+    {
+      "note": "Strict: the replayed assistant message must keep the signature.",
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 4,
+        "tool_result_contains": {"call_S10a_1": "llm_openai_api"}
+      },
+      "respond": {
+        "stream": [
+          {
+            "reasoning_details": [
+              {
+                "type": "reasoning.text",
+                "text": "The catalog has parsers, embeddings, ",
+                "format": "anthropic-claude-v1",
+                "index": 0
+              },
+              {
+                "type": "reasoning.text",
+                "text": "vector stores and LLMs.",
+                "format": "anthropic-claude-v1",
+                "index": 0
+              },
+              {
+                "type": "reasoning.text",
+                "signature": "EqoBCkgIBxABGAIiQFakeSignatureForTheBakeoffOnlyNotARealAnthropicSignature0002==",
+                "format": "anthropic-claude-v1",
+                "index": 0
+              }
+            ]
+          },
+          {
+            "text": "Use chat or webhook, parse, an embedding node, a vector store, prompt, llm_openai_api and response_answers.",
+            "chunks": 3
+          },
+          {"finish": "stop"},
+          {
+            "usage": {
+              "prompt_tokens": 1400,
+              "completion_tokens": 70,
+              "reasoning_tokens": 16,
+              "cost": 0.0052
+            }
+          }
+        ]
+      }
+    },
+    {
+      "note": "Both earlier assistant messages replay their reasoning_details.",
+      "expect": {"last_role": "user", "messages_len": 6},
+      "respond": {
+        "stream": [
+          {
+            "text": "A RAG pipeline parses, embeds and stores documents, then answers questions with an LLM over the retrieved chunks.",
+            "chunks": 3
+          },
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {"stops": ["end_turn", "end_turn"], "requests": 3, "commits": 2}
+}

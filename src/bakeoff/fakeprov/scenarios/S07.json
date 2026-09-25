@@ -1,0 +1,83 @@
+{
+  "id": "S07",
+  "title": "Cancel mid-stream (stall) and during a slow tool; the next turn must not replay unsigned reasoning",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5", "reasoning": {"effort": "low"}},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 2000},
+  "strict": {"reject_unsigned_reasoning": true},
+  "driver": [
+    {"user": "Describe the tool_pipe component.", "cancel_after_ms": 300},
+    {"user": "Look it up with describe_component.", "cancel_after_ms": 400},
+    {"user": "Answer from memory: which lanes does tool_pipe output?"}
+  ],
+  "exchanges": [
+    {
+      "note": "Reasoning without its signature yet, a little text, then the stream stalls. The client cancels at 300 ms.",
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "reasoning_details": [
+              {
+                "type": "reasoning.text",
+                "text": "The user wants the ",
+                "format": "anthropic-claude-v1",
+                "index": 0
+              },
+              {
+                "type": "reasoning.text",
+                "text": "tool_pipe definition.",
+                "format": "anthropic-claude-v1",
+                "index": 0
+              }
+            ]
+          },
+          {"text": "Let me"},
+          {"stall": true}
+        ]
+      }
+    },
+    {
+      "note": "Strict: rejects a replay of the cut-off reasoning (it has no signature). The tool takes 2 s; the client cancels at 400 ms.",
+      "expect": {"last_role": "user", "last_content_contains": "describe_component"},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S07_1",
+                "name": "describe_component",
+                "arguments": {"name": "tool_pipe"}
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "The cancelled call has its one result; no orphan tool calls.",
+      "expect": {"last_role": "user", "tool_result_contains": {"call_S07_1": ""}},
+      "respond": {
+        "stream": [
+          {
+            "text": "tool_pipe outputs text, questions, documents, table and answers.",
+            "chunks": 3
+          },
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["cancelled", "cancelled", "end_turn"],
+    "requests": 3,
+    "commits": 3,
+    "tool_runs": {"call_S07_1": 1},
+    "text_contains": "tool_pipe outputs"
+  }
+}
