@@ -1,0 +1,446 @@
+"""The scenario driver: expect evaluation, result.json and summary.json, cross-process steps."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+import sys
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from bakeoff import loops
+from bakeoff.fakeprov.script import SCENARIOS_DIR
+from bakeoff.fakeprov.server import FakeProvider
+from bakeoff.our_version import OurLoop
+from bakeoff.shared import scenario
+from bakeoff.shared.contract import ModelConfig
+from bakeoff.shared.scenario import (
+    DriverError,
+    Observed,
+    capture_output,
+    crash_sink,
+    decide,
+    evaluate_expect,
+    format_matrix,
+    reason,
+    run_matrix,
+    run_scenario,
+    unexpected,
+    usage_totals,
+)
+
+# The result.json fields of the shared output format, plus the driver's thread and processes.
+RESULT_KEYS = set(
+    "v run_id scenario title impl stops expect invariants requests tool_runs usage duration_ms"
+    " passed error thread processes".split()
+)
+
+
+def copy_scenario(tmp_path: Path, sid: str, new_id: str, **changes: Any) -> Path:
+    """A copy of scenario `sid` named `new_id` in tmp_path/scenarios, with top-level changes."""
+    data = json.loads((SCENARIOS_DIR / f"{sid}.json").read_text())
+    data |= {"id": new_id, **changes}
+    folder = tmp_path / "scenarios"
+    folder.mkdir(exist_ok=True)
+    path = folder / f"{new_id}.json"
+    path.write_text(json.dumps(data))
+    return path
+
+
+@pytest.fixture
+def provider(tmp_path: Path):
+    with FakeProvider(tmp_path / "scenarios", tmp_path / "wire") as served:
+        yield served
+
+
+@pytest.fixture
+def real_provider(tmp_path: Path):
+    with FakeProvider(wire_dir=tmp_path / "wire") as served:
+        yield served
+
+
+def observed(tmp_path: Path, **fields: Any) -> Observed:
+    base: dict[str, Any] = {
+        "stops": ["end_turn"],
+        "tool_runs": {"call_1": 1},
+        "requests": 2,
+        "commits": 1,
+        "last_text": "Hello, team!",
+        "usage": [],
+        "workdir": tmp_path,
+    }
+    return Observed(**(base | fields))
+
+
+def usage_event(tokens_in: int, tokens_out: int, cached: int, cost: float) -> dict[str, Any]:
+    return {
+        "input_tokens": tokens_in,
+        "output_tokens": tokens_out,
+        "cached_tokens": cached,
+        "cost_usd": cost,
+        "cost_source": "provider",
+    }
+
+
+# --- expect evaluation ------------------------------------------------------------------------
+
+
+def test_every_expect_key_passes_on_matching_facts(tmp_path: Path) -> None:
+    (tmp_path / "a.pipe").write_text('{"components": []}')
+    usage = [usage_event(10, 2, 5, 0.001), usage_event(20, 3, 0, 0.002)]
+    expect = {
+        "stops": ["end_turn"],
+        "files": {"a.pipe": "components", "gone.md": None},
+        "tool_runs": {"call_1": 1, "call_2": 0},
+        "commits": 1,
+        "requests": 2,
+        "text_contains": "team",
+        "cost_usd": 0.003,
+        "usage": {"input_tokens": 30, "output_tokens": 5, "cached_tokens": 5},
+        "cost_source": "provider",
+    }
+    results = evaluate_expect(expect, observed(tmp_path, usage=usage))
+    assert set(results) == set(expect)
+    assert all(r["ok"] for r in results.values()), results
+
+
+def test_each_expect_key_explains_a_mismatch(tmp_path: Path) -> None:
+    (tmp_path / "a.pipe").write_text("{}")
+    (tmp_path / "gone.md").write_text("still here")
+    usage = [{"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.5, "cost_source": "estimate"}]
+    expect = {
+        "stops": ["paused", "end_turn"],
+        "files": {"a.pipe": "components", "gone.md": None, "missing.txt": "x"},
+        "tool_runs": {"call_1": 0},
+        "commits": 2,
+        "requests": 3,
+        "text_contains": "bye",
+        "cost_usd": 0.25,
+        "usage": {"input_tokens": 2},
+        "cost_source": "none",
+    }
+    results = evaluate_expect(expect, observed(tmp_path, usage=usage))
+    details = {key: r["detail"] for key, r in results.items() if not r["ok"]}
+    assert set(details) == set(expect)
+    assert details["stops"] == "got ['end_turn'], expected ['paused', 'end_turn']"
+    assert details["files"] == (
+        "a.pipe lacks 'components'; gone.md exists, expected absent; missing.txt is missing"
+    )
+    assert details["tool_runs"] == "call_1 ran 1x, expected 0x"
+    assert details["requests"] == "got 2, expected 3"
+    assert details["text_contains"] == "missing 'bye' in 'Hello, team!'"
+    assert details["cost_usd"] == "got 0.5, expected 0.25"
+    assert details["cost_source"] == "got estimate, expected none"
+
+
+def test_cost_source_needs_usage_events_and_one_source(tmp_path: Path) -> None:
+    assert evaluate_expect({"cost_source": "none"}, observed(tmp_path))["cost_source"] == {
+        "ok": False,
+        "detail": "no usage events",
+    }
+    mixed = [{"cost_source": "provider"}, {"cost_source": "none"}]
+    result = evaluate_expect({"cost_source": "none"}, observed(tmp_path, usage=mixed))
+    assert not result["cost_source"]["ok"]
+    assert usage_totals(mixed)["cost_source"] == "mixed"
+    assert usage_totals([])["cost_source"] == "none"
+
+
+def test_cost_is_compared_with_a_tolerance(tmp_path: Path) -> None:
+    usage = [
+        {"cost_usd": 0.1, "cost_source": "provider"},
+        {"cost_usd": 0.2, "cost_source": "provider"},
+    ]
+    assert evaluate_expect({"cost_usd": 0.3}, observed(tmp_path, usage=usage))["cost_usd"]["ok"]
+
+
+def test_decide_answers_every_pending_call_exactly() -> None:
+    assert decide(["a", "b"], "all", ["b"]) == {"a": "allow", "b": "deny"}
+    assert decide(["a"], [], ["a"]) == {"a": "deny"}
+    with pytest.raises(DriverError, match="no decision"):
+        decide(["a", "b"], ["a"], [])
+    with pytest.raises(DriverError, match="not pending"):
+        decide(["a"], ["a", "typo"], [])
+
+
+def test_capture_output_sees_python_and_file_descriptor_writes(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    with capture_output() as captured:
+        print("via print")
+        sys.stderr.write("via sys.stderr\n")
+        os.write(1, b"via fd 1\n")
+        os.write(2, b"via fd 2\n")
+    assert captured.stdout == "via print\nvia fd 1\n"
+    assert captured.stderr == "via sys.stderr\nvia fd 2\n"
+    print("after")
+    assert capfd.readouterr() == ("after\n", "")
+
+
+def test_crash_sink_matches_the_event_and_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    kills: list[int] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: kills.append(sig))
+    sink = crash_sink("item", "call_1")
+    tool_item = {
+        "type": "item",
+        "data": {"item": {"message": {"role": "tool", "tool_call_id": "call_1"}}},
+    }
+    other = {
+        "type": "item",
+        "data": {"item": {"message": {"role": "tool", "tool_call_id": "call_2"}}},
+    }
+    sink({"type": "tool.end", "data": {"call_id": "call_1"}})
+    sink(other)
+    assert kills == []
+    sink(tool_item)
+    assert kills == [signal.SIGKILL]
+    crash_sink("tool.start")({"type": "tool.start", "data": {"call_id": "x"}})
+    assert kills == [signal.SIGKILL, signal.SIGKILL]
+
+
+# --- running scenarios -------------------------------------------------------------------------
+
+
+async def test_result_json_shape_and_layout(real_provider: FakeProvider, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    result = await run_scenario("S01", "our", out=out, run_id="r1", provider=real_provider)
+    directory = out / "runs" / "r1" / "S01" / "our"
+    assert set(result) == RESULT_KEYS
+    assert json.loads((directory / "result.json").read_text()) == result
+    assert result["passed"] and result["error"] is None
+    assert (result["v"], result["scenario"], result["impl"], result["run_id"]) == (
+        1,
+        "S01",
+        "our",
+        "r1",
+    )
+    assert result["stops"] == ["end_turn"]
+    assert set(result["expect"]) == {"stops", "requests", "commits", "text_contains", "cost_usd"}
+    assert set(result["invariants"]) == {"I1", "I2", "I3", "I5", "I7"}
+    for check in [*result["expect"].values(), *result["invariants"].values()]:
+        assert check["ok"] is True and isinstance(check["detail"], str)
+    assert result["usage"] == {
+        "input_tokens": result["usage"]["input_tokens"],
+        "output_tokens": result["usage"]["output_tokens"],
+        "cached_tokens": result["usage"]["cached_tokens"],
+        "cost_usd": 0.001446,
+        "cost_source": "provider",
+    }
+    assert result["requests"] == 1 and result["tool_runs"] == {}
+    assert isinstance(result["duration_ms"], float)
+    for name in ("log.sqlite", "events.ndjson", "wire/001.json", "wire/001.meta.json"):
+        assert (directory / name).is_file(), name
+    assert (directory / "wc" / "S01-our" / ".git").is_dir()
+    types = [
+        json.loads(line)["type"] for line in (directory / "events.ndjson").read_text().splitlines()
+    ]
+    assert types[0] == "turn.start" and types[-2:] == ["turn.end", "commit"]
+
+
+async def test_the_same_scenario_can_run_again(real_provider: FakeProvider, tmp_path: Path) -> None:
+    # Every run gets a fresh fakeprov cursor, so a rerun with the same run id starts over.
+    for _ in range(2):
+        result = await run_scenario(
+            "S01", "our", out=tmp_path / "out", run_id="r1", provider=real_provider
+        )
+        assert result["passed"], reason(result)
+        assert result["requests"] == 1
+
+
+async def test_failed_expectations_are_reported_per_key(
+    provider: FakeProvider, tmp_path: Path
+) -> None:
+    expect = {"stops": ["end_turn"], "requests": 2, "text_contains": "Goodbye"}
+    copy_scenario(tmp_path, "S01", "X01", expect=expect)
+    result = await run_scenario("X01", "our", out=tmp_path / "out", run_id="r1", provider=provider)
+    assert not result["passed"] and result["error"] is None
+    assert [k for k, v in result["expect"].items() if not v["ok"]] == ["requests", "text_contains"]
+    assert reason(result) == "requests: got 1, expected 2 (+1 more)"
+
+
+class NoisyLoop(OurLoop):
+    """Breaks I5: prints during its turn."""
+
+    def run_turn(self, turn, tools, cancel):  # type: ignore[no-untyped-def]
+        print("debug: turn started")
+        return super().run_turn(turn, tools, cancel)
+
+
+async def test_a_loop_that_prints_fails_i5(real_provider: FakeProvider, tmp_path: Path) -> None:
+    result = await run_scenario(
+        "S01",
+        "our",
+        out=tmp_path / "out",
+        run_id="r1",
+        provider=real_provider,
+        loop_factory=NoisyLoop,
+    )
+    i5 = result["invariants"]["I5"]
+    assert not result["passed"] and not i5["ok"]
+    assert i5["info"]["stdout"] == "debug: turn started\n"
+    assert reason(result).startswith("I5: 20 chars to stdout: 'debug: turn started'")
+
+
+async def test_approve_in_a_new_process(real_provider: FakeProvider, tmp_path: Path) -> None:
+    result = await run_scenario(
+        "S05", "our", out=tmp_path / "out", run_id="r1", provider=real_provider
+    )
+    assert result["passed"], reason(result)
+    (proc,) = result["processes"]
+    assert proc["command"] == "approve" and proc["exit"] == 0
+    assert proc["pid"] != os.getpid() and proc["summary"]["pid"] == proc["pid"]
+    assert proc["summary"]["stop"] == "end_turn"
+    assert result["stops"] == ["paused", "end_turn"]
+    assert result["tool_runs"] == {"call_S05_1": 1, "call_S05_2": 1}
+
+
+async def test_crash_in_a_child_and_resume(real_provider: FakeProvider, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    result = await run_scenario("S08", "our", out=out, run_id="r1", provider=real_provider)
+    assert result["passed"], reason(result)
+    (proc,) = result["processes"]
+    assert (proc["command"], proc["exit"]) == ("turn", -signal.SIGKILL)
+    assert "summary" not in proc and proc["pid"] != os.getpid()
+    lines = (out / "runs" / "r1" / "S08" / "our" / "events.ndjson").read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    crashed = [e for e in events if e["turn"] == "S08-our.0"]
+    # The child died right after the call's result item was stored: turn 0 never ended, and the
+    # next event is the resumed turn's start.
+    last = crashed[-1]
+    assert last["type"] == "item"
+    assert last["data"]["item"]["message"]["tool_call_id"] == "call_S08_1"
+    assert "turn.end" not in {e["type"] for e in crashed}
+    assert events[len(crashed)]["type"] == "turn.start"
+    assert events[len(crashed)]["data"]["resume"]["kind"] == "crash"
+    assert result["tool_runs"] == {"call_S08_1": 1}
+
+
+async def test_a_crash_point_that_never_comes_fails_the_run(
+    provider: FakeProvider, tmp_path: Path
+) -> None:
+    driver = [
+        {"crash_after": "permission.asked"},
+        {"user": "Write hello.txt containing 'hello from S08', then confirm."},
+        {"resume": "crash"},
+    ]
+    copy_scenario(tmp_path, "S08", "X08", driver=driver)
+    result = await run_scenario("X08", "our", out=tmp_path / "out", run_id="r1", provider=provider)
+    assert not result["passed"]
+    assert "was to die of SIGKILL at its crash point, but exited with 0" in result["error"]
+    assert result["processes"][0]["exit"] == 0
+
+
+async def test_a_driver_step_that_cannot_run_is_the_error(
+    provider: FakeProvider, tmp_path: Path
+) -> None:
+    driver = [
+        {"user": "Validate a simple chat pipeline and save a README.md that describes it."},
+        {"approve": {"allow": ["call_S05_1"]}, "new_process": True},
+    ]
+    copy_scenario(tmp_path, "S05", "X05", driver=driver)
+    result = await run_scenario("X05", "our", out=tmp_path / "out", run_id="r1", provider=provider)
+    assert not result["passed"]
+    assert result["error"].startswith("DriverError: step 2")
+    assert "not pending: ['call_S05_1']" in result["error"]
+    assert result["stops"] == ["paused"]
+
+
+async def test_run_matrix_writes_the_summary_and_latest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy_scenario(tmp_path, "S01", "X01")
+    wrong = {"stops": ["end_turn"], "text_contains": "Goodbye"}
+    copy_scenario(tmp_path, "S01", "X02", expect=wrong)
+    copy_scenario(tmp_path, "S01", "X03", expect=wrong)
+    documented = replace(loops.REGISTRY["our"], known_failures={"X03": "says hello, not goodbye"})
+    monkeypatch.setitem(loops.REGISTRY, "our", documented)
+    out, seen = tmp_path / "out", []
+    summary = await run_matrix(
+        ["X01", "X02", "X03"],
+        ["our"],
+        out=out,
+        run_id="m1",
+        on_result=lambda r: seen.append(r["scenario"]),
+        scenarios_dir=tmp_path / "scenarios",
+    )
+    assert seen == ["X01", "X02", "X03"]
+    runs = out / "runs"
+    assert json.loads((runs / "m1" / "summary.json").read_text()) == summary
+    assert (runs / "latest").is_symlink() and os.readlink(runs / "latest") == "m1"
+    assert not (runs / "m1" / ".wire").exists()
+    assert (runs / "m1" / "X01" / "our" / "wire" / "001.json").is_file()
+    assert summary["loops"]["our"]["target"] == "bakeoff.our_version:OurLoop"
+    assert summary["loops"]["our"]["versions"]["httpx"]
+    assert summary["git_sha"] is None or len(summary["git_sha"]) == 40
+    cells = {sid: summary["matrix"][sid]["our"] for sid in ("X01", "X02", "X03")}
+    assert cells["X01"] == {
+        "passed": True,
+        "status": "pass",
+        "reason": "ok",
+        "expected_failure": None,
+        "duration_ms": cells["X01"]["duration_ms"],
+    }
+    assert (cells["X02"]["status"], cells["X02"]["expected_failure"]) == ("FAIL", None)
+    assert cells["X02"]["reason"].startswith("text_contains: missing 'Goodbye' in 'Hello")
+    assert (cells["X03"]["status"], cells["X03"]["expected_failure"]) == (
+        "xfail",
+        "says hello, not goodbye",
+    )
+    assert unexpected(summary) == ["X02/our"]
+    lines = format_matrix(summary).splitlines()
+    assert lines[:4] == ["scenario  our", "X01       pass", "X02       FAIL", "X03       xfail"]
+    assert lines[4].startswith("  X02/our FAIL: text_contains: missing 'Goodbye'")
+    assert lines[-1] == "our 1/3 pass, 1 FAIL, 1 xfail"
+
+    await run_matrix(["X01"], ["our"], out=out, run_id="m2", scenarios_dir=tmp_path / "scenarios")
+    assert os.readlink(runs / "latest") == "m2"
+
+
+def test_unexpected_lists_only_undocumented_failures() -> None:
+    cell = {"passed": False, "reason": "x", "expected_failure": None, "duration_ms": 1.0}
+    summary = {
+        "matrix": {
+            "S01": {"our": cell | {"status": "FAIL"}},
+            "S11": {"our": cell | {"status": "xfail"}},
+        }
+    }
+    assert unexpected(summary) == ["S01/our"]
+
+
+def test_scenario_ids_are_every_file_in_order() -> None:
+    ids = scenario.scenario_ids()
+    assert ids[0] == "S01" and ids[-1] == "S15" and "S12b" in ids
+    assert ids == sorted(p.stem for p in SCENARIOS_DIR.glob("*.json"))
+
+
+async def test_cancel_command_reaches_a_worker_turn(
+    real_provider: FakeProvider, tmp_path: Path
+) -> None:
+    """`bakeoff cancel` from another process stops the turn a `bakeoff turn` worker runs."""
+    db = tmp_path / "log.sqlite"
+    ws = scenario.Workspace(db)
+    model = ModelConfig(base_url=real_provider.base_url("S07", "r1", "our"), model="m")
+    ws.runner.new_thread(impl="our", system="s", rules={"*": "allow"}, model=model, thread_id="t1")
+    ws.close()
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    bakeoff = (sys.executable, "-m", "bakeoff.cli")
+    pipes = {"stdout": asyncio.subprocess.PIPE, "stderr": asyncio.subprocess.PIPE, "env": env}
+    # S07's first answer streams "Let me", then stalls until the client leaves.
+    worker = await asyncio.create_subprocess_exec(
+        *bakeoff, "turn", "t1", f"--db={db}", "--user=hi", **pipes
+    )
+    events = tmp_path / "events.ndjson"
+    for _ in range(200):
+        if events.exists() and '"text.delta"' in events.read_text():
+            break
+        await asyncio.sleep(0.05)
+    cancel = await asyncio.create_subprocess_exec(*bakeoff, "cancel", "t1", f"--db={db}", **pipes)
+    assert json.loads((await cancel.communicate())[0]) == {"thread": "t1", "cancel": "requested"}
+    out, err = await asyncio.wait_for(worker.communicate(), 10)
+    assert err == b""
+    summary = json.loads(out)
+    assert (summary["stop"], summary["pid"]) == ("cancelled", worker.pid)
