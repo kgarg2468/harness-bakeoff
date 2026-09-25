@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from bakeoff.report import build, data
+from bakeoff.report import build, data, render
 from bakeoff.shared.contract import Item
 from bakeoff.shared.sessionlog import SessionLog, event_row, item_to_json
 
@@ -21,13 +21,15 @@ _VOID = {"meta", "input", "br", "img", "hr", "link", "col", "source", "wbr", "ar
 
 
 class Page(HTMLParser):
-    """Checks that every tag is closed in order, and collects sections and the embedded data."""
+    """Checks that every tag is closed in order, and collects sections, the glossary terms used
+    in <main> and the embedded data."""
 
     def __init__(self, text: str) -> None:
         super().__init__()
         self.stack: list[str] = []
         self.problems: list[str] = []
         self.sections: list[str] = []
+        self.terms: set[str] = set()
         self._in_data = False
         self.data_text = ""
         self.feed(text)
@@ -39,6 +41,8 @@ class Page(HTMLParser):
         a = dict(attrs)
         if tag == "section" and a.get("data-section"):
             self.sections.append(str(a["data-section"]))
+        if a.get("data-term") and "main" in self.stack:
+            self.terms.add(str(a["data-term"]))
         self._in_data = tag == "script" and a.get("id") == "report-data"
         if tag not in _VOID:
             self.stack.append(tag)
@@ -217,7 +221,8 @@ def out(tmp_path: Path) -> Path:
             "our_version": {"total": {"files": 5, "code": 698, "comment": 18, "docstring": 90, "blank": 111},
                             "ported": {"Pi": {"code": 332}}, "imports_outside": [], "other_files": []},
             "pydantic_version": {"total": {"files": 3, "code": 512, "comment": 9, "docstring": 40, "blank": 60}},
-        }, "shared": {"total": {"files": 13, "code": 1100, "comment": 47, "docstring": 211, "blank": 251}}},
+        }, "shared": {"total": {"files": 13, "code": 1100, "comment": 47, "docstring": 211, "blank": 251},
+                      "ported": {"OpenCode": {"code": 322}, "RocketRide": {"code": 300}}}},
         "bench": {"config": {"chunks": 500}, "loops": {
             "our_version": {"wall_ms": {"baseline": {"p50": 12.47}, "overhead": {"p50": 3.06, "p95": 3.8}},
                             "overhead_us_per_frame": {"wall": {"p50": 6.01}}},
@@ -234,6 +239,7 @@ def out(tmp_path: Path) -> Path:
     for impl, seconds in (("our", 2.5), ("pydantic", 3.25)):
         write_json(out / "live" / "L1" / impl / "result.json", {
             "v": 1, "run_id": "L1", "impl": impl, "model": "gpt-test", "prompt": "What is RocketRide?",
+            "base_url": "https://api.openai.com/v1",
             "final_text": f"answer from {impl}", "stops": ["end_turn"], "requests": 3, "tool_runs": {"c": 1},
             "usage": {"input_tokens": 1234, "output_tokens": 56, "cached_tokens": 0, "cost_usd": None,
                       "cost_source": "none"}, "duration_ms": seconds * 1000, "error": None,
@@ -264,10 +270,22 @@ def test_full_page_is_well_formed_with_every_section(out: Path) -> None:
     # live runs: prompt, answers, tokens, latency, steps
     assert "What is RocketRide?" in html and "answer from pydantic" in html
     assert "1,234" in html and "3.25 s" in html
+    assert "BYOK" in html and "api.openai.com" in html and "/v1" not in html
+    # the shared layer's ported lines are counted too
+    assert "<th>shared (once)</th>" in html and "622</td>" in html
     # where each wins: a measured win for A (fewer own lines), linked to its evidence
     assert "Fewer lines of its own code to maintain" in html and 'href="#loc"' in html
-    assert "Answered faster: B 2.50 s vs A 3.25 s (live run L1, one sample" in html
-    assert "Sent fewer input tokens" not in html  # a tie is nobody's win
+    # counts only over the scenarios both loops ran (S02 has no A run)
+    assert "Passes more scenarios: B 1 vs A 0, of the 1 both loops ran." in html
+    # one live run is not evidence of speed: shown as too close to call
+    assert "Answered faster" not in html and "Sent fewer input tokens" not in html
+    assert "one live run, too few to call" in html
+    assert "as our own <span" in html and "written without an agent framework" in html
+
+
+def test_every_glossary_term_has_a_tooltip_on_the_page(out: Path) -> None:
+    used = Page(make(out)).terms
+    assert {label for label, _ in render.GLOSSARY.values()} - used == set()
 
 
 def test_replay_and_wire_data(out: Path) -> None:
@@ -359,16 +377,22 @@ def test_over_the_size_budget_strings_are_cut(out: Path, monkeypatch: pytest.Mon
     assert Page(cut).problems == []
 
 
-def test_long_wire_strings_are_clipped_with_a_pointer_to_the_file(out: Path) -> None:
-    wire = out / "runs" / "r1" / "S01" / "our" / "wire"
-    write_json(wire / "003.json", body([{"role": "user", "content": "z" * (data.WIRE_LIMIT + 10)}]))
-    pool = Page(make(out)).data["pool"]
-    clipped = next(
-        v["content"] for v in pool if isinstance(v, dict) and "zzz" in str(v.get("content"))
-    )
-    assert clipped.endswith(
-        "[10 more characters not shown; the full text is in S01/our/wire/003.json]"
-    )
+def test_identical_long_wire_strings_stay_identical_when_clipped(out: Path) -> None:
+    long = {"role": "tool", "tool_call_id": "c1", "content": "z" * (data.WIRE_LIMIT + 10)}
+    run = out / "runs" / "r1" / "S01"
+    write_json(run / "our" / "wire" / "003.json", body([long]))
+    write_json(run / "pydantic" / "wire" / "S01" / "r1" / "pydantic" / "002.json", body([long]))
+    page = Page(make(out)).data
+    clipped = [v for v in page["pool"] if isinstance(v, dict) and "zzz" in str(v.get("content"))]
+    # One pool entry for both loops, and a note that names no file (it would differ per loop).
+    assert len(clipped) == 1
+    assert clipped[0]["content"].endswith("\n…[10 more characters not shown]")
+    (s01,) = [s for s in page["scenarios"] if s["id"] == "S01"]
+    ours, theirs = s01["runs"]["our"]["wire"][2], s01["runs"]["pydantic"]["wire"][1]
+    assert ours["body"] == theirs["body"]
+    assert ours["clipped"] == theirs["clipped"] == {"strings": 1, "chars": 10}
+    assert ours["file"] == "S01/our/wire/003.json"
+    assert theirs["file"] == "S01/pydantic/wire/S01/r1/pydantic/002.json"
 
 
 def test_session_log_is_read_without_touching_it(out: Path) -> None:
@@ -411,3 +435,150 @@ def test_main_writes_the_page(out: Path, capsys: pytest.CaptureFixture[str]) -> 
     page = out / "report.html"
     assert Page(page.read_text()).sections == SECTIONS
     assert f"wrote {page}" in capsys.readouterr().out
+
+
+def call(id_: str, name: str) -> dict[str, Any]:
+    return {"id": id_, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+
+def test_eager_means_read_only_and_started_while_its_message_streams() -> None:
+    """Only c1 is eager. c4 starts after the stream ended (A's order), c7 is a write, and c2 was
+    saved in turn 0 and runs in the approval turn while a new request is open."""
+    t0, t1 = "T.0", "T.1"
+    assistant = {"role": "assistant", "content": None,
+                 "tool_calls": [call("c1", "read_file"), call("c4", "list_files"),
+                                call("c7", "write_file"), call("c2", "read_file")]}  # fmt: skip
+    resume = {"kind": "approval", "decisions": {"c2": "allow"}, "reason": None}
+    events = [
+        env("T", t0, 1, 0, "turn.start", turn_id=t0),
+        env("T", t0, 2, 100, "request.start", step=1, attempt=1),
+        env("T", t0, 3, 200, "tool.start", call_id="c1", name="read_file", read_only=True),
+        env("T", t0, 4, 250, "tool.start", call_id="c7", name="write_file", read_only=False),
+        env("T", t0, 5, 300, "item", **item(t0, "a1", assistant)),
+        env("T", t0, 6, 400, "tool.start", call_id="c4", name="list_files", read_only=True),
+        env("T", t0, 7, 450, "permission.asked", call_id="c2", name="read_file", arguments="{}"),
+        env("T", t0, 8, 500, "turn.end", stop="paused", steps=1, pending=["c2"]),
+        env("T", t1, 9, 0, "turn.start", turn_id=t1, resume=resume),
+        env("T", t1, 10, 50, "request.start", step=2, attempt=1),
+        env("T", t1, 11, 60, "tool.start", call_id="c2", name="read_file", read_only=True),
+        env("T", t1, 12, 90, "turn.end", stop="end_turn", steps=2),
+    ]  # fmt: skip
+    replay = data.build_replay(events, [])
+    eager = {seg["call"]: seg["eager"] for seg in replay["lanes"]["tools"]}
+    assert eager == {"c1": True, "c7": False, "c4": False, "c2": False}
+    assert replay["stats"]["eager"] == 1
+
+
+def test_tool_result_cards_say_how_the_result_came_about() -> None:
+    t0, t1 = "T.0", "T.1"
+    names = ("a", "b", "c", "d", "e", "f")
+    assistant = {"role": "assistant", "content": None,
+                 "tool_calls": [call(n, "read_file") for n in names]}  # fmt: skip
+
+    def result_(turn: str, seq: int, id_: str, text: str) -> dict[str, Any]:
+        message = {"role": "tool", "tool_call_id": id_, "content": text}
+        return env("T", turn, seq, seq, "item", **item(turn, f"r{id_}", message))
+
+    resume = {"kind": "approval", "decisions": {"c": "deny"}, "reason": "no"}
+    events = [
+        env("T", t0, 1, 0, "turn.start", turn_id=t0),
+        env("T", t0, 2, 1, "item", **item(t0, "a1", assistant)),
+        env("T", t0, 3, 2, "tool.start", call_id="a", name="read_file", read_only=True),
+        env("T", t0, 4, 3, "tool.end", call_id="a", name="read_file", ok=True),
+        env("T", t0, 5, 4, "tool.start", call_id="b", name="read_file", read_only=True),
+        env("T", t0, 6, 5, "tool.end", call_id="b", name="read_file", ok=False),
+        env("T", t0, 7, 6, "tool.start", call_id="f", name="read_file", read_only=True),
+        env("T", t0, 8, 7, "tool.end", call_id="f", name="read_file", ok=False),
+        env("T", t0, 9, 8, "tool.start", call_id="e", name="read_file", read_only=True),
+        result_(t0, 10, "a", "hello"),
+        result_(t0, 11, "b", "read_file failed: no such file"),
+        result_(t0, 12, "f", "Denied by permission rules: read_file .env"),
+        result_(t0, 13, "d", "Not run: the turn reached its step limit."),
+        env("T", t0, 14, 14, "turn.end", stop="paused", steps=1, pending=["c"]),
+        env("T", t1, 15, 0, "turn.start", turn_id=t1, resume=resume),
+        result_(t1, 16, "c", "Denied by user: no"),
+        result_(t1, 17, "e", "Interrupted: the worker died while it ran."),
+    ]  # fmt: skip
+    cards = data.build_replay(events, [])["cards"]
+    states = {c["call"]: c["state"] for c in cards if c["k"] == "result"}
+    assert states == {"a": "ok", "b": "failed", "f": "denied", "d": "not run", "c": "denied",
+                      "e": "unfinished"}  # fmt: skip
+
+
+def test_scenario_counts_compare_only_what_both_loops_ran(tmp_path: Path) -> None:
+    """B passed S01 and S02, A ran only S01 and passed it: that is a tie, not a win for B."""
+    run = tmp_path / "runs" / "r1"
+    for scenario, impls in (("S01", ("our", "pydantic")), ("S02", ("our",))):
+        for impl in impls:
+            write_json(run / scenario / impl / "result.json", result(scenario, impl, True))
+    html = build.build(runs=run, live=None, metrics=None, now=NOW, discovered=[])
+    assert "Passes more scenarios" not in html
+    assert "Keeps a" not in html  # the byte prefix too: 1 each over the shared scenario
+    assert "Passes as many scenarios: B 1 vs A 1, of the 1 both loops ran." in html
+    assert "too close to call" in html
+
+
+def test_timings_need_a_clear_margin_and_live_runs_more_than_one_sample(out: Path) -> None:
+    metrics = json.loads((out / "metrics.json").read_text())
+    metrics["bench"]["loops"] = {
+        "our_version": {"wall_ms": {"baseline": {"p50": 12.0}, "overhead": {"p50": 3.10, "p95": 5.3}}},
+        "pydantic_version": {"wall_ms": {"baseline": {"p50": 12.0}, "overhead": {"p50": 3.09, "p95": 9.9}}},
+    }  # fmt: skip
+    metrics["deps"]["our_version"]["import_ms"] = 800.0  # within 10% of A's 850
+    write_json(out / "metrics.json", metrics)
+    live = json.loads((out / "live" / "L1" / "our" / "result.json").read_text())
+    for impl, seconds in (("our", 2.6), ("pydantic", 3.3)):  # a second sample
+        write_json(out / "live" / "L2" / impl / "result.json",
+                   {**live, "run_id": "L2", "impl": impl, "duration_ms": seconds * 1000})  # fmt: skip
+    html = make(out)
+    assert "Adds less time on top of the model" not in html
+    assert "the median and the slow tail do not both differ by 10%" in html
+    assert "Starts faster in a fresh process" not in html and "850.0 ms, within 10%" in html
+    # Two live runs, B about 25% faster in both: now a win, stated as a median.
+    assert "Answered faster: median B 2.55 s vs A" in html and "over 2 live runs" in html
+    assert "median B 1,234 vs A 1,234 over 2 live runs, within 10%" in html  # equal tokens
+
+
+def test_metrics_errors_are_shown_not_hidden_or_fatal(out: Path) -> None:
+    metrics = json.loads((out / "metrics.json").read_text())
+    metrics["bench"]["loops"] = {
+        "our_version": {"error": "bench child timed out"},
+        "pydantic_version": {"error": "No module named 'openai'"},
+    }
+    metrics["deps"]["pydantic_version@2.31.1"] = {
+        "distributions": 38, "site_packages_mb": 61.3, "import_ms": None,
+        "import_error": "ModuleNotFoundError: No module named 'bakeoff.pydantic_version.mapping'",
+        "framework_import_ms": 897.8, "turn_error": None,
+        "third_party_code": {"loop_turn": None, "framework_import": {"total": 50000}},
+    }  # fmt: skip
+    write_json(out / "metrics.json", metrics)
+    html = make(out)
+    assert Page(html).problems == []
+    assert "bench child timed out" in html and "No module named &#x27;openai&#x27;" in html
+    # A loop that fails to import shows the error, not the library-only time.
+    assert "bakeoff.pydantic_version.mapping" in html
+    assert "897.8 ms" not in html and "50,000" not in html
+
+
+def test_live_runs_show_steps_apart_from_retried_requests(out: Path) -> None:
+    path = out / "live" / "L1" / "our" / "result.json"
+    write_json(path, {**json.loads(path.read_text()), "requests": 4, "steps": 3,
+                      "latency": {"ttft_ms": 812.5, "total_ms": 2400.0}})  # fmt: skip
+    html = make(out)
+    assert ">steps</span></dt><dd>3</dd>" in html
+    assert "<dt>requests (with retries)</dt><dd>4</dd>" in html
+    assert "<dt>first token</dt><dd>812.5 ms</dd>" in html
+
+
+def test_header_reads_the_driver_summary(out: Path) -> None:
+    write_json(out / "runs" / "r1" / "summary.json", {
+        "v": 1, "run_id": "r1", "git_sha": "0123456789abcdef", "git_dirty": True,
+        "loops": {"our": {"target": "bakeoff.our_version:OurLoop", "versions": {"httpx": "0.28.1"}},
+                  "pydantic": {"target": "bakeoff.pydantic_version:PydanticLoop",
+                               "versions": {"pydantic-ai-slim": "2.31.1", "openai": "2.8.1"}}},
+        "matrix": {"S01": {"our": {"passed": True, "status": "pass", "reason": "ok"}}},
+    })  # fmt: skip
+    html = make(out)
+    assert "git <code>0123456789</code> (with uncommitted changes)" in html
+    assert "bakeoff.our_version:OurLoop, httpx 0.28.1" in html
+    assert "pydantic-ai-slim 2.31.1, openai 2.8.1" in html and "{&#x27;" not in html

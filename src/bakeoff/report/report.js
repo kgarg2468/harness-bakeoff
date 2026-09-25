@@ -27,6 +27,11 @@
   const fmtMs = (ms) =>
     ms == null ? "n/a" : ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : ms < 10 ? `${ms.toFixed(2)} ms` : `${ms.toFixed(1)} ms`;
   const fmtInt = (n) => (n == null ? "n/a" : Math.round(n).toLocaleString("en-US"));
+  // A glossary term drawn by this script: the same dotted underline and tooltip as the page's.
+  function term(key, text) {
+    const [label, definition] = (D.terms || {})[key] || [key, ""];
+    return h("span", { class: "t", tabindex: 0, "data-term": label, "data-tip": definition, text: text ?? label });
+  }
 
   // ---- tooltips: any element with data-tip (and an optional data-term title) -------------
   const tip = $("#tip");
@@ -117,6 +122,12 @@
     ok: "a complete response", cut: "cut short by a cancel", retry: "failed; retried", error: "an error",
     cancel: "cancelled", killed: "the process was killed", open: "no response saved",
   };
+  const LANE_TIP = {
+    model: "One bar per model request (a step): pale while waiting for the first token, solid while the answer streams in.",
+    tools: "One bar per tool run, from start to end. Tools that run at the same time get their own rows.",
+    approval: "◆ the loop asked for an approval; ● the user's answer (green: allowed, red: denied).",
+    git: "● a git commit after a finished turn; ■ a compaction (the history is replaced by a summary).",
+  };
   const GLYPH = { retry: ["↻", "var(--warn)"], error: ["✕", "var(--bad)"], cancel: ["■", "var(--ink)"], killed: ["✕", "var(--bad)"], cut: ["✂", "var(--ink)"] };
 
   function prepare(replay, gap) {
@@ -143,7 +154,7 @@
     const fill = `var(--${color})`;
     for (const [label, y, hh] of [["model", yModel, 14], ["tools", yTools, hTools], ["approval", yPerm, 14], ["git", yGit, 14]]) {
       svg.append(s("rect", { class: "lanebg", x: LEFT, y, width: PW, height: hh }));
-      const text = s("text", { x: LEFT - 6, y: y + 10, "text-anchor": "end" });
+      const text = s("text", { x: LEFT - 6, y: y + 10, "text-anchor": "end", "data-tip": LANE_TIP[label] });
       text.textContent = label;
       svg.append(text);
     }
@@ -186,7 +197,7 @@
       const style = seg.ok ? `fill:${fill};fill-opacity:.55` : seg.ok === false ? "fill:var(--bad);fill-opacity:.75" : "fill:var(--grey)";
       svg.append(s("rect", {
         x: x(t0), y: yTools + 2 + (seg.row || 0) * 9, width: Math.max(1.5, x(t1) - x(t0)), height: 7, rx: 1.5, style,
-        "data-tip": `${seg.name} (${seg.call})\nran ${fmtMs(t1 - t0)} · ${state}${seg.eager ? "\nstarted while the model was still streaming (eager)" : ""}${seg.late ? "\nstarted after the loop's turn.end (late)" : ""}`,
+        "data-tip": `${seg.name} (${seg.call})\nran ${fmtMs(t1 - t0)} · ${state}${seg.eager ? "\nread-only, started while the model was still streaming (eager)" : ""}${seg.late ? "\nstarted after the loop's turn.end (late)" : ""}`,
       }));
     }
     for (const p of lay.replay.lanes.perm) {
@@ -234,6 +245,16 @@
     crash: "Worker killed",
   };
   const STOP_TAG = { end_turn: "ok", error: "bad" };
+  // A tool result's origin: [tag class, label, what it means].
+  const RESULT = {
+    ok: ["ok", "ok", "The tool ran and succeeded."],
+    failed: ["bad", "failed", "The tool ran and reported an error; the model sees the message."],
+    denied: ["warn", "denied", "Denied by the user or by a permission rule: the tool changed nothing."],
+    unfinished: ["bad", "never finished", "The tool started, but its process died before it ended."],
+    "not run": ["nt", "not run", "The loop wrote this result without running the tool, e.g. because the turn reached its step limit or was cancelled."],
+  };
+  // Card titles that are glossary terms.
+  const TITLE_TERM = { result: "tool-result", ask: "approval", retry: "retry", commit: "commit", end: "turn" };
 
   function cardBody(c) {
     switch (c.k) {
@@ -247,12 +268,14 @@
         }
         return parts;
       }
-      case "result":
-        return [h("span", { class: `tag ${c.ok === false ? "bad" : "ok"}`, text: c.ok === false ? "failed" : "ok" }), pre(c.text, 400)];
+      case "result": {
+        const [cls, label, meaning] = RESULT[c.state] || ["nt", c.state || "?", ""];
+        return [h("span", { class: `tag ${cls}`, tabindex: 0, "data-tip": meaning, text: label }), pre(c.text, 400)];
+      }
       case "ask":
         return [pre(c.args, 300)];
       case "resume":
-        if (c.kind === "crash") return [h("div", { text: "Continued from the saved history after the worker was killed." })];
+        if (c.kind === "crash") return [h("div", {}, term("crash-resume", "Continued"), " from the saved history after the worker was killed.")];
         return [
           h("div", {}, ...Object.entries(c.decisions || {}).map(([id, d]) => h("span", { class: `tag ${d === "allow" ? "ok" : "bad"}`, text: `${id}: ${d}` }))),
           c.reason ? h("div", { text: `reason: ${c.reason}` }) : null,
@@ -264,9 +287,10 @@
       case "end": {
         const u = c.usage || {};
         const cost = u.cost_usd ? ` · $${u.cost_usd.toFixed(4)}` : "";
+        const [stopLabel, stopTip] = (D.terms || {}).stop || ["stop reason", ""];
         return [
-          h("span", { class: `tag ${STOP_TAG[c.stop] || "warn"}`, text: c.stop || "?" }),
-          h("span", { class: "muted", text: ` ${c.steps ?? "?"} step${c.steps === 1 ? "" : "s"} · ${fmtInt(u.input_tokens)} in / ${fmtInt(u.output_tokens)} out tokens${cost}` }),
+          h("span", { class: `tag ${STOP_TAG[c.stop] || "warn"}`, tabindex: 0, "data-term": stopLabel, "data-tip": stopTip, text: c.stop || "?" }),
+          h("span", { class: "muted" }, " ", term("step", `${c.steps ?? "?"} step${c.steps === 1 ? "" : "s"}`), " · ", term("tokens", `${fmtInt(u.input_tokens)} in / ${fmtInt(u.output_tokens)} out tokens`), cost),
           c.pending && c.pending.length ? h("div", { text: `waiting for: ${c.pending.join(", ")}` }) : null,
           c.error ? h("div", { class: "bad-t", text: c.error }) : null,
         ];
@@ -281,11 +305,12 @@
   }
 
   function cardEl(c, t) {
-    const title = c.k === "result" || c.k === "ask" ? `${TITLES[c.k]} · ${c.name || "?"}` : TITLES[c.k] || c.k;
+    const name = TITLES[c.k] || c.k;
+    const title = h("b", {}, TITLE_TERM[c.k] ? term(TITLE_TERM[c.k], name) : name, c.k === "result" || c.k === "ask" ? ` · ${c.name || "?"}` : null);
     return h(
       "div",
       { class: `card ${c.k}` },
-      h("div", { class: "ch" }, h("b", { text: title }), h("span", { text: `+${fmtMs(t)}` }), h("span", { text: `turn ${c.turn + 1}` })),
+      h("div", { class: "ch" }, title, h("span", { text: `+${fmtMs(t)}` }), h("span", { text: `turn ${c.turn + 1}` })),
       h("div", { class: "body" }, cardBody(c)),
     );
   }
@@ -303,9 +328,10 @@
     for (const name of ["I1", "I2", "I3", "I5", "I7"]) {
       const v = (run.invariants || {})[name];
       const cls = v == null ? "na" : v.ok ? "ok" : "bad";
+      const [label, definition] = (D.terms || {})[name] || [name, ""];
       head.append(h("span", {
-        class: `inv ${cls}`, tabindex: 0, "data-term": name,
-        "data-tip": `${D.invariantTips[name]}\n\n${v ? v.detail : "not checked in this run"}`,
+        class: `inv ${cls}`, tabindex: 0, "data-term": label,
+        "data-tip": `${definition}\n\n${v ? v.detail : "not checked in this run"}`,
         text: `${v == null ? "–" : v.ok ? "✓" : "✕"} ${name}`,
       }));
     }
@@ -551,12 +577,13 @@
     if (m.status != null) bits.push(`HTTP ${m.status}`);
     if (m.conn_id != null) bits.push(`connection ${m.conn_id}`);
     if (m.t_us != null) bits.push(`server clock ${fmtMs(m.t_us / 1000)}`);
-    const prefix = run.byte_prefix == null ? null : `byte-identical prefix over all requests: ${run.byte_prefix ? "yes" : "no"}`;
+    const cut = req.clipped;
     return [
       loopTag(impl),
       h("div", { class: "mono small", text: bits.join(" · ") }),
       m.error ? h("div", { class: "bad-t small", text: `rejected by the fake server: ${m.error}` }) : null,
-      prefix ? h("div", { class: "small muted", text: prefix }) : null,
+      run.byte_prefix == null ? null : h("div", { class: "small muted" }, term("byte-prefix"), ` over all requests: ${run.byte_prefix ? "yes" : "no"}`),
+      cut ? h("div", { class: "small muted", text: `${cut.strings} long string${cut.strings === 1 ? "" : "s"} cut here (${fmtInt(cut.chars)} characters not shown); the full body is in ${req.file}` }) : null,
     ];
   }
 

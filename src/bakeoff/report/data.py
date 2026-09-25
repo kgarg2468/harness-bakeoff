@@ -99,12 +99,14 @@ def read_json(path: Path) -> tuple[Any, str | None]:
         return None, f"{path.name}: unreadable ({type(exc).__name__}: {exc})"
 
 
-def clip(text: str, limit: int, where: str = "") -> str:
-    """`text` cut to `limit` characters, saying how much is missing and where it is."""
+def clip(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters, saying how much is missing.
+
+    The note depends only on the text, so the same text clips the same way wherever it was
+    recorded (the wire diff compares clipped strings)."""
     if len(text) <= limit:
         return text
-    rest = f"; the full text is in {where}" if where else ""
-    return f"{text[:limit]}\n…[{len(text) - limit:,} more characters not shown{rest}]"
+    return f"{text[:limit]}\n…[{len(text) - limit:,} more characters not shown]"
 
 
 def natural_key(name: str) -> list[Any]:
@@ -337,12 +339,55 @@ def _reasoning(message: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _item_card(item: dict[str, Any], names: dict[str, str], ok: dict[str, bool]) -> dict:
+@dataclass(slots=True)
+class _Calls:
+    """What the whole replay knows about each tool call, gathered before the turns are walked:
+    a result card or a later turn may refer to a call from an earlier turn."""
+
+    names: dict[str, str]  # call id -> tool name
+    ok: dict[str, bool]  # call id -> its tool.end's ok (only calls that ran to the end)
+    started: set[str]  # calls with a tool.start
+    denied: set[str]  # calls the user denied on an approval resume
+    saved: set[str]  # calls whose assistant item is saved so far (grows during the walk)
+
+    @classmethod
+    def scan(cls, events: list[dict[str, Any]]) -> _Calls:
+        calls = cls({}, {}, set(), set(), set())
+        for e in events:
+            data = e.get("data") or {}
+            call = data.get("call_id")
+            if e.get("type") in ("tool_call.ready", "tool.start", "permission.asked"):
+                calls.names.setdefault(call, data.get("name"))
+            if e.get("type") == "tool.start":
+                calls.started.add(call)
+            elif e.get("type") == "tool.end":
+                calls.ok[call] = bool(data.get("ok"))
+            elif e.get("type") == "turn.start":
+                decisions = (data.get("resume") or {}).get("decisions") or {}
+                calls.denied |= {c for c, d in decisions.items() if d == "deny"}
+        return calls
+
+    def state(self, call: str | None, text: str) -> str:
+        """How a tool result came about: ok, failed, denied, unfinished (started, never ended)
+        or not run (the loop wrote the result without running the tool, e.g. at a step limit).
+        """
+        if call in self.ok:
+            if self.ok[call]:
+                return "ok"
+            # A permission rule's deny goes through ToolHost.run() and fails there.
+            return "denied" if text.startswith("Denied") else "failed"
+        # A user's deny never runs the tool (contract rule 5).
+        if call in self.denied or text.startswith("Denied by user"):
+            return "denied"
+        return "unfinished" if call in self.started else "not run"
+
+
+def _item_card(item: dict[str, Any], calls: _Calls) -> dict:
     message = item.get("message") or {}
     role = message.get("role")
     text = clip(_text(message.get("content")), CARD_LIMIT)
     if role == "assistant":
-        calls = [
+        tool_calls = [
             {
                 "id": c.get("id"),
                 "name": (c.get("function") or {}).get("name"),
@@ -351,7 +396,7 @@ def _item_card(item: dict[str, Any], names: dict[str, str], ok: dict[str, bool])
             for c in message.get("tool_calls") or []
             if isinstance(c, dict)
         ]
-        card = {"k": "assistant", "text": text, "calls": calls}
+        card = {"k": "assistant", "text": text, "calls": tool_calls}
         if reasoning := _reasoning(message):
             card["reasoning"] = clip(reasoning, CARD_LIMIT)
         if item.get("status") == "incomplete":
@@ -362,8 +407,8 @@ def _item_card(item: dict[str, Any], names: dict[str, str], ok: dict[str, bool])
         return {
             "k": "result",
             "call": call,
-            "name": names.get(call),
-            "ok": ok.get(call),
+            "name": calls.names.get(call),
+            "state": calls.state(call, _text(message.get("content"))),
             "text": text,
         }
     if item.get("compaction"):
@@ -421,14 +466,7 @@ def build_replay(events: list[dict[str, Any]], turns: list[dict[str, Any]]) -> d
     by_turn: dict[str, list[dict]] = {}
     for e in events:
         by_turn.setdefault(e.get("turn"), []).append(e)
-    names: dict[str, str] = {}
-    ok: dict[str, bool] = {}
-    for e in events:  # names and outcomes first: a result card needs its call's tool
-        data = e.get("data") or {}
-        if e.get("type") in ("tool_call.ready", "tool.start", "permission.asked"):
-            names.setdefault(data.get("call_id"), data.get("name"))
-        elif e.get("type") == "tool.end":
-            ok[data.get("call_id")] = bool(data.get("ok"))
+    calls = _Calls.scan(events)
     replay: dict[str, Any] = {
         "turns": [],
         "lanes": {"model": [], "tools": [], "perm": [], "git": []},
@@ -441,7 +479,7 @@ def build_replay(events: list[dict[str, Any]], turns: list[dict[str, Any]]) -> d
         late = [x for x in row.get("late") or [] if isinstance(x, dict)]
         kind = row.get("kind") or _guess_kind(evs)
         span = max([_ms(e.get("t_us")) for e in evs] + [_ms(x.get("t_us")) for x in late] + [0.0])
-        turn = _TurnWalk(ti, replay, names, ok).run(evs, late)
+        turn = _TurnWalk(ti, replay, calls).run(evs, late)
         if kind in _LOOP_KINDS and evs and not turn["ended"]:
             # The worker died mid-turn (a crash scenario kills it on purpose).
             replay["cards"].append({"turn": ti, "t": span, "k": "crash"})
@@ -462,17 +500,14 @@ class _TurnWalk:
     """Turns one turn's events into lane segments and cards (see `build_replay`). Each event
     type has an `on_<type>` handler; times are ms since the turn started."""
 
-    def __init__(
-        self, ti: int, replay: dict[str, Any], names: dict[str, str], ok: dict[str, bool]
-    ) -> None:
-        self.ti, self.names, self.ok = ti, names, ok
+    def __init__(self, ti: int, replay: dict[str, Any], calls: _Calls) -> None:
+        self.ti, self.calls = ti, calls
         self.lanes: dict[str, list[dict]] = replay["lanes"]
         self.cards: list[dict] = replay["cards"]
         self.stats: dict[str, int] = replay["stats"]
         self.req: dict | None = None  # the model request being streamed
         self.by_step: dict[Any, dict] = {}  # step -> its latest request (usage arrives late)
         self.started: dict[str, dict] = {}  # call id -> a tool run without its tool.end yet
-        self.saved_calls: set[str] = set()  # calls whose assistant item is already saved
         self.tools: list[dict] = []
         self.usage = {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "cost_usd": 0.0}
         self.ended, self.stop = False, None
@@ -545,16 +580,23 @@ class _TurnWalk:
         message = item.get("message") or {}
         if message.get("role") == "assistant":
             self.close(t, "cut" if item.get("status") == "incomplete" else "ok")
-            self.saved_calls.update(c.get("id") for c in message.get("tool_calls") or [])
-        self.card(t, _item_card(item, self.names, self.ok))
+            self.calls.saved.update(c.get("id") for c in message.get("tool_calls") or [])
+        self.card(t, _item_card(item, self.calls))
         if item.get("compaction"):
             self.lanes["git"].append({"turn": self.ti, "t": t, "kind": "compact"})
 
     def on_tool_start(self, t: float, data: dict, is_late: bool) -> None:
         call = data.get("call_id")
         self.stats["tool_runs"] += 1
-        # Started before the model finished the message that holds the call: an eager run.
-        eager = call not in self.saved_calls and not is_late
+        # Eager: a read-only tool started while the model still streams the message that holds
+        # its call. A call saved in an earlier turn (it runs after an approval or a crash
+        # resume) or started after the stream ended is not eager, whatever its turn.
+        eager = (
+            not is_late
+            and self.req is not None
+            and bool(data.get("read_only"))
+            and call not in self.calls.saved
+        )
         self.stats["eager"] += eager
         self.started[call] = {"turn": self.ti, "t0": t, "t1": t, "name": data.get("name"),
                               "call": call, "eager": eager, "late": is_late}  # fmt: skip
@@ -584,7 +626,7 @@ class _TurnWalk:
                 "t": t,
                 "kind": decision,
                 "call": call,
-                "name": self.names.get(call),
+                "name": self.calls.names.get(call),
             }
             self.lanes["perm"].append(perm)
         self.card(t, {"k": "resume", "kind": resume.get("kind"), "decisions": decisions,
@@ -627,19 +669,26 @@ def find_wire_dir(wire: Path, scenario: str, run_id: str, impl: str) -> Path | N
     return next((c for c in candidates if c.name == impl), candidates[0] if candidates else None)
 
 
-def _clip_deep(value: Any, where: str) -> Any:
+def _clip_deep(value: Any, cuts: list[int]) -> Any:
+    """`value` with every long string clipped; appends the cut length to `cuts` for each.
+
+    The clip note names no file: two loops that sent the same long string must still compare
+    (and pool) as equal. The request entry says where the full body is."""
     if isinstance(value, str):
-        return clip(value, WIRE_LIMIT, where)
+        if len(value) > WIRE_LIMIT:
+            cuts.append(len(value) - WIRE_LIMIT)
+        return clip(value, WIRE_LIMIT)
     if isinstance(value, list):
-        return [_clip_deep(v, where) for v in value]
+        return [_clip_deep(v, cuts) for v in value]
     if isinstance(value, dict):
-        return {k: _clip_deep(v, where) for k, v in value.items()}
+        return {k: _clip_deep(v, cuts) for k, v in value.items()}
     return value
 
 
-def encode_body(body: Any, pool: Pool, where: str) -> Any:
-    """A request body with its messages and tool list moved into `pool` (key order kept)."""
-    body = _clip_deep(body, where)
+def encode_body(body: Any, pool: Pool, cuts: list[int]) -> Any:
+    """A request body with long strings clipped (counted in `cuts`) and its messages and tool
+    list moved into `pool` (key order kept)."""
+    body = _clip_deep(body, cuts)
     if not isinstance(body, dict):
         return body
     out = {}
@@ -661,17 +710,19 @@ def wire_requests(directory: Path, pool: Pool, run_dir: Path) -> list[dict[str, 
         raw = path.read_bytes()
         meta, _ = read_json(path.with_name(f"{path.stem}.meta.json"))
         meta = meta if isinstance(meta, dict) else {}
-        where = path.relative_to(run_dir.parent.parent).as_posix()
         entry: dict[str, Any] = {
             "n": int(path.stem),
-            "file": where,
+            "file": path.relative_to(run_dir.parent.parent).as_posix(),
             "bytes": len(raw),
             "meta": {k: meta[k] for k in ("status", "conn_id", "t_us", "error") if k in meta},
         }
+        cuts: list[int] = []
         try:
-            entry["body"] = encode_body(json.loads(raw), pool, where)
+            entry["body"] = encode_body(json.loads(raw), pool, cuts)
         except ValueError:
-            entry["raw"] = clip(raw.decode("utf-8", "replace"), WIRE_LIMIT, where)
+            entry["raw"] = _clip_deep(raw.decode("utf-8", "replace"), cuts)
+        if cuts:  # the page says how much is missing and in which file the full body is
+            entry["clipped"] = {"strings": len(cuts), "chars": sum(cuts)}
         out.append(entry)
     return out
 
@@ -679,8 +730,8 @@ def wire_requests(directory: Path, pool: Pool, run_dir: Path) -> list[dict[str, 
 # --- live runs and metrics ----------------------------------------------------------------
 
 _LIVE_KEYS = (
-    "run_id", "impl", "model", "stops", "requests", "tool_runs", "usage", "duration_ms",
-    "passed", "error", "invariants",
+    "run_id", "impl", "model", "base_url", "stops", "steps", "requests", "tool_runs", "usage",
+    "latency", "duration_ms", "passed", "error", "invariants",
 )  # fmt: skip
 
 

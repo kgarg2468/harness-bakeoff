@@ -1,8 +1,10 @@
 """Build `out/report.html`: one self-contained page (inline CSS, JS and data; no external
 assets), readable from file:// or over HTTP.
 
-    bakeoff report                       # out/runs/latest + out/live/* + out/metrics.json
+    python -m bakeoff.report.build       # out/runs/latest + out/live/* + out/metrics.json
     python -m bakeoff.report.build --out-dir out -o out/report.html
+
+`main(argv)` is ready to be the `bakeoff report` subcommand.
 
 The same inputs give the same bytes, except the "generated" timestamp (set `SOURCE_DATE_EPOCH`
 to pin it). The page stays under ~2 MB: long texts are cut with an expand control, and if the
@@ -138,7 +140,7 @@ def build(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """`bakeoff report`: write the page and say what went into it."""
+    """Write the page and say where it went (the `bakeoff report` command, once wired)."""
     parser = argparse.ArgumentParser(
         prog="bakeoff report", description="Build the comparison report (one HTML file)."
     )

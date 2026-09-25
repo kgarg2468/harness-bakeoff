@@ -8,12 +8,13 @@ Everything shown comes from the data passed in; every text goes through `esc`.
 from __future__ import annotations
 
 import html
+import itertools
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
-from bakeoff.report.data import impl_of_package, impl_order, loop_info
+from bakeoff.report.data import WIRE_LIMIT, impl_of_package, impl_order, loop_info
 
 REPO_URL = "https://github.com/kgarg2468/harness-bakeoff/blob/main"
 
@@ -41,7 +42,7 @@ GLOSSARY: dict[str, tuple[str, str]] = {
     ),
     "ported": (
         "ported",
-        "Lines copied or translated from another open-source agent (Pi, OpenCode) under an MIT or Apache-2.0 licence. Each such file says so at its top. We still own and maintain them.",
+        "Lines copied or translated from another MIT-licensed open-source project (Pi, OpenCode, RocketRide). Each such file says so at its top and in THIRD_PARTY_NOTICES.md. We still own and maintain them.",
     ),
     "dependency": (
         "dependency",
@@ -78,6 +79,18 @@ GLOSSARY: dict[str, tuple[str, str]] = {
         "fake model server",
         "A local stand-in for OpenRouter that plays back scripted answers and records every request. No real model, no internet.",
     ),
+    "openrouter": (
+        "OpenRouter",
+        "A service that forwards one OpenAI-style API to many model providers. The fake model server imitates it.",
+    ),
+    "session-log": (
+        "session log",
+        "The SQLite file the shared runner writes for each conversation: every event and every history item, in order. The replay is drawn from it.",
+    ),
+    "working-copy": (
+        "working copy",
+        "The folder of files the agent reads and edits in a scenario. It is a git repository, so every turn can be committed and undone.",
+    ),
     "turn": (
         "turn",
         "One round: the user says something and the loop works until it answers, pauses for an approval, is cancelled or hits a limit.",
@@ -92,7 +105,11 @@ GLOSSARY: dict[str, tuple[str, str]] = {
     ),
     "tool-result": (
         "tool result",
-        "What a tool returned. It goes back to the model in the next request.",
+        "What a tool returned. It goes back to the model in the next request. A denied call, or one cut off by a limit, still gets a result that says so, without the tool running.",
+    ),
+    "tool-run": (
+        "tool run",
+        "One execution of a tool. A call that was denied, or cut off by a limit, has a result but no run.",
     ),
     "approval": (
         "approval",
@@ -280,8 +297,8 @@ def status_badge(status: str) -> str:
     """A PASS/FAIL/XFAIL badge with an icon and a definition (never colour alone)."""
     icon = {"pass": "✓", "fail": "✕", "xfail": "≈", "xpass": "!", "none": "–"}[status]
     return (
-        f'<span class="st {status}" tabindex="0" data-tip="{esc(STATUS_TIP[status])}">'
-        f"{icon} {STATUS_LABEL[status]}</span>"
+        f'<span class="st {status}" tabindex="0" data-term="{esc(STATUS_LABEL[status])}" '
+        f'data-tip="{esc(STATUS_TIP[status])}">{icon} {STATUS_LABEL[status]}</span>'
     )
 
 
@@ -366,17 +383,35 @@ def make_cell(
 # --- header ---------------------------------------------------------------------------------
 
 
+def _flatten(value: Any) -> list[str]:
+    """A summary's loop entry as short "name version" texts; nested dicts (the driver's
+    `versions`) are flattened, and a `target` or `class` shows as itself."""
+    if not isinstance(value, dict):
+        return [str(value)]
+    out = []
+    for key, item in value.items():
+        if key in ("file", "path") or item in (None, "", {}, []):
+            continue
+        if isinstance(item, dict):
+            out += _flatten(item)
+        else:
+            out.append(str(item) if key in ("target", "class") else f"{key} {item}")
+    return out
+
+
 def header(page: Page, generated: str) -> str:
     """The run's identity: run id, git commit, loop versions, data sources."""
     summary = page.summary
+    # Two shapes: {"git": {"sha", "dirty"}} or the driver's top-level git_sha and git_dirty.
     git = summary.get("git") if isinstance(summary.get("git"), dict) else {}
     sha = git.get("sha") or summary.get("git_sha") or summary.get("sha")
+    dirty = git.get("dirty") if git else summary.get("git_dirty")
     facts = []
     if page.run:
         facts.append(f"scenario run <code>{esc(page.run['run_id'])}</code>")
     if sha:
-        dirty = " (with uncommitted changes)" if git.get("dirty") else ""
-        facts.append(f"git <code>{esc(str(sha)[:10])}</code>{dirty}")
+        note = " (with uncommitted changes)" if dirty else ""
+        facts.append(f"git <code>{esc(str(sha)[:10])}</code>{note}")
     metrics_git = ((page.metrics or {}).get("git") or {}).get("sha")
     if metrics_git:
         facts.append(f"metrics from <code>{esc(str(metrics_git)[:10])}</code>")
@@ -385,13 +420,7 @@ def header(page: Page, generated: str) -> str:
     versions = []
     if isinstance(loops, dict):
         for impl in sorted(loops, key=impl_order):
-            value = loops[impl]
-            if isinstance(value, dict):
-                shown = ", ".join(
-                    f"{k} {v}" for k, v in value.items() if k not in ("file", "path") and v
-                )
-            else:
-                shown = str(value)
+            shown = ", ".join(_flatten(loops[impl]))
             versions.append(f"<li>{chip(impl)} <span class='mono small'>{esc(shown)}</span></li>")
     sources = [
         ("scenario runs", page.run is not None),
@@ -413,8 +442,9 @@ def header(page: Page, generated: str) -> str:
     return f"""
 <div class="intro">
   <p class="lede">The same agent {term("harness")} built twice: <b>A</b> on {term("pydantic-ai")},
-  <b>B</b> as our own lean {term("loop")}. Everything else is {term("shared", "shared")} and identical,
-  so every number below is about the loop only. This page shows evidence; it names no overall winner.</p>
+  <b>B</b> as our own {term("loop")}, written without an agent framework. Everything else is
+  {term("shared", "shared")} and identical, so every number below is about the loop only. This page
+  shows evidence; it names no overall winner.</p>
   <p class="meta">{" · ".join(facts)}</p>
   {f'<ul class="versions">{"".join(versions)}</ul>' if versions else ""}
   <p class="meta">Data found: {found}</p>
@@ -488,11 +518,11 @@ def _score_cells(page: Page, impl: str) -> list[str]:
         p95 = f"<span class='muted small'>p95 {fmt_ms(over.get('p95'))}</span>"
         cells.append(f"<b>{fmt_ms(over['p50'])}</b> {p95}")
     elif error:
-        cells.append(f'<span class="bad-t" tabindex="0" data-tip="{esc(error)}">error</span>')
+        cells.append(_error_cell(error))
     else:
         cells.append(_MISSING)
     passed, xfail, total = passed_counts(page, impl)
-    xfails = f' <span class="muted small">+{xfail} XFAIL</span>' if xfail else ""
+    xfails = f' <span class="muted small">+{xfail} {term("xfail")}</span>' if xfail else ""
     cells.append(
         f"<b>{passed} / {total}</b>{xfails}" if total else '<span class="muted">no runs</span>'
     )
@@ -589,21 +619,23 @@ def loc_figure(page: Page) -> str:
     )
     if not loc:
         return intro + _empty("Not measured yet.", "uv run python -m bakeoff.metrics.collect")
+
+    def bar(label: str, color: str, entry: dict[str, Any]) -> _Bar:
+        ported = {k: (v or {}).get("code", 0) for k, v in (entry.get("ported") or {}).items()}
+        note = ", ".join(f"{n:,} ported from {k}" for k, n in sorted(ported.items()))
+        return _Bar(label, color, entry.get("total") or {}, sum(ported.values()), note)
+
     bars = []
     for impl in page.loops:
-        if (entry := _loc_for(page, impl)) is None:
-            continue
-        info = loop_info(impl)
-        ported = {k: (v or {}).get("code", 0) for k, v in (entry.get("ported") or {}).items()}
-        note = ", ".join(f"{n} ported from {k}" for k, n in sorted(ported.items()))
-        label = f"{info.letter} {info.label}"
-        bars.append(_Bar(label, info.color, entry.get("total") or {}, sum(ported.values()), note))
+        if (entry := _loc_for(page, impl)) is not None:
+            info = loop_info(impl)
+            bars.append(bar(f"{info.letter} {info.label}", info.color, entry))
     if shared := loc.get("shared"):
-        bars.append(_Bar("shared (once)", "grey", shared.get("total") or {}, 0, ""))
+        bars.append(bar("shared (once)", "grey", shared))
     if not bars:
         return intro + _empty("No loop package has line counts yet.", "")
     lines = [sum((bar.counts.get(k) or 0) for k, *_ in _KINDS) for bar in bars]
-    scale = max(*lines, 1)
+    scale = max(lines, default=0) or 1
     width, left, plot, row_h, bar_h = 760, 130, 470, 34, 18
     svg = [
         f'<svg class="chart" viewBox="0 0 {width} {row_h * len(bars) + 8}" role="img" '
@@ -649,7 +681,11 @@ def loc_figure(page: Page) -> str:
     rows = "".join(
         f"<tr><th>{esc(bar.label)}</th>"
         + "".join(f"<td>{fmt_int(bar.counts.get(k))}</td>" for k, *_ in _KINDS)
-        + f"<td>{fmt_int(bar.ported) if bar.ported else '–'}</td>"
+        + (
+            f"<td data-tip='{esc(bar.note)}'>{fmt_int(bar.ported)}</td>"
+            if bar.ported
+            else "<td>–</td>"
+        )
         + f"<td>{fmt_int(bar.counts.get('files'))}</td></tr>"
         for bar in bars
     )
@@ -693,23 +729,33 @@ def _empty(text: str, command: str) -> str:
 _ALONE = "<span class='muted' data-tip='The library alone: this loop is not in the measured checkout yet.'>*</span>"
 
 
+def _error_cell(error: str) -> str:
+    return f'<span class="bad-t" tabindex="0" data-tip="{esc(error)}">error</span>'
+
+
 def _import_cell(d: dict[str, Any]) -> str:
-    """The loop's cold import time; the library's alone (marked *) when the loop is not in the
-    measured checkout (its package still empty); "error" with the reason on hover."""
+    """The loop's cold import time; "error" with the reason on hover; the library's alone
+    (marked *) only when the loop is not in the measured checkout: metrics leaves `import_ms`
+    empty without an error exactly when the package exports no loop yet."""
     if d.get("import_ms") is not None:
         return fmt_ms(d["import_ms"])
+    if error := d.get("import_error"):  # a loop that is there but fails to import
+        return _error_cell(error)
     if d.get("framework_import_ms") is not None:
         return f"{fmt_ms(d['framework_import_ms'])}{_ALONE}"
-    if error := d.get("import_error") or d.get("framework_import_error"):
-        return f'<span class="bad-t" tabindex="0" data-tip="{esc(error)}">error</span>'
+    if error := d.get("framework_import_error"):
+        return _error_cell(error)
     return "n/a"
 
 
 def _third_party_cell(d: dict[str, Any]) -> str:
-    """Third-party code lines loaded after one turn (or by the library's import alone)."""
+    """Third-party code lines loaded after one turn; "error" if the import or the turn failed;
+    the library's import alone (marked *) when the loop is not in the measured checkout."""
     code = d.get("third_party_code") or {}
     if (turn := (code.get("loop_turn") or {}).get("total")) is not None:
         return fmt_int(turn)
+    if error := d.get("import_error") or d.get("turn_error"):
+        return _error_cell(error)
     if (alone := (code.get("framework_import") or {}).get("total")) is not None:
         return f"{fmt_int(alone)}{_ALONE}"
     return "n/a"
@@ -770,7 +816,7 @@ def overhead_figure(page: Page) -> str:
         for impl, b in entries
         if _overhead(page, impl).get("p50") is not None
     ]
-    scale = max(*totals, 1e-9)
+    scale = max(totals, default=0.0) or 1e-9  # every entry may be an error: nothing to scale
     width, left, plot, row_h, bar_h = 520, 110, 210, 34, 16
     svg = [
         f'<svg class="chart" viewBox="0 0 {width} {row_h * len(entries) + 8}" role="img" '
@@ -847,9 +893,16 @@ def fit_figure(page: Page) -> str:
 
 def matrix(page: Page) -> str:
     """Section 2: scenario × loop, PASS/FAIL/XFAIL with the one-line reason."""
+    invariants = ", ".join(term(name, name) for name in INVARIANTS)
     intro = (
-        f"<p class='lede'>Every {term('scenario')} against every loop, on the {term('fakeprov')}. "
-        f"Pass or fail is judged only from the {term('wire')} recordings and the session log. "
+        f"<p class='lede'>Every {term('scenario')} against every loop, on the {term('fakeprov')} "
+        f"(it imitates {term('openrouter')}); pipeline tools answer from a {term('mock-engine')}. "
+        f"The scenarios cover {term('tool-call', 'tool calls')} and their "
+        f"{term('tool-result', 'results')}, {term('approval', 'approvals')}, "
+        f"{term('retry', 'retries')}, {term('cancel')}, {term('crash-resume')}, "
+        f"{term('compaction')} and {term('revert')}. A cell passes when every final check of "
+        f"the scenario and all five {term('invariant', 'invariants')} ({invariants}) hold, "
+        f"judged only from the {term('wire')} recordings and the {term('session-log')}. "
         "Click a cell to replay that scenario below.</p>"
     )
     if not page.scenarios:
@@ -912,10 +965,11 @@ def replay(page: Page) -> str:
     """Section 3's controls; report.js draws the lanes and the transcript cards."""
     intro = (
         f"<p class='lede'>Two loops, one scenario, one time axis. {term('lane', 'Lanes')} show when each "
-        f"loop waits for the model, streams, runs tools, asks for an {term('approval')} and makes a git "
-        f"{term('commit')}. Drag the scrubber or press play; the cards below each timeline are the "
-        f"transcript up to that moment. Idle time between {term('turn', 'turns')} (a user deciding, "
-        "a new process starting) is cut, the same way for both loops.</p>"
+        f"loop waits for the model during a {term('step')}, streams, runs tools, asks for an "
+        f"{term('approval')} and makes a git {term('commit')} of the {term('working-copy')}. Drag the "
+        "scrubber or press play; the cards below each timeline are the transcript up to that moment, "
+        f"each turn ending with its {term('stop')}. Idle time between {term('turn', 'turns')} (a user "
+        "deciding, a new process starting) is cut, the same way for both loops.</p>"
     )
     if not page.scenarios:
         return intro + _empty("Nothing to replay yet.", "bakeoff scenario --all")
@@ -948,7 +1002,10 @@ def wire(page: Page) -> str:
         f"<p class='lede'>The exact {term('request-body', 'request bodies')} each loop sent for the "
         f"scenario chosen above, side by side. Changed lines are highlighted, identical stretches "
         f"folded. Compare request 2 of S10a to see how each loop re-sends {term('reasoning-details')}; "
-        f"key order and added fields matter for a {term('prompt-cache')}.</p>"
+        f"key order and added fields matter for a {term('prompt-cache')}, which needs a "
+        f"{term('byte-prefix')}. Each request also shows the network connection that carried it "
+        f"({term('connection')}). Strings over {WIRE_LIMIT:,} characters are cut the same way for "
+        "both loops; the header names the file with the full body.</p>"
     )
     if not page.scenarios:
         return intro + _empty("No wire recordings yet.", "bakeoff scenario --all")
@@ -991,22 +1048,34 @@ def live(page: Page) -> str:
                 if isinstance(r.get("tool_runs"), dict)
                 else None
             )
+            # `steps` counts first attempts only; `requests` adds retries (older results have
+            # only `requests`, which is the same number when nothing was retried).
+            steps, requests = r.get("steps", r.get("requests")), r.get("requests")
+            first_token = (r.get("latency") or {}).get("ttft_ms")
             stats = [
-                ("latency", fmt_ms(r.get("duration_ms"))),
-                ("steps", fmt_int(r.get("requests"))),
-                ("tool runs", fmt_int(tools)),
-                ("input tokens", fmt_int(usage.get("input_tokens"))),
-                ("output tokens", fmt_int(usage.get("output_tokens"))),
-                ("cached tokens", fmt_int(usage.get("cached_tokens"))),
+                (term("latency"), fmt_ms(r.get("duration_ms"))),
+                *([("first token", fmt_ms(first_token))] if first_token is not None else []),
+                (term("step", "steps"), fmt_int(steps)),
+                *(
+                    [("requests (with retries)", fmt_int(requests))]
+                    if requests is not None and requests != steps
+                    else []
+                ),
+                (term("tool-run", "tool runs"), fmt_int(tools)),
+                (term("tokens", "input tokens"), fmt_int(usage.get("input_tokens"))),
+                (term("tokens", "output tokens"), fmt_int(usage.get("output_tokens"))),
+                (term("prompt-cache", "cached tokens"), fmt_int(usage.get("cached_tokens"))),
                 ("cost", _cost(cost, usage.get("cost_source"))),
             ]
-            dl = "".join(f"<div><dt>{esc(k)}</dt><dd>{v}</dd></div>" for k, v in stats)
+            dl = "".join(f"<div><dt>{k}</dt><dd>{v}</dd></div>" for k, v in stats)
             error = f'<p class="bad-t small">error: {esc(r["error"])}</p>' if r.get("error") else ""
             stops = ", ".join(map(str, r.get("stops") or []))
+            stop = f" · {term('stop', 'stop')} {esc(stops)}" if stops else ""
             cols.append(
-                f'<div class="live-col"><div class="lh">{chip(impl)} <span class="mono small muted">{esc(r.get("model") or "")}'
-                f'{" · stop " + esc(stops) if stops else ""}</span></div><dl class="stats">{dl}</dl>{error}'
-                f'<div class="answer"><div class="k">final answer</div>{_expandable(r.get("final_text") or "", 700)}</div></div>'
+                f'<div class="live-col"><div class="lh">{chip(impl)} <span class="mono small muted">'
+                f"{esc(r.get('model') or '')}{_endpoint(r.get('base_url'))}{stop}</span></div>"
+                f'<dl class="stats">{dl}</dl>{error}<div class="answer"><div class="k">final answer</div>'
+                f"{_expandable(r.get('final_text') or '', 700)}</div></div>"
             )
         out.append(
             f'<div class="fig live"><div class="small muted">live run <code>{esc(run["run_id"])}</code></div>'
@@ -1018,9 +1087,21 @@ def live(page: Page) -> str:
 
 def _cost(cost: float | None, source: str | None) -> str:
     """A cost with where it came from; "unknown" when the provider reported none."""
+    where = term("cost-source", source or "n/a")
     if source in (None, "none") or cost is None:
-        return f"unknown <span class='muted small'>({esc(source or 'n/a')})</span>"
-    return f"{fmt_usd(cost)} <span class='muted small'>({esc(source)})</span>"
+        return f"unknown <span class='muted small'>({where})</span>"
+    return f"{fmt_usd(cost)} <span class='muted small'>({where})</span>"
+
+
+def _endpoint(base_url: str | None) -> str:
+    """ " · via OpenRouter" or " · BYOK api.openai.com": where a live run's requests went."""
+    if not base_url:
+        return ""
+    # The host only: never a path, a query or a user:password@ part.
+    host = base_url.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0].rsplit("@", 1)[-1]
+    if "openrouter" in host:
+        return f" · via {term('openrouter')}"
+    return f" · {term('byok')} {esc(host)}"
 
 
 def _expandable(text: str, preview: int) -> str:
@@ -1037,45 +1118,86 @@ def _expandable(text: str, preview: int) -> str:
 
 # --- 6. where each wins -----------------------------------------------------------------------
 
+TIMING_MARGIN = 0.10  # a timing is a win only when it is at least 10% better: less is noise
+MIN_LIVE_SAMPLES = 2  # one live run is an anecdote: run order and prompt caches swing it
 
-def evidence(page: Page) -> dict[str, dict[str, Any]]:
-    """Per loop, facts gathered from the runs: passes, eager tool starts, byte-identical
-    prefixes, and connections opened where every loop sent the same number of requests."""
-    out: dict[str, dict[str, Any]] = {}
-    for impl in page.loops:
-        facts = dict.fromkeys(
-            ("passed", "total", "eager", "byte_ok", "multi", "requests", "conns"), 0
+
+class Claim(NamedTuple):
+    """One comparison in section 6. `winner` is None when it is too close to call."""
+
+    winner: str | None
+    text: str  # HTML
+    link: str  # the figure or cell that is its evidence
+
+
+@dataclass(slots=True)
+class Evidence:
+    """Counts from the scenario runs, taken only over scenarios every compared loop ran, so a
+    loop never loses a count for having run fewer scenarios."""
+
+    loops: list[str]  # the loops with at least one scenario result: the ones compared
+    common: int = 0  # scenarios all of them ran
+    replayed: int = 0  # ... of which every loop has a replay (eager starts are counted there)
+    multi: int = 0  # ... in which every loop sent 2+ requests (a prefix can be compared)
+    same_requests: int = 0  # ... in which every loop sent the same number of requests
+    facts: dict[str, dict[str, int]] = field(default_factory=dict)  # impl -> counts
+
+
+def evidence(page: Page) -> Evidence:
+    """Per loop: passes, eager tool starts, byte-identical prefixes, and connections opened (the
+    last only where every loop sent the same number of requests)."""
+
+    def status(s: dict[str, Any], impl: str) -> str:
+        return (page.cells[s["id"]].get(impl) or {}).get("status", "none")
+
+    ran = [i for i in page.loops if any(status(s, i) != "none" for s in page.scenarios)]
+    keys = ("passed", "eager", "byte_ok", "requests", "conns")
+    ev = Evidence(ran, facts={i: dict.fromkeys(keys, 0) for i in ran})
+    if len(ran) < 2:
+        return ev
+    for s in page.scenarios:
+        if any(status(s, i) == "none" for i in ran):
+            continue
+        runs = {i: s["runs"].get(i) or {} for i in ran}
+        i1 = {
+            i: (((r.get("result") or {}).get("invariants") or {}).get("I1") or {}).get("info") or {}
+            for i, r in runs.items()
+        }
+        replays = {i: r.get("replay") for i, r in runs.items()}
+        wire = {i: r.get("wire") or [] for i, r in runs.items()}
+        multi = all((i1[i].get("requests") or 0) >= 2 for i in ran)
+        same = (
+            len({len(w) for w in wire.values()}) == 1
+            and all(wire.values())
+            and all(r["meta"].get("conn_id") is not None for w in wire.values() for r in w)
         )
-        for s in page.scenarios:
-            run = s["runs"].get(impl)
-            if not run or (page.cells[s["id"]].get(impl) or {}).get("status", "none") == "none":
-                continue
-            facts["total"] += 1
-            facts["passed"] += page.cells[s["id"]][impl]["status"] in ("pass", "xpass")
-            facts["eager"] += ((run.get("replay") or {}).get("stats") or {}).get("eager", 0)
-            i1 = (((run.get("result") or {}).get("invariants") or {}).get("I1") or {}).get("info")
-            if ((i1 or {}).get("requests") or 0) >= 2:
-                facts["multi"] += 1
-                facts["byte_ok"] += bool(i1.get("byte_prefix"))
-            wire_reqs = run.get("wire") or []
-            if (
-                wire_reqs
-                and len({len((s["runs"].get(i) or {}).get("wire") or []) for i in page.loops}) == 1
-            ):
-                facts["requests"] += len(wire_reqs)
-                facts["conns"] += len({r["meta"].get("conn_id") for r in wire_reqs} - {None})
-        out[impl] = facts
-    return out
+        ev.common += 1
+        ev.replayed += all(replays.values())
+        ev.multi += multi
+        ev.same_requests += same
+        for i in ran:
+            facts = ev.facts[i]
+            facts["passed"] += status(s, i) in ("pass", "xpass")
+            if all(replays.values()):
+                facts["eager"] += (replays[i].get("stats") or {}).get("eager", 0)
+            if multi:
+                facts["byte_ok"] += bool(i1[i].get("byte_prefix"))
+            if same:
+                facts["requests"] += len(wire[i])
+                facts["conns"] += len({r["meta"]["conn_id"] for r in wire[i]})
+    return ev
 
 
-def _better(values: dict[str, Any], lower: bool = True) -> str | None:
-    """The loop with the strictly best value, or None on a tie or missing data."""
-    known = {k: v for k, v in values.items() if v is not None}
+def _better(values: dict[str, Any], lower: bool = True, margin: float = 0.0) -> str | None:
+    """The loop with the best value; None on a tie, with fewer than two values, or when the lead
+    is under `margin` (a share of the larger of the two best values)."""
+    known = sorted(((v, k) for k, v in values.items() if v is not None), reverse=not lower)
     if len(known) < 2:
         return None
-    best = min(known.values()) if lower else max(known.values())
-    winners = [k for k, v in known.items() if v == best]
-    return winners[0] if len(winners) == 1 else None
+    (best, winner), (second, _) = known[0], known[1]
+    if best == second or abs(second - best) < margin * max(abs(best), abs(second)):
+        return None
+    return winner
 
 
 def _vs(values: dict[str, Any], fmt: Callable[[Any], str]) -> str:
@@ -1085,67 +1207,154 @@ def _vs(values: dict[str, Any], fmt: Callable[[Any], str]) -> str:
     )
 
 
-def _measured_claims(page: Page) -> list[tuple[str, str, str]]:
-    """(winning loop, claim, evidence link) for every measure where one loop is strictly better."""
-    deps = {i: _deps_for(page, i) or {} for i in page.loops}
-    facts = evidence(page)
+def _median(values: list[Any]) -> float | None:
+    known = sorted(v for v in values if v is not None)
+    if not known:
+        return None
+    mid = len(known) // 2
+    return known[mid] if len(known) % 2 else (known[mid - 1] + known[mid]) / 2
+
+
+def _claims(page: Page) -> list[Claim]:
+    """Every comparison the data supports: a win where one loop is better by a clear margin,
+    a "too close to call" note for measured timings that are not."""
+    claims: list[Claim] = []
+    pct = f"{TIMING_MARGIN:.0%}"
+
+    def compare(
+        values: dict[str, Any],
+        win: Callable[[dict[str, Any]], str],
+        link: str,
+        *,
+        lower: bool = True,
+        margin: float = 0.0,
+        close: Callable[[dict[str, Any]], str] | None = None,
+    ) -> None:
+        known = {k: v for k, v in values.items() if v is not None}
+        if len(known) < 2:
+            return
+        winner = _better(known, lower, margin)
+        if winner is not None and (lower or known[winner]):  # 0 eager starts wins nothing
+            claims.append(Claim(winner, win(known), link))
+        elif close is not None:
+            claims.append(Claim(None, close(known), link))
 
     def per_loop(get: Callable[[str], Any]) -> dict[str, Any]:
         return {i: get(i) for i in page.loops}
 
-    def when(key: str, base: str) -> dict[str, Any]:
-        return per_loop(lambda i: facts[i][key] if facts[i][base] else None)
-
+    deps = per_loop(lambda i: _deps_for(page, i) or {})
     mb = per_loop(lambda i: deps[i].get("site_packages_mb"))
-    measures: list[tuple[dict[str, Any], bool, Callable[[dict[str, Any]], str], str]] = [
-        (per_loop(lambda i: ((_loc_for(page, i) or {}).get("total") or {}).get("code")), True,
-         lambda v: f"Fewer lines of its own code to maintain: {_vs(v, fmt_int)}.", "#loc"),
-        (per_loop(lambda i: deps[i].get("distributions")), True,
-         lambda v: f"Installs less: {_vs(v, fmt_int)} packages ({_vs(mb, lambda x: f'{x} MB')}).", "#deps"),
-        (per_loop(lambda i: deps[i].get("import_ms")), True,
-         lambda v: f"Starts faster in a fresh process ({term('cold-import')}): {_vs(v, fmt_ms)}.", "#deps"),
-        (per_loop(lambda i: _overhead(page, i).get("p50")), True,
-         lambda v: f"Adds less time on top of the model per turn ({term('p50')}): {_vs(v, fmt_ms)}.", "#overhead"),
-        (when("passed", "total"), False,
-         lambda v: f"Passes more scenarios: {_vs(v, str)}.", "#matrix"),
-        (when("eager", "total"), False,
-         lambda v: f"Starts read-only tools while the model is still streaming ({term('eager', 'eager starts')}): {_vs(v, fmt_int)} across the scenarios.", "#replay"),
-        (when("byte_ok", "multi"), False,
-         lambda v: f"Keeps a {term('byte-prefix')} in more multi-request scenarios: {_vs(v, str)}.", "#wire"),
-        (when("conns", "requests"), True,
-         lambda v: f"Opens fewer connections ({term('connection')}) for the same requests: {_vs(v, fmt_int)}, in scenarios where both loops sent the same number of requests.", "#wire"),
-    ]  # fmt: skip
-    if page.live:  # the newest live run only: one sample, so it says so
-        run = page.live[0]
-        results = {i: run["results"].get(i) or {} for i in page.loops}
-        if all(r and not r.get("error") for r in results.values()):
-            caveat = f"live run {esc(run['run_id'])}, one sample; the order of runs and the provider's prompt cache can swing it"
-            latency = {i: r.get("duration_ms") for i, r in results.items()}
-            measures.append(
-                (latency, True, lambda v: f"Answered faster: {_vs(v, fmt_ms)} ({caveat}).", "#live")
-            )
-            tokens = {i: (r.get("usage") or {}).get("input_tokens") for i, r in results.items()}
-            measures.append(
-                (
-                    tokens,
-                    True,
-                    lambda v: f"Sent fewer input tokens: {_vs(v, fmt_int)} ({caveat}).",
-                    "#live",
-                )
-            )
-    claims = []
-    for values, lower, sentence, link in measures:
-        if (winner := _better(values, lower)) and values[winner]:  # a win of 0 eager starts is none
-            claims.append((winner, sentence(values), link))
+    compare(
+        per_loop(lambda i: ((_loc_for(page, i) or {}).get("total") or {}).get("code")),
+        lambda v: f"Fewer lines of its own code to maintain: {_vs(v, fmt_int)}.",
+        "#loc",
+    )
+    compare(
+        per_loop(lambda i: deps[i].get("distributions")),
+        lambda v: f"Installs less: {_vs(v, fmt_int)} packages ({_vs(mb, lambda x: f'{x} MB')}).",
+        "#deps",
+    )
+    compare(
+        per_loop(lambda i: deps[i].get("import_ms")),
+        lambda v: f"Starts faster in a fresh process ({term('cold-import')}): {_vs(v, fmt_ms)}.",
+        "#deps",
+        margin=TIMING_MARGIN,
+        close=lambda v: f"{term('cold-import', 'Cold import')}: {_vs(v, fmt_ms)}, within {pct}.",
+    )
+    # Overhead: a win needs the median and the slow tail to agree, each by the margin.
+    p50 = per_loop(lambda i: _overhead(page, i).get("p50"))
+    p95 = per_loop(lambda i: _overhead(page, i).get("p95"))
+    both = f"{_vs(p50, fmt_ms)} ({term('p50')}); {_vs(p95, fmt_ms)} ({term('p95')})"
+    winner = _better(p50, margin=TIMING_MARGIN)
+    if winner is not None and winner == _better(p95, margin=TIMING_MARGIN):
+        claims.append(Claim(winner, f"Adds less time on top of the model per turn: {both}.", "#overhead"))  # fmt: skip
+    elif sum(v is not None for v in p50.values()) >= 2:
+        claims.append(Claim(None, f"{term('overhead', 'Harness overhead')} per turn: {both}; the median and the slow tail do not both differ by {pct}.", "#overhead"))  # fmt: skip
+
+    ev = evidence(page)
+    who = "both loops" if len(ev.loops) == 2 else "every loop"
+    if ev.common:
+        compare(
+            {i: f["passed"] for i, f in ev.facts.items()},
+            lambda v: f"Passes more scenarios: {_vs(v, str)}, of the {ev.common} {who} ran.",
+            "#matrix",
+            lower=False,
+            close=lambda v: (
+                f"Passes as many scenarios: {_vs(v, str)}, of the {ev.common} {who} ran."
+            ),
+        )
+    if ev.replayed:
+        compare(
+            {i: f["eager"] for i, f in ev.facts.items()},
+            lambda v: (
+                f"Starts read-only tools while the model is still streaming ({term('eager', 'eager starts')}): {_vs(v, fmt_int)}, in the {ev.replayed} scenarios {who} ran."
+            ),
+            "#replay",
+            lower=False,
+        )
+    if ev.multi:
+        compare(
+            {i: f["byte_ok"] for i, f in ev.facts.items()},
+            lambda v: (
+                f"Keeps a {term('byte-prefix')} in more multi-request scenarios: {_vs(v, str)}, of {ev.multi}."
+            ),
+            "#wire",
+            lower=False,
+        )
+    if ev.same_requests:
+        requests = next(iter(ev.facts.values()))["requests"]
+        compare(
+            {i: f["conns"] for i, f in ev.facts.items()},
+            lambda v: (
+                f"Opens fewer connections ({term('connection')}) for the same requests: {_vs(v, fmt_int)} for {requests} requests each, in the {ev.same_requests} scenarios where {who} sent the same number of requests."
+            ),
+            "#wire",
+        )
+    claims += _live_claims(page)
     for s in page.scenarios:
-        cells = page.cells[s["id"]]
-        for impl, other in ((i, o) for i in page.loops for o in page.loops):
-            if (cells.get(impl) or {}).get("status") == "pass" and (cells.get(other) or {}).get(
-                "status"
-            ) == "fail":
+        cells = {i: page.cells[s["id"]].get(i) or {} for i in page.loops}
+        for impl, other in itertools.product(page.loops, repeat=2):
+            if cells[impl].get("status") == "pass" and cells[other].get("status") == "fail":
                 why = esc(cells[other]["reason"])
                 text = f"Passes {esc(s['id'])}, where {esc(loop_info(other).letter)} fails ({why})."
-                claims.append((impl, text, f"#cell-{esc(s['id'])}-{esc(other)}"))
+                claims.append(Claim(impl, text, f"#cell-{esc(s['id'])}-{esc(other)}"))
+    return claims
+
+
+def _live_claims(page: Page) -> list[Claim]:
+    """Latency and input tokens over the live runs every live loop answered: medians, and a win
+    only with enough samples and a clear margin."""
+    loops = [i for i in page.loops if any(i in run["results"] for run in page.live)]
+    samples = [
+        run["results"]
+        for run in page.live
+        if all(i in run["results"] and not run["results"][i].get("error") for i in loops)
+    ]
+    if len(loops) < 2 or not samples:
+        return []
+    n = len(samples)
+    runs = f"{n} live run{'s' * (n != 1)}"
+    latency = {i: _median([r[i].get("duration_ms") for r in samples]) for i in loops}
+    tokens = {
+        i: _median([(r[i].get("usage") or {}).get("input_tokens") for r in samples]) for i in loops
+    }
+    if n < MIN_LIVE_SAMPLES:
+        shown = (
+            f"{term('latency', 'Answer time')} {_vs(latency, fmt_ms)}; "
+            f"{term('tokens', 'input tokens')} {_vs(tokens, fmt_int)}"
+        )
+        why = "the order of runs and the provider's prompt cache swing it"
+        return [Claim(None, f"{shown}: one live run, too few to call ({why}).", "#live")]
+    claims = []
+    for values, win, name, fmt in (
+        (latency, "Answered faster", term("latency", "Answer time"), fmt_ms),
+        (tokens, "Sent fewer input tokens", term("tokens", "Input tokens"), fmt_int),
+    ):
+        shown = f"median {_vs(values, fmt)} over {runs}"
+        if (winner := _better(values, margin=TIMING_MARGIN)) is not None:
+            claims.append(Claim(winner, f"{win}: {shown}.", "#live"))
+        else:
+            claims.append(Claim(None, f"{name}: {shown}, within {TIMING_MARGIN:.0%}.", "#live"))
     return claims
 
 
@@ -1167,13 +1376,13 @@ DESIGN_WINS = {
 def wins(page: Page) -> str:
     """Section 6: measured wins per loop (each linked to its evidence), then design properties
     that are not measured here, for both sides. No overall verdict (FAIRNESS.md rule 7)."""
-    claims = _measured_claims(page)
+    claims = _claims(page)
     cards = []
     for impl in page.loops:
         measured = "".join(
-            f'<li>{text} <a href="{link}" class="ev">evidence</a></li>'
-            for winner, text, link in claims
-            if winner == impl
+            f'<li>{c.text} <a href="{c.link}" class="ev">evidence</a></li>'
+            for c in claims
+            if c.winner == impl
         )
         measured = (
             measured or '<li class="muted">No measured advantage in the data on this page.</li>'
@@ -1187,15 +1396,25 @@ def wins(page: Page) -> str:
             f'<div class="win {esc(loop_info(impl).color)}"><h3>{chip(impl)} wins on</h3>'
             f'<div class="k">measured</div><ul class="ev">{measured}</ul>{design}</div>'
         )
+    close = "".join(
+        f'<li>{c.text} <a href="{c.link}" class="ev">evidence</a></li>'
+        for c in claims
+        if c.winner is None
+    )
+    if close:
+        close = f'<div class="fig close"><div class="k">too close to call</div><ul class="ev">{close}</ul></div>'
     sources = " · ".join(
         f'<a href="{REPO_URL}/{name}">{name}</a>'
         for name in ("FAIRNESS.md", "A_CHECKLIST.md", "PREDICTIONS.md", "DESIGN.md")
     )
     return (
         "<p class='lede'>Only what the data on this page shows, plus a few design properties for "
-        "each side, labelled as such. Scenarios that favour A (cancel repair, built-in features) "
-        "are in the matrix. People decide; this page names no overall winner.</p>"
-        f'<div class="wins">{"".join(cards)}</div><p class="small muted">Sources: {sources}</p>'
+        "each side, labelled as such. Counts compare only the scenarios every loop ran; a timing "
+        f"counts only when it is at least {TIMING_MARGIN:.0%} better, and a live result only over "
+        f"{MIN_LIVE_SAMPLES} or more runs. Scenarios that favour A (cancel repair, built-in "
+        "features) are in the matrix. People decide; this page names no overall winner.</p>"
+        f'<div class="wins">{"".join(cards)}</div>{close}'
+        f'<p class="small muted">Sources: {sources}</p>'
     )
 
 
@@ -1206,6 +1425,10 @@ def glossary() -> str:
         for label, text in sorted(GLOSSARY.values(), key=lambda v: v[0].lower())
     )
     return f'<details><summary>Glossary: every term on this page</summary><dl class="gloss">{items}</dl></details>'
+
+
+_JS_TERMS = ("stop", "step", "tokens", "tool-result", "approval", "retry", "crash-resume",
+             "commit", "turn", "byte-prefix")  # fmt: skip
 
 
 def js_data(page: Page) -> dict[str, Any]:
@@ -1244,7 +1467,8 @@ def js_data(page: Page) -> dict[str, Any]:
             }
             for impl in replay_impls(page)
         },
-        "invariantTips": {k: GLOSSARY[k][1] for k in INVARIANTS},
+        # (label, definition) of the terms report.js draws itself.
+        "terms": {k: GLOSSARY[k] for k in (*INVARIANTS, *_JS_TERMS)},
         "scenarios": scenarios,
         "pool": (page.run or {}).get("pool") or [],
     }
