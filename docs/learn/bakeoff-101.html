@@ -1488,11 +1488,12 @@ chips('sqlBtns', b => {
     return null;
   }
   function normalize(path) {
-    // what resolve_path does before any rule is read: relative to the working copy, "." and ".." collapsed
+    // what resolve_path does before any rule is read: relative to the working copy, "." and ".." collapsed;
+    // only "/" separates (match() later reads a backslash as "/", as OpenCode's matcher does)
     // (it also follows symlinks, which a web page can't see)
     if (path.startsWith('/')) return null;
     const out = [];
-    for (const part of path.replace(/\\/g, '/').split('/')) {
+    for (const part of path.split('/')) {  // on POSIX a backslash is part of a file name, not a separator
       if (!part || part === '.') continue;
       if (part === '..') { if (!out.length) return null; out.pop(); } else out.push(part);
     }
