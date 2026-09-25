@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -661,6 +662,109 @@ async def test_run_matrix_writes_the_summary_and_latest(
 
     await run_matrix(["X01"], ["our"], out=out, run_id="m2", scenarios_dir=tmp_path / "scenarios")
     assert os.readlink(runs / "latest") == "m2"
+
+
+# Loops whose aclose leaves a task that outlives its cancel: `LingerLoop`'s task ends at a
+# second cancel, `DeafLoop`'s never does. A module, because run_matrix loads loops by name.
+STUBBORN_LOOPS = """
+import asyncio
+
+from bakeoff.our_version import OurLoop
+
+TASKS = []
+
+
+async def linger() -> None:
+    try:
+        await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        await asyncio.sleep(3600)
+
+
+async def deaf() -> None:
+    while True:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+
+
+class LingerLoop(OurLoop):
+    async def aclose(self) -> None:
+        await super().aclose()
+        TASKS.append(asyncio.get_running_loop().create_task(linger()))
+        await asyncio.sleep(0)  # it starts, so a cancel lands in its try
+
+
+class DeafLoop(OurLoop):
+    async def aclose(self) -> None:
+        await super().aclose()
+        TASKS.append(asyncio.get_running_loop().create_task(deaf()))
+        await asyncio.sleep(0)  # it starts, so a cancel lands in its try
+"""
+
+
+async def test_a_task_that_outlives_its_cancel_stops_the_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "stubborn_loops.py").write_text(STUBBORN_LOOPS)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    entry = replace(loops.REGISTRY["our"], target="stubborn_loops:LingerLoop")
+    monkeypatch.setitem(loops.REGISTRY, "our", entry)
+    monkeypatch.setattr(scenario, "STRAY_WAIT_S", 0.2)
+    for sid in ("X01", "X02"):
+        copy_scenario(tmp_path, "S01", sid)
+    out, seen = tmp_path / "out", []
+    summary = await run_matrix(
+        ["X01", "X02"],
+        ["our"],
+        out=out,
+        run_id="m1",
+        on_result=lambda r: seen.append(r["scenario"]),
+        scenarios_dir=tmp_path / "scenarios",
+    )
+    assert seen == ["X01"]  # X02 would have shared the event loop with the task
+    result = json.loads((out / "runs" / "m1" / "X01" / "our" / "result.json").read_text())
+    assert result["error"] == (
+        "tasks still running after aclose: ['linger'];"
+        " still running 0.2 s after being cancelled: ['linger']"
+    )
+    assert summary["matrix"]["X01"]["our"]["status"] == "FAIL"
+    assert summary["stopped"] == (
+        "X01/our left tasks running after they were cancelled: ['linger'];"
+        " 1 of 2 runs did not start"
+    )
+    assert json.loads((out / "runs" / "m1" / "summary.json").read_text()) == summary
+    assert format_matrix(summary).splitlines()[-1] == f"stopped: {summary['stopped']}"
+
+
+def test_the_scenario_command_ends_even_if_a_task_ignores_every_cancel(tmp_path: Path) -> None:
+    (tmp_path / "stubborn_loops.py").write_text(STUBBORN_LOOPS)
+    out = tmp_path / "out"
+    script = f"""
+import sys
+from dataclasses import replace
+from bakeoff import loops
+from bakeoff.cli import main
+from bakeoff.shared import scenario
+scenario.STRAY_WAIT_S = 0.2
+loops.REGISTRY["our"] = replace(loops.REGISTRY["our"], target="stubborn_loops:DeafLoop")
+sys.exit(main(["scenario", "S01", "S13", "--impl", "our", "--out", {str(out)!r}, "--run-id", "k1"]))
+"""
+    path = os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "PYTHONPATH": path},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "bakeoff scenario: stopped: S01/our left tasks running after they were cancelled:" in (
+        proc.stderr
+    )
+    summary = json.loads((out / "runs" / "k1" / "summary.json").read_text())
+    assert list(summary["matrix"]) == ["S01"] and summary["stopped"].startswith("S01/our left")
 
 
 def test_unexpected_lists_failures_and_passes_of_documented_failures() -> None:

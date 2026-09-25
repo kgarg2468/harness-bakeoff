@@ -45,7 +45,8 @@ timestamped id).
 It prints a matrix and exits 1 on any `FAIL` or `XPASS`. `xfail` is a failure that the loop's
 registry entry (`bakeoff/loops.py`) documents, with exactly the checks it documents; a documented
 cell that fails any other way is a `FAIL`. `XPASS` means a documented failure is fixed, so its
-entry must go. Each run writes:
+entry must go. A loop that leaves a task running even after it was cancelled stops the command
+after that run (exit 1; `stopped` in summary.json says which). Each run writes:
 
 ```
 out/runs/<run_id>/summary.json                   matrix + one-line reasons, git sha, loop versions

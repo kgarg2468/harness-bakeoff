@@ -221,6 +221,9 @@ For I5 the driver captures this process's stdout/stderr from the loop's creation
 closed, so background tasks and threads count too, and reads the child processes' pipes (a
 worker prints only its one-line JSON summary). Tasks a loop leaves running after `aclose()` are
 cancelled before judging and fail the scenario, so nothing they do lands in the next scenario.
+If one is still running 2 s after its cancel, `bakeoff scenario` runs nothing more in that
+process (it would share the event loop with it) and exits 1; `summary.json` covers the runs so
+far, and its `stopped` names the run and the tasks.
 A loop's documented failures are listed in `bakeoff/loops.py` with the exact checks they fail:
 the matrix runs them as strict xfails, so a fix shows up as well as a regression, and a cell
 that fails any other way is a plain failure.

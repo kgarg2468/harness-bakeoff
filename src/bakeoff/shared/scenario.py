@@ -562,23 +562,36 @@ async def _drive_and_close(run: _ScenarioRun, factory: Callable[[], Loop]) -> st
                 if _cancelled_from_outside():
                     raise
                 errors.append("aclose: CancelledError")
-        if strays := await _stop_strays(before):
+        strays, alive = await _stop_strays(before)
+        if strays:
             errors.append(f"tasks still running after aclose: {strays}")
+        if alive:
+            errors.append(f"still running {STRAY_WAIT_S:g} s after being cancelled: {alive}")
     return "; ".join(errors) or None
 
 
-async def _stop_strays(before: set[asyncio.Task[Any]]) -> list[str]:
+async def _stop_strays(before: set[asyncio.Task[Any]]) -> tuple[list[str], list[str]]:
     """Cancel the tasks the loop left running after `aclose` (e.g. a tool it shielded from a
-    cancel), give them a moment to finish, and name them. Their last events and output then
-    land in this scenario's log and I5 capture, not in the next scenario's, which may be
-    another loop's."""
-    current = asyncio.current_task()
-    strays = [t for t in asyncio.all_tasks() - before if t is not current and not t.done()]
+    cancel) and give them STRAY_WAIT_S to finish, so their last events and output land in this
+    scenario's log and I5 capture, not in the next scenario's, which may be another loop's.
+    Returns the names of those tasks, and of the tasks still running after the wait (which
+    `run_matrix` then refuses to run anything next to)."""
+    strays = _running_since(before)
     for task in strays:
         task.cancel()
     if strays:
         await asyncio.wait(strays, timeout=STRAY_WAIT_S)
-    return [getattr(t.get_coro(), "__qualname__", t.get_name()) for t in strays]
+    return _names(strays), _names(_running_since(before))
+
+
+def _running_since(before: set[asyncio.Task[Any]]) -> list[asyncio.Task[Any]]:
+    """The tasks not in `before` (except the current one) that are still running."""
+    current = asyncio.current_task()
+    return [t for t in asyncio.all_tasks() - before if t is not current and not t.done()]
+
+
+def _names(tasks: Sequence[asyncio.Task[Any]]) -> list[str]:
+    return [getattr(t.get_coro(), "__qualname__", t.get_name()) for t in tasks]
 
 
 def _cancelled_from_outside() -> bool:
@@ -927,30 +940,49 @@ async def run_matrix(
 ) -> dict[str, Any]:
     """Run every scenario for every loop against one fake provider, then write summary.json
     and point `out/runs/latest` at the run. Returns the summary. Raises DriverError before
-    anything runs if `out/runs/<run_id>` exists: a run id is never reused."""
+    anything runs if `out/runs/<run_id>` exists: a run id is never reused.
+
+    If a run leaves tasks running even after they were cancelled, nothing else runs: the
+    summary covers the runs so far, and its `stopped` says which run leaked what. The caller
+    must not wait for those tasks either (see `cli._scenario`)."""
     run_id = run_id or new_run_id()
     if (out / "runs" / run_id).exists():  # its summary.json and cells would be replaced
         raise DriverError(f"{out / 'runs' / run_id} already exists: pick another --run-id")
     staging = out / "runs" / run_id / ".wire"  # fakeprov records here; each run moves its part
-    results = []
+    runs = [(sid, impl) for sid in scenarios for impl in impls]
+    results: list[dict[str, Any]] = []
+    stopped = None
     with FakeProvider(scenarios_dir, wire_dir=staging) as provider:
-        for sid in scenarios:
-            for impl in impls:
-                result = await run_scenario(sid, impl, out=out, run_id=run_id, provider=provider)
-                results.append(result)
-                if on_result is not None:
-                    on_result(result)
+        for sid, impl in runs:
+            before = asyncio.all_tasks()
+            result = await run_scenario(sid, impl, out=out, run_id=run_id, provider=provider)
+            results.append(result)
+            if on_result is not None:
+                on_result(result)
+            if leaked := _running_since(before):
+                # They share this event loop with every later run, which may be another loop's,
+                # and could still write to this run's closed log: no run here can be trusted.
+                stopped = (
+                    f"{sid}/{impl} left tasks running after they were cancelled: {_names(leaked)};"
+                    f" {len(runs) - len(results)} of {len(runs)} runs did not start"
+                )
+                break
     shutil.rmtree(staging, ignore_errors=True)
-    summary = summarize(run_id, results, impls)
+    summary = summarize(run_id, results, impls, stopped=stopped)
     write_json(out / "runs" / run_id / "summary.json", summary)
     point_latest(out / "runs", run_id)
     return summary
 
 
 def summarize(
-    run_id: str, results: Sequence[dict[str, Any]], impls: Sequence[str]
+    run_id: str,
+    results: Sequence[dict[str, Any]],
+    impls: Sequence[str],
+    *,
+    stopped: str | None = None,
 ) -> dict[str, Any]:
-    """summary.json: scenario x impl -> passed + one-line reason, plus git sha and loop versions."""
+    """summary.json: scenario x impl -> passed + one-line reason, plus git sha and loop versions,
+    and why the matrix stopped early (None if it ran every cell)."""
     matrix: dict[str, dict[str, Any]] = {}
     for r in results:
         known = loops.known_failure(r["impl"], r["scenario"])
@@ -978,6 +1010,7 @@ def summarize(
         },
         "scenarios": {r["scenario"]: r["title"] for r in results},
         "matrix": matrix,
+        "stopped": stopped,
     }
 
 
@@ -1009,7 +1042,8 @@ def format_matrix(summary: dict[str, Any]) -> str:
             f"{impl} {counts['pass']}/{len(cells)} pass"
             + "".join(f", {n} {s}" for s, n in sorted(counts.items()) if s != "pass")
         )
-    return "\n".join([*lines, *notes, "; ".join(totals)])
+    stopped = [f"stopped: {summary['stopped']}"] if summary.get("stopped") else []
+    return "\n".join([*lines, *notes, "; ".join(totals), *stopped])
 
 
 def unexpected(summary: dict[str, Any]) -> list[str]:

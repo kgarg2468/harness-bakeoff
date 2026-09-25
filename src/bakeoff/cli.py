@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -193,11 +194,20 @@ def _scenario(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    summary = asyncio.run(
-        scenario.run_matrix(ids, impls, out=args.out, run_id=args.run_id, on_result=progress)
-    )
-    print(scenario.format_matrix(summary))
-    print(f"results: {args.out / 'runs' / summary['run_id']}")
+    # Not asyncio.run: at exit it cancels the tasks still running and waits for them, which
+    # never ends if a loop left one that ignores cancellation (see the stop below).
+    with asyncio.Runner() as runner:
+        summary = runner.run(
+            scenario.run_matrix(ids, impls, out=args.out, run_id=args.run_id, on_result=progress)
+        )
+        print(scenario.format_matrix(summary))
+        print(f"results: {args.out / 'runs' / summary['run_id']}")
+        if summary["stopped"]:
+            sys.stdout.flush()
+            print(f"bakeoff scenario: stopped: {summary['stopped']}", file=sys.stderr, flush=True)
+            # The leaked tasks already ignored a cancel. Everything is written: end the process
+            # without waiting for them.
+            os._exit(1)
     return 1 if scenario.unexpected(summary) else 0
 
 
