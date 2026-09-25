@@ -205,7 +205,7 @@ class SessionLog:
         )
 
     def discard_turn(self, turn_id: str) -> None:
-        """Delete a turn that recorded no items or events (a revert that git refused)."""
+        """Delete a turn that recorded no items or events (a revert or compaction that failed)."""
         self._db.execute("DELETE FROM turns WHERE id = ?", (turn_id,))
 
     def turns(self, thread_id: str) -> list[dict[str, Any]]:

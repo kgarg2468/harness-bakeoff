@@ -350,8 +350,12 @@ class Runner:
         Returns `{"turn_id", "stop", "pending", "commit"}`. A loop exception ends the turn with
         stop="error" instead of raising. `asyncio.CancelledError` propagates and leaves the turn
         "running", like a crash; resume it with `Resume(kind="crash")`. Any other failure (git,
-        or the session log) records the turn as "error" without a commit and is raised; the
-        next turn's commit then includes its changes.
+        or the session log) is raised after the turn is recorded without a commit: as "error"
+        (the next turn's commit includes its changes), or still "paused" if it paused. If even
+        that cannot be written, the turn stays "running" for a crash resume.
+
+        A resume waits up to `lock_wait_s` for the thread's lock; a new user message raises
+        ThreadBusy at once while another turn, revert or compaction holds it.
         """
         if (user_text is None) == (resume is None):
             raise ValueError("pass exactly one of user_text and resume")
