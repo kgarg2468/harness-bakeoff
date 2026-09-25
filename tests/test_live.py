@@ -25,6 +25,7 @@ from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.shared.contract import ModelConfig
 from bakeoff.shared.scenario import Workspace
 from bakeoff.shared.sessionlog import SessionLog
+from bakeoff.shared.workcopy import WorkCopy
 
 PIPELINE = {
     "source": "chat_1",
@@ -205,6 +206,57 @@ async def test_chat_asks_before_writing(tmp_path: Path) -> None:
     assert result["stops"] == ["paused", "end_turn"] and result["final_text"] == "Saved notes.md."
     assert result["passed"] and result["files"] == ["notes.md"]
     assert "?? write_file(path='notes.md', content='# Notes') needs approval" in term.getvalue()
+
+
+def fail_git_init(monkeypatch: pytest.MonkeyPatch, thread: str) -> None:
+    """Make creating `thread`'s working copy fail, as a broken git would."""
+    init_sync = WorkCopy.init_sync
+
+    def failing(self: WorkCopy) -> None:
+        if self.root.name == thread:
+            raise RuntimeError(f"git init failed in {self.root}: simulated")
+        init_sync(self)
+
+    monkeypatch.setattr(WorkCopy, "init_sync", failing)
+
+
+def test_a_live_run_that_cannot_start_records_why(
+    endpoint: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fail_git_init(monkeypatch, "live-our")
+    out = tmp_path / "out"
+    argv = ["live", "--impl", "our,pydantic", "--model", "fake-live", "--base-url", endpoint]
+    argv += ["--prompt", "Build chat.pipe and validate it.", "--out", str(out), "--run-id", "t1"]
+    assert main(argv) == 1
+    printed = capsys.readouterr().out
+    directory = out / "live" / "t1" / "our"
+    result = json.loads((directory / "result.json").read_text())
+    error = f"RuntimeError: git init failed in {directory / 'wc' / 'live-our'}: simulated"
+    assert (result["passed"], result["error"], result["stops"]) == (False, error, [])
+    assert (result["impl"], result["prompt"], result["thread"]) == ("our", argv[-5], None)
+    assert f"[our failed: {error}]" in printed
+    # The other loop still ran, and both show up side by side.
+    assert json.loads((out / "live" / "t1" / "pydantic" / "result.json").read_text())["passed"]
+    assert "invariants      -" in printed
+
+
+async def test_a_chat_that_cannot_start_records_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_git_init(monkeypatch, "live-our")
+
+    async def ask(prompt: str) -> str:
+        raise AssertionError("no prompt before the chat has started")
+
+    model = live.LiveModel(model="m", base_url="http://127.0.0.1:9/v1")
+    with pytest.raises(RuntimeError, match="simulated"):
+        await live.chat("our", model, out=tmp_path, run_id="c1", term=io.StringIO(), ask=ask)
+    result = json.loads((tmp_path / "live" / "c1" / "our" / "result.json").read_text())
+    assert (result["passed"], result["prompt"]) == (False, "(chat)")
+    assert result["error"].startswith("RuntimeError: git init failed in ")
 
 
 # --- key and network ---------------------------------------------------------------------------

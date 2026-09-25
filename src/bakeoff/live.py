@@ -447,13 +447,7 @@ class LiveThread:
         err = "".join(c.stderr for c in self.captured)
         checks = check_invariants(self.ws.log, self.thread_id, obs, out, err, wire=False)
         events = self.ws.log.events(self.thread_id)
-        return {
-            "v": 1,
-            "run_id": run_id,
-            "impl": self.impl,
-            "model": self.model.model,
-            "base_url": self.model.base_url,
-            "prompt": prompt,
+        return empty_result(self.impl, self.model, run_id, prompt, duration_ms, error) | {
             "final_text": obs.last_text,
             "stops": obs.stops,
             "invariants": {
@@ -469,12 +463,10 @@ class LiveThread:
             "files": sorted(p.name for p in workdir.iterdir() if p.name != ".git")
             if workdir.exists()
             else [],
-            "duration_ms": duration_ms,
             # A live run passes when it answered: no failure, invariants hold, last stop end_turn.
             "passed": error is None
             and obs.stops[-1:] == ["end_turn"]
             and all(c.ok for c in checks.values()),
-            "error": error,
             "thread": self.thread_id,
         }
 
@@ -496,12 +488,63 @@ class LiveThread:
             try:
                 await self.close_loop()
             finally:
-                duration_ms = round((time.perf_counter() - started) * 1000, 1)
-                result = self.result(run_id, prompt, duration_ms, error)
+                result = self.result(run_id, prompt, _ms_since(started), error)
                 write_json(self.dir / "result.json", result)
         finally:
             self.ws.close()
         return result
+
+
+def empty_result(
+    impl: str, model: ModelConfig, run_id: str, prompt: str, duration_ms: float, error: str | None
+) -> dict[str, Any]:
+    """A live result.json with nothing observed: the base of every result, and all that a run
+    whose thread could not be set up leaves."""
+    return {
+        "v": 1,
+        "run_id": run_id,
+        "impl": impl,
+        "model": model.model,
+        "base_url": model.base_url,
+        "prompt": prompt,
+        "final_text": "",
+        "stops": [],
+        "invariants": {},
+        "requests": 0,
+        "steps": 0,
+        "tool_runs": {},
+        "usage": usage_totals([]),
+        "latency": latency([]),
+        "files": [],
+        "duration_ms": duration_ms,
+        "passed": False,
+        "error": error,
+        "thread": None,
+    }
+
+
+async def _finish(
+    thread: LiveThread | None,
+    impl: str,
+    directory: Path,
+    model: LiveModel,
+    run_id: str,
+    prompt: str,
+    started: float,
+    error: str | None,
+) -> dict[str, Any]:
+    """`thread.finish(...)`; or, if the thread could not be set up (the loop, the log or the
+    working copy failed), a result.json with the error: the run directory may exist already,
+    and it blocks its run id, so it must say why it has nothing else."""
+    if thread is not None:
+        return await thread.finish(run_id, prompt, started, error)
+    result = empty_result(impl, model.config(impl), run_id, prompt, _ms_since(started), error)
+    write_json(directory / "result.json", result)
+    return result
+
+
+def _ms_since(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 1)
 
 
 def latency(events: list[dict[str, Any]]) -> dict[str, float | None]:
@@ -531,7 +574,8 @@ async def run_live(
 ) -> list[dict[str, Any]]:
     """Run `prompt` once per impl, one after the other, streaming to `term`. With `ask`,
     writes need approval; without it, the rules allow everything. Returns the results.
-    Raises LiveError before anything runs if a run directory already exists."""
+    Raises LiveError before anything runs if a run directory already exists. A run that fails,
+    even before its thread exists, still writes its result.json, and the next impl runs."""
     impls = list(dict.fromkeys(impls))  # each loop once: its thread id is `live-<impl>`
     directories = {impl: fresh_dir(out / "live" / run_id / impl) for impl in impls}
     results = []
@@ -541,9 +585,10 @@ async def run_live(
         term.write(f"   {directory}\n\n> {prompt}\n")
         term.flush()
         rules = ASK_RULES if ask is not None else LIVE_RULES
-        thread = LiveThread(impl, directory, model, term, rules=rules, max_steps=max_steps)
+        thread: LiveThread | None = None
         started, error = time.perf_counter(), None
         try:
+            thread = LiveThread(impl, directory, model, term, rules=rules, max_steps=max_steps)
             await thread.converse(prompt, ask)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -552,7 +597,9 @@ async def run_live(
             error = f"interrupted ({type(exc).__name__})"
             raise
         finally:
-            results.append(await thread.finish(run_id, prompt, started, error))
+            results.append(
+                await _finish(thread, impl, directory, model, run_id, prompt, started, error)
+            )
             point_latest(out / "live", run_id)
     return results
 
@@ -588,7 +635,9 @@ def format_side_by_side(results: list[dict[str, Any]]) -> str:
         (
             "invariants",
             lambda r: (
-                "ok"
+                "-"  # a run that could not start checked none
+                if not r["invariants"]
+                else "ok"
                 if all(c["ok"] for c in r["invariants"].values())
                 else ", ".join(n for n, c in r["invariants"].items() if not c["ok"]) + " failed"
             ),
@@ -615,11 +664,12 @@ async def chat(
     `/revert N` undoes turn N, `/compact TEXT` compacts, `/exit`, end of input or Ctrl-C at a
     prompt quits (Ctrl-C during a turn cancels the turn)."""
     directory = fresh_dir(out / "live" / run_id / impl)
-    thread = LiveThread(impl, directory, model, term, rules=ASK_RULES, max_steps=max_steps)
-    term.write(f"chat with {impl} on {model.model}; thread {thread.thread_id} in {directory}\n")
-    term.write("/revert N, /compact TEXT, /exit\n")
+    thread: LiveThread | None = None
     started, error = time.perf_counter(), None
     try:
+        thread = LiveThread(impl, directory, model, term, rules=ASK_RULES, max_steps=max_steps)
+        term.write(f"chat with {impl} on {model.model}; thread {thread.thread_id} in {directory}\n")
+        term.write("/revert N, /compact TEXT, /exit\n")
         while True:
             try:
                 line = (await ask("\n> ")).strip()
@@ -631,11 +681,14 @@ async def chat(
                 break
             except (RuntimeError, ValueError, KeyError, IndexError) as exc:
                 term.write(f"[{exc}]\n")
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        raise
     except BaseException as exc:
         error = f"interrupted ({type(exc).__name__})"
         raise
     finally:
-        result = await thread.finish(run_id, "(chat)", started, error)
+        result = await _finish(thread, impl, directory, model, run_id, "(chat)", started, error)
         point_latest(out / "live", run_id)
     return result
 
