@@ -117,6 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("chat", help="interactive REPL on one loop, with approval prompts")
     _model_args(p, impl_default="our")
+    p.add_argument(
+        "--yes",
+        action="store_true",
+        help="allow every tool and ask nothing (unattended, as in `live`)",
+    )
 
     p = sub.add_parser("turn", help="run one user turn of a thread (a worker process)")
     _worker_args(p)
@@ -291,6 +296,7 @@ def _chat(args: argparse.Namespace) -> int:
             term=term,
             ask=live.stdin_ask(term),
             max_steps=args.max_steps,
+            yes=args.yes,
         )
     )
     term.write(f"\nresults: {args.out / 'live' / result['run_id'] / args.impl}\n")
