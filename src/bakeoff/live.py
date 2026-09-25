@@ -341,7 +341,10 @@ class LiveModel:
 
 
 class LiveThread:
-    """One loop on one thread in `directory`, with streamed output and approval prompts."""
+    """One loop on one thread in `directory`, with streamed output and approval prompts.
+
+    `must_answer`: the run passes only if its last turn ended with an answer (a `live` prompt).
+    A chat need not: its user may leave at any prompt, even an approval prompt."""
 
     def __init__(
         self,
@@ -353,8 +356,10 @@ class LiveThread:
         rules: dict[str, Any],
         max_steps: int,
         loop: Loop | None = None,
+        must_answer: bool = True,
     ) -> None:
         self.impl, self.dir, self.term = impl, directory, term
+        self.must_answer = must_answer
         self.model = model.config(impl)
         self.limits = Limits(max_steps=max_steps)
         self.loop = loop or loops.load(impl)()
@@ -463,9 +468,11 @@ class LiveThread:
             "files": sorted(p.name for p in workdir.iterdir() if p.name != ".git")
             if workdir.exists()
             else [],
-            # A live run passes when it answered: no failure, invariants hold, last stop end_turn.
+            # No failure, invariants hold, and no turn stopped short (error, max_steps, budget,
+            # cancelled); "paused" waits for an approval. See `must_answer` for the last turn.
             "passed": error is None
-            and obs.stops[-1:] == ["end_turn"]
+            and all(stop in ("end_turn", "paused") for stop in obs.stops)
+            and (not self.must_answer or obs.stops[-1:] == ["end_turn"])
             and all(c.ok for c in checks.values()),
             "thread": self.thread_id,
         }
@@ -662,12 +669,15 @@ async def chat(
 ) -> dict[str, Any]:
     """An interactive REPL on one thread: each line is a user turn; writes ask for approval.
     `/revert N` undoes turn N, `/compact TEXT` compacts, `/exit`, end of input or Ctrl-C at a
-    prompt quits (Ctrl-C during a turn cancels the turn)."""
+    prompt quits (Ctrl-C during a turn cancels the turn). The result passes unless a turn
+    stopped short (error, max_steps, budget, cancelled) or an invariant failed."""
     directory = fresh_dir(out / "live" / run_id / impl)
     thread: LiveThread | None = None
     started, error = time.perf_counter(), None
     try:
-        thread = LiveThread(impl, directory, model, term, rules=ASK_RULES, max_steps=max_steps)
+        thread = LiveThread(
+            impl, directory, model, term, rules=ASK_RULES, max_steps=max_steps, must_answer=False
+        )
         term.write(f"chat with {impl} on {model.model}; thread {thread.thread_id} in {directory}\n")
         term.write("/revert N, /compact TEXT, /exit\n")
         while True:

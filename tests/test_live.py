@@ -401,6 +401,53 @@ def test_chat_exits_on_ctrl_c_at_the_prompt(endpoint: str, tmp_path: Path) -> No
     assert (result["stops"], result["error"], result["prompt"]) == ([], None, "(chat)")
 
 
+@pytest.mark.parametrize(
+    ("exchanges", "lines", "extra", "code", "stops"),
+    [
+        ([says("Hi.")], ["hello"], [], 0, ["end_turn"]),
+        # Any turn that stops short counts, not only the last one.
+        (
+            [{"respond": {"status": 400}}, says("Hi.")],
+            ["hello", "again"],
+            [],
+            1,
+            ["error", "end_turn"],
+        ),
+        (
+            [calls({"id": "call_C2_1", "name": "list_files", "arguments": {}})],
+            ["hello"],
+            ["--max-steps", "1"],
+            1,
+            ["max_steps"],
+        ),
+    ],
+    ids=["answered", "a-turn-errors", "max-steps"],
+)
+def test_chat_exits_1_if_a_turn_stopped_short(
+    exchanges: list[dict[str, Any]],
+    lines: list[str],
+    extra: list[str],
+    code: int,
+    stops: list[str],
+    tmp_path: Path,
+) -> None:
+    write_scenario(tmp_path / "scenarios", "C2", exchanges)
+    with FakeProvider(tmp_path / "scenarios", tmp_path / "wire") as provider:
+        argv = [sys.executable, "-m", "bakeoff.cli", "chat", "--model", "fake-live"]
+        argv += ["--base-url", provider.base_url("C2", "r1", "our"), *extra]
+        argv += ["--out", str(tmp_path / "out"), "--run-id", "c1"]
+        stdin = "".join(f"{line}\n" for line in [*lines, "/exit"])
+        proc = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=60)
+    result = json.loads((tmp_path / "out" / "live" / "c1" / "our" / "result.json").read_text())
+    assert (proc.returncode, result["stops"], result["passed"]) == (code, stops, code == 0), (
+        proc.stdout + proc.stderr
+    )
+    if code:
+        assert f"bakeoff chat: not every turn ended well: stops {stops}" in proc.stderr
+    else:
+        assert proc.stderr == ""
+
+
 def test_the_key_is_never_stored(
     endpoint: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

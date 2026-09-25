@@ -265,7 +265,14 @@ def _chat(args: argparse.Namespace) -> int:
     )
     term.write(f"\nresults: {args.out / 'live' / result['run_id'] / args.impl}\n")
     _close(term)
-    return 0
+    if result["passed"]:  # also a chat ended at a prompt (Ctrl-C, /exit) before any turn
+        return 0
+    failed = [f"; {n} failed" for n, c in result["invariants"].items() if not c["ok"]]
+    print(
+        f"bakeoff chat: not every turn ended well: stops {result['stops']}{''.join(failed)}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _close(term: Any) -> None:

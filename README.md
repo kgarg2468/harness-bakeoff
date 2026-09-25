@@ -69,8 +69,9 @@ bakeoff live --impl our,pydantic --model gpt-6-luna --reasoning none --max-steps
 bakeoff chat --impl our            # REPL: approvals prompted, /revert N, /compact TEXT, /exit
 ```
 
-In `chat`, Ctrl-C during a turn cancels the turn, and at a prompt it ends the chat. A run id is
-never reused: `out/live/<run_id>/<impl>` must not exist yet.
+In `chat`, Ctrl-C during a turn cancels the turn, and at a prompt it ends the chat. `chat` exits 1
+if any turn stopped short (error, max_steps, budget, cancelled) or an invariant failed, else 0.
+A run id is never reused: `out/live/<run_id>/<impl>` must not exist yet.
 
 `live` streams each loop's run (text inline, tool calls and results on one line each), then
 prints tokens, time to first token, total time and steps side by side, and writes
