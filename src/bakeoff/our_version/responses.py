@@ -1,5 +1,5 @@
 # Ported from Pi (MIT): packages/ai/src/api/{openai-responses.ts,openai-responses-shared.ts,openai-prompt-cache.ts} @ 5fd446ca1843682e8da3fec4ceb71c42f56fbace
-# Changes: Python; one request shape (store false, encrypted reasoning always asked for); done output items replayed verbatim; calls used once done.
+# Changes: Python; one request shape (store false, encrypted reasoning always asked for); done output items replayed as sent, ids dropped after an unkept reasoning item; calls used once done.
 """OpenAI's Responses API: the request's fixed part, history items as `input` items, and the
 streamed-event accumulator.
 
@@ -7,12 +7,14 @@ From Pi: the request parameters (`store: false` with `include: ["reasoning.encry
 here always, not only when reasoning is on; a reasoning summary unless the effort is "none",
 `max_output_tokens` of at least 16, a `prompt_cache_key` of at most 64 characters, flat function
 tools with `strict: false`, the system prompt as a developer message), the conversion of
-chat-shaped messages to input items, replaying output items without their ids when their
-reasoning item is not replayed (Pi: calls from another model), which events carry text and
-reasoning (a blank line between summary parts; between reasoning items, their raw text parts
-and messages too, which Pi keeps apart as blocks), and the ends of a stream:
-`response.completed`, `.incomplete` (max_output_tokens is a truncation, any other reason an
-error), `.failed`, the `error` event, and a stream that ends before any of them.
+chat-shaped messages to input items, which events carry text and reasoning (a blank line
+between summary parts; between reasoning items, their raw text parts and messages too, which
+Pi keeps apart as blocks), and the ends of a stream: `response.completed`, `.incomplete`
+(max_output_tokens is a truncation, any other reason an error), `.failed`, the `error` event,
+and a stream that ends before any of them.
+
+Not from Pi: the output items after a reasoning item that is not kept go back without their ids
+(Pi drops only a function call's id, for calls from another model, against the same check).
 
 Not ported (this harness does not need them): images, custom and grammar tools, tool search,
 service tiers and their pricing, cache retention options, session headers, Copilot, foreign
@@ -82,8 +84,9 @@ def input_json(item: Item) -> bytes:
 
 
 def input_items(item: Item) -> list[dict[str, Any]]:
-    """A history item as `input` items: a response's done output items verbatim (reasoning with
-    its encrypted_content, messages with their phase), else converted from its chat message."""
+    """A history item as `input` items: a response's done output items as kept (reasoning with
+    its encrypted_content, messages with their phase; no ids after an unkept reasoning item),
+    else converted from its chat message."""
     if item.native:  # empty if the server sent no done items: then the message is converted
         return item.native
     msg = item.message
@@ -109,7 +112,7 @@ def input_items(item: Item) -> list[dict[str, Any]]:
 
 class ResponsesStream(Stream):
     """One streamed response, accumulated event by event. `native` collects its done output
-    items: exactly what the next request replays."""
+    items as the next request replays them."""
 
     def __init__(self) -> None:
         super().__init__()
