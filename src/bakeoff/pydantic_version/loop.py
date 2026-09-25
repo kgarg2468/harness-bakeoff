@@ -84,6 +84,7 @@ class _Turn:
     steps: int = 0
     failure: tuple[int, float] | None = None  # (status, monotonic time) of the last failed attempt
     emitted: dict[int, ModelMessage] = field(default_factory=dict)
+    responses: list[tuple[int, ModelResponse]] = field(default_factory=list)  # usage not sent yet
 
     def emit(self, type_: str, data: dict[str, Any]) -> None:
         self.out.put_nowait(Event(type_, data))
@@ -121,8 +122,7 @@ class _Turn:
                 self.emit("tool_call.ready", _call_data(call))
 
     def flush(self, messages: Iterable[ModelMessage]) -> None:
-        """Emit an item for each wire message not emitted yet, plus a usage event per model
-        response."""
+        """Emit an item for each wire message not emitted yet, then the queued usage events."""
         for message in messages:
             if id(message) in self.emitted:
                 continue
@@ -138,8 +138,9 @@ class _Turn:
                         native=mapping.dump(piece),
                     )
                     self.emit("item", {"item": item})
-            if isinstance(message, ModelResponse):
-                self.emit("usage", _usage(message, self.steps))
+        for step, response in self.responses:
+            self.emit("usage", _usage(response, step))
+        self.responses.clear()
 
 
 _TURN: ContextVar[_Turn] = ContextVar("pydantic_version_turn")
@@ -272,7 +273,7 @@ class PydanticLoop:
                 output_type=[str, DeferredToolRequests],
                 toolsets=[toolset],
                 capabilities=[
-                    Hooks(after_model_request=_billed_cost, before_tool_execute=_step_cap),
+                    Hooks(after_model_request=_on_model_response, before_tool_execute=_step_cap),
                     ProcessHistory(mapping.replayable),
                 ],
                 name=self.name,
@@ -378,7 +379,8 @@ def _pause(state: _Turn, calls: list[ToolCallPart]) -> dict[str, Any]:
 def _usage(response: ModelResponse, step: int) -> dict[str, Any]:
     usage = response.usage
     billed = (response.provider_details or {}).get("cost")
-    estimate = None if usage.cost is None else float(usage.cost)
+    # Without usage from the provider there is nothing to price: no estimate.
+    estimate = float(usage.cost) if usage.cost is not None and usage.has_values() else None
     source = "provider" if billed is not None else "estimate" if estimate is not None else "none"
     return {
         "step": step,
@@ -391,13 +393,16 @@ def _usage(response: ModelResponse, step: int) -> dict[str, Any]:
     }
 
 
-def _billed_cost(
+def _on_model_response(
     ctx: RunContext[_Turn], /, *, request_context: ModelRequestContext, response: ModelResponse
 ) -> ModelResponse:
-    """Use OpenRouter's billed cost as the response cost, so `RunUsage.cost` and `cost_limit`
-    count what was charged instead of pydantic-ai's price estimate."""
+    """Every response the model returns, before the library adds it to history and checks the
+    limits. OpenRouter's billed cost becomes the response cost, so `RunUsage` and `cost_limit`
+    count what was charged, and the usage event is queued (the response that crosses the cost
+    limit was billed too, although the library drops it)."""
     if (cost := (response.provider_details or {}).get("cost")) is not None:
         response.usage.cost = Decimal(str(cost))
+    ctx.deps.responses.append((ctx.deps.steps, response))
     return response
 
 

@@ -514,13 +514,17 @@ async def test_max_steps_stops_after_exactly_that_many_requests(loop):
 async def test_cost_without_provider_cost_is_labelled(loop):
     priced = [{**c, "model": "gpt-4o-mini"} for c in [*text("a"), done()]]
     unknown = [*text("b"), done()]
-    with SSEServer(Reply(priced), Reply(unknown)) as srv:
+    no_usage = [{**c, "model": "gpt-4o-mini"} for c in [*text("c"), chunk(finish="stop")]]
+    with SSEServer(Reply(priced), Reply(unknown), Reply(no_usage)) as srv:
         byok = config(srv, kind="openai_compat", model="gpt-4o-mini")
         estimated = of(await run(loop, turn([user("x")], byok), StubTools()), "usage")[0]
         missing = of(await run(loop, turn([user("y")], byok), StubTools()), "usage")[0]
+        unreported = of(await run(loop, turn([user("z")], byok), StubTools()), "usage")[0]
 
     assert estimated["cost_source"] == "estimate" and estimated["cost_usd"] > 0
     assert (missing["cost_source"], missing["cost_usd"]) == ("none", None)
+    # No usage from the endpoint: nothing to price, so no (zero) estimate either.
+    assert (unreported["cost_source"], unreported["cost_usd"]) == ("none", None)
 
 
 async def test_reasoning_details_round_trip(loop, record_property):
@@ -654,20 +658,26 @@ async def test_provider_error_ends_the_turn_with_error(loop):
     assert of(events, "error")[0]["retryable"] is False
     end = of(events, "turn.end")[0]
     assert end["stop"] == "error" and "unsigned reasoning" in end["error"]
+    # Nothing came back: no item (an empty assistant message is not sendable) and no usage.
+    assert (of(events, "item"), of(events, "usage")) == ([], [])
 
 
-async def test_cost_limit_ends_the_turn_with_budget(loop):
-    costly = Reply(
-        [*tool_call(0, "c0", "read_file", '{"path": "a"}'), done("tool_calls", cost=0.002)]
-    )
-    with SSEServer(costly) as srv:
+async def test_cost_limit_ends_the_turn_with_budget_and_reports_every_billed_step(loop):
+    def costly(n: int) -> Reply:
+        call = tool_call(0, f"c{n}", "read_file", '{"path": "a"}')
+        return Reply([*call, done("tool_calls", cost=0.0006)])
+
+    tools = StubTools()
+    with SSEServer(costly(0), costly(1)) as srv:
         limits = Limits(max_cost_usd=0.001)
-        events = await run(loop, turn([user("go")], config(srv), limits=limits), StubTools())
+        events = await run(loop, turn([user("go")], config(srv), limits=limits), tools)
 
-    assert of(events, "turn.end") == [{"stop": "budget", "steps": 1}]
-    # Recorded behavior: the library drops the response that crossed the limit from history,
-    # so it gets no item (and no usage event), and its tool call never runs.
-    assert of(events, "item") == []
+    assert of(events, "turn.end") == [{"stop": "budget", "steps": 2}]
+    # Recorded behavior: the library drops the response that crossed the limit from history, so
+    # it gets no item and its call never runs. It was billed, so it still gets its usage event.
+    assert [i.message["role"] for i in items(events)] == ["assistant", "tool"]
+    assert [c.id for c in tools.runs] == ["c0"]
+    assert [(u["step"], u["cost_usd"]) for u in of(events, "usage")] == [(1, 0.0006), (2, 0.0006)]
 
 
 async def test_reasoning_model_with_temperature_stays_quiet(capfd):

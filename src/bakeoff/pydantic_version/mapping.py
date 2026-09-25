@@ -58,9 +58,11 @@ def to_history(items: list[Item]) -> list[ModelMessage]:
 
 
 def to_openai(message: ModelMessage) -> list[dict[str, Any]]:
-    """The OpenAI chat messages for one native message: one per tool result or prompt, else one."""
+    """The OpenAI chat messages for one native message: one per tool result or prompt, one per
+    response, none for a response with nothing to send (the model skips those too)."""
     if isinstance(message, ModelResponse):
-        return [_assistant(replayable([message])[0])]
+        assistant = _assistant(replayable([message])[0])
+        return [assistant] if assistant is not None else []
     out: list[dict[str, Any]] = []
     for part in message.parts:
         if isinstance(part, ToolReturnPart):
@@ -124,7 +126,8 @@ def _tool(call_id: str, content: str) -> dict[str, Any]:
     return {"role": "tool", "tool_call_id": call_id, "content": content}
 
 
-def _assistant(response: ModelResponse) -> dict[str, Any]:
+def _assistant(response: ModelResponse) -> dict[str, Any] | None:
+    """The assistant message OpenRouterModel / OpenAIChatModel sends for a response, or None."""
     text = "".join(part.content for part in response.parts if isinstance(part, TextPart))
     message: dict[str, Any] = {"role": "assistant", "content": text or None}
     if response.tool_calls:
@@ -138,7 +141,7 @@ def _assistant(response: ModelResponse) -> dict[str, Any]:
         ]
     if details := [_reasoning_detail(p) for p in response.parts if isinstance(p, ThinkingPart)]:
         message["reasoning_details"] = details
-    return message
+    return message if text or response.tool_calls or details else None
 
 
 def _reasoning_detail(part: ThinkingPart) -> dict[str, Any]:
