@@ -489,6 +489,7 @@ class Runner:
             row = self.log.start_turn(thread_id, "revert")
             wc = WorkCopy(self.workdir(thread_id), lock_fd)
             try:
+                await self._reconcile(wc, thread_id, row["id"])  # e.g. after a failed revert
                 head = await wc.head()
                 sha, files = await wc.revert(target["commit_sha"])
             except Exception:
@@ -577,7 +578,10 @@ class Runner:
         something that must be resolved before `what`."""
         turns = self._git_turns(thread_id)
         last = turns[-1] if turns else None
-        if last is not None and last["status"] in waits and not last["commit_sha"]:
+        # A revert without a sha recorded nothing, and `_reconcile` undoes what git did for it.
+        if last is None or last["kind"] == "revert" or last["commit_sha"]:
+            return
+        if last["status"] in waits:
             raise RuntimeError(f"cannot {what}: turn {last['id']} {waits[last['status']]}")
 
     def _git_turns(self, thread_id: str) -> list[dict[str, Any]]:
@@ -585,14 +589,27 @@ class Runner:
         return [t for t in self.log.turns(thread_id) if t["kind"] != "compact"]
 
     async def _reconcile(self, wc: WorkCopy, thread_id: str, turn_id: str) -> None:
-        """Before turn `turn_id` uses git: if the turn before it died ("running") or failed to
-        commit ("error" without a sha), git may hold a commit that no turn recorded or a stale
-        lock. Move HEAD back to the last recorded commit; the changes after it stay staged, so
-        this turn's commit includes them."""
+        """Before turn `turn_id` uses git, repair what the git turn before it left, if that turn
+        died ("running") or failed ("error" without a sha): git may hold a commit that no turn
+        recorded, a stale lock, or a revert in progress.
+
+        A revert records its note, sha and commit event at once, so one without a sha recorded
+        nothing: undo all that git did for it (it started from a clean tree at the last recorded
+        commit) and mark it "error", so the model never sees changes it was not told about. For
+        any other turn, move HEAD back to the last recorded commit; the changes after it stay
+        staged, so this turn's commit includes them.
+        """
         turns = [t for t in self._git_turns(thread_id) if t["id"] != turn_id]
-        if turns and turns[-1]["status"] in ("running", "error") and not turns[-1]["commit_sha"]:
-            shas = [t["commit_sha"] for t in turns if t["commit_sha"]]
+        last = turns[-1] if turns else None
+        if last is None or last["status"] not in ("running", "error") or last["commit_sha"]:
+            return
+        shas = [t["commit_sha"] for t in turns if t["commit_sha"]]
+        if last["kind"] != "revert":
             await wc.recover(shas[-1] if shas else None)
+            return
+        await wc.recover(shas[-1] if shas else None, keep=False)
+        if last["status"] == "running":
+            self.log.set_turn_status(last["id"], "error")
 
     async def _watch_cancel(self, thread_id: str, since_us: int, cancel: asyncio.Event) -> None:
         # Polls because the request may come from another process (`bakeoff cancel`).

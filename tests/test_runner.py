@@ -1039,6 +1039,41 @@ async def test_a_revert_the_log_cannot_record_is_undone(runner, log, tid, monkey
     assert check.ok, check.detail
 
 
+@pytest.mark.parametrize("died", ["after-revert", "after-commit", "in-a-conflict"])
+async def test_a_crash_resume_undoes_a_revert_that_died(runner, log, tid, died):
+    await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
+    wd = runner.workdir(tid)
+    if died == "in-a-conflict":  # reverting turn 1 conflicts with turn 2's change
+        (wd / "a.pipe").write_text("changed\n")
+    await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")
+    head = git(wd, "rev-parse", "HEAD")
+    # The worker died inside revert(): its row says "running", its note was never recorded.
+    log.start_turn(tid, "revert")
+    git(wd, "revert", "--no-commit", log.turns(tid)[0]["commit_sha"])
+    if died == "after-commit":
+        git(wd, "commit", "-q", "--no-edit")
+    assert git(wd, "status", "--porcelain") != "" or died == "after-commit"
+    # Only a crash resume may start; it undoes the revert the model was never told about.
+    with pytest.raises(RuntimeError, match="running turn"):
+        await runner.revert(tid, f"{tid}.0")
+    finish = FakeLoop(only(Event("turn.end", {"stop": "end_turn", "steps": 0})))
+    await runner.turn(finish, tid, model=MODEL, resume=Resume(kind="crash"))
+    assert log.events(tid)[-1]["data"]["files"] == []
+    assert git(wd, "rev-parse", "HEAD~1") == head
+    assert (wd / "a.pipe").read_text() == ("changed\n" if died == "in-a-conflict" else "{}")
+    assert git(wd, "status", "--porcelain") == ""
+    assert [(t["kind"], t["status"]) for t in log.turns(tid)][2:] == [
+        ("revert", "error"),
+        ("crash", "done"),
+    ]
+    assert not any("Reverted" in str(i.message.get("content")) for i in log.items(tid))
+    check = check_commits(log, tid, wd)
+    assert check.ok, check.detail
+    if died != "in-a-conflict":
+        await runner.revert(tid, f"{tid}.0")  # it can be tried again
+        assert not (wd / "a.pipe").exists()
+
+
 async def test_a_refused_revert_the_log_cannot_discard_raises_gits_error(
     runner, log, tid, monkeypatch, caplog
 ):
@@ -1055,6 +1090,10 @@ async def test_a_refused_revert_the_log_cannot_discard_raises_gits_error(
         await runner.revert(tid, f"{tid}.0")
     assert "discarding turn" in caplog.text
     assert [(t["kind"], t["status"]) for t in log.turns(tid)][-1] == ("revert", "error")
+    monkeypatch.undo()
+    # The failed revert changed nothing, so another revert need not wait for a turn.
+    await runner.revert(tid, f"{tid}.1")
+    assert (runner.workdir(tid) / "a.pipe").read_text() == "{}"
     await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="three")
     check = check_commits(log, tid, runner.workdir(tid))
     assert check.ok, check.detail
