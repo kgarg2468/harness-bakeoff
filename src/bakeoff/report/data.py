@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Any, NamedTuple
+from urllib.parse import urlsplit
 
 # Long texts are cut here; the page shows a shorter preview with an expand control.
 CARD_LIMIT = 6_000  # one transcript card (a tool result, an answer)
@@ -789,6 +790,9 @@ _LIVE_KEYS = (
 
 # The model settings a live answer depends on (ModelConfig fields), besides the endpoint.
 _LIVE_SETTINGS = ("model", "kind", "reasoning", "temperature", "max_tokens", "compat")
+# What a live run depends on that only its result.json records (the session log does not keep
+# it), with its type. Results written before `bakeoff live` recorded them lack them.
+_LIVE_RUN_FIELDS: dict[str, type] = {"max_steps": int, "attended": bool}
 
 
 def endpoint(base_url: str | None) -> str:
@@ -796,6 +800,14 @@ def endpoint(base_url: str | None) -> str:
     if not base_url:
         return ""
     return base_url.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0].rsplit("@", 1)[-1].lower()
+
+
+def route(base_url: str | None, impl: str) -> str:
+    """The path of a base URL, with a segment that is the loop's name put back as "{impl}":
+    `--base-url` gives each loop its own path that way (one fake-server cursor per loop), and
+    the loops of one run must still compare. Other paths are other routes. Never the query."""
+    path = urlsplit(base_url or "").path.rstrip("/")
+    return "/".join("{impl}" if part == impl else part for part in path.split("/"))
 
 
 def _thread_setup(log: Path, thread: Any) -> tuple[dict[str, Any], str] | str:
@@ -820,33 +832,45 @@ def _thread_setup(log: Path, thread: Any) -> tuple[dict[str, Any], str] | str:
 def live_settings(idir: Path, result: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
     """What a live run's answer depends on besides the loop and the prompt, or None and why its
     session log cannot tell. That is the model settings and the system prompt from the log
-    (result.json has only the model and base_url), with the base_url cut to its endpoint (the
-    per-loop path on one server is still one endpoint) and the system prompt to a hash (it
-    changes with the harness code, so runs of one user prompt can still differ in it)."""
+    (result.json has only the model and base_url), with the base_url split into its endpoint
+    and its route (see `route`) and the system prompt cut to a hash (it changes with the harness
+    code, so runs of one user prompt can still differ in it); plus the `_LIVE_RUN_FIELDS` that
+    result.json records (`unrecorded` names those it lacks)."""
     setup = _thread_setup(idir / "log.sqlite", result.get("thread"))
     if isinstance(setup, str):
         return None, setup
     model, system = setup
+    base_url = model.get("base_url") or result.get("base_url")
     return {
-        "endpoint": endpoint(model.get("base_url") or result.get("base_url")),
+        "endpoint": endpoint(base_url),
+        "path": route(base_url, idir.name),
         **{k: model.get(k, result.get(k)) for k in _LIVE_SETTINGS},
         "system": hashlib.sha256(system.encode()).hexdigest()[:12],
+        # A run that lacks one is in no group (see `load_live`), whatever this says.
+        **{k: result.get(k) for k in _LIVE_RUN_FIELDS},
     }, None
+
+
+def unrecorded(result: dict[str, Any]) -> list[str]:
+    """The `_LIVE_RUN_FIELDS` a live result.json lacks (or holds with the wrong type)."""
+    # `type(...) is` so that True is not a max_steps (bool is a subclass of int).
+    return [k for k, kind in _LIVE_RUN_FIELDS.items() if type(result.get(k)) is not kind]
 
 
 def load_live(live_dir: Path | None) -> tuple[list[dict[str, Any]], list[str]]:
     """The newest live runs (`out/live/<run_id>/<impl>/result.json`), newest first.
 
-    Each run's `group` names its prompt and model settings: runs compare (and pool into medians)
-    only within a group. It is None when the run's loops differ in either, or when a loop's
-    settings are unknown (its session log cannot tell): `unknown` lists those loops, since
-    runs whose settings are unknown could differ in any of them."""
+    Each run's `group` names its prompt and settings: runs compare (and pool into medians) only
+    within a group. It is None when the run's loops differ in either, or when a loop's settings
+    are unknown, since runs whose settings are unknown could differ in any of them: `unknown`
+    lists the loops whose session log cannot tell the model settings, and `unrecorded` maps a
+    loop to the `_LIVE_RUN_FIELDS` its result.json lacks (it predates them)."""
     if live_dir is None or not live_dir.is_dir():
         return [], []
     runs, problems = [], []
     folders = sorted(_subdirs(live_dir), key=lambda p: natural_key(p.name), reverse=True)
     for run in folders[:MAX_LIVE_RUNS]:
-        results, setups, unknown = {}, set(), []
+        results, setups, unknown, missing = {}, set(), [], {}
         for idir in sorted(_subdirs(run), key=lambda p: impl_order(p.name)):
             data, problem = read_json(idir / "result.json")
             if problem:
@@ -864,6 +888,13 @@ def load_live(live_dir: Path | None) -> tuple[list[dict[str, Any]], list[str]]:
                         f"live/{run.name}/{idir.name}/log.sqlite: {why}; the run's model settings "
                         "are unknown, so it is not in the live medians"
                     )
+                if fields := unrecorded(data):
+                    missing[idir.name] = fields
+                    problems.append(
+                        f"live/{run.name}/{idir.name}/result.json: no {', '.join(fields)} (older "
+                        "results lack them); the run's settings are unknown, so it is not in the "
+                        "live medians"
+                    )
                 results[idir.name] = slim
                 # The full prompt: two prompts may differ only after the clipped part.
                 setup = [str(data.get("prompt") or ""), slim["settings"]]
@@ -872,11 +903,11 @@ def load_live(live_dir: Path | None) -> tuple[list[dict[str, Any]], list[str]]:
             prompt = next((r["prompt"] for r in results.values() if r["prompt"]), "")
             group = (
                 hashlib.sha256(setups.pop().encode()).hexdigest()[:16]
-                if len(setups) == 1 and not unknown
+                if len(setups) == 1 and not unknown and not missing
                 else None
             )
             runs.append({"run_id": run.name, "prompt": prompt, "results": results, "group": group,
-                         "unknown": unknown})  # fmt: skip
+                         "unknown": unknown, "unrecorded": missing})  # fmt: skip
     return runs, problems
 
 

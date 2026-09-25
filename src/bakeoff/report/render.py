@@ -1095,9 +1095,8 @@ def live(page: Page) -> str:
             )
         # Which runs the medians in section 6 pool: those of one prompt and model setup. The
         # number is the one the claims name, so a reader can tell two similar setups apart.
-        if unknown := run.get("unknown"):
-            who = ", ".join(loop_info(i).letter for i in unknown)
-            setup = f" · model settings unknown (no readable session log for {esc(who)}): not in the medians"
+        if unknown := _unknown_settings(run):
+            setup = f" · {esc(unknown)}: not in the medians"
         elif not run.get("group"):
             setup = " · the loops ran different prompts or model settings: not in the medians"
         else:
@@ -1110,6 +1109,23 @@ def live(page: Page) -> str:
             f'<div class="live-cols">{"".join(cols)}</div></div>'
         )
     return "".join(out)
+
+
+def _unknown_settings(run: dict[str, Any]) -> str:
+    """ "model settings unknown (no readable session log for A)": what a live run cannot tell
+    about its setup, and why; "" if it can tell everything."""
+    parts = []
+    if unknown := run.get("unknown"):
+        who = ", ".join(loop_info(i).letter for i in unknown)
+        parts.append(f"model settings unknown (no readable session log for {who})")
+    by_fields: dict[str, list[str]] = {}  # "max_steps, attended" -> the loops that lack them
+    for impl, fields in (run.get("unrecorded") or {}).items():
+        by_fields.setdefault(", ".join(fields), []).append(loop_info(impl).letter)
+    parts += [
+        f"{fields} unknown (not in the result.json of {', '.join(letters)})"
+        for fields, letters in by_fields.items()
+    ]
+    return "; ".join(parts)
 
 
 def _cost(cost: float | None, source: str | None) -> str:
@@ -1434,6 +1450,9 @@ def _setup(settings: dict[str, Any], varying: set[str]) -> str:
         parts.append(f"reasoning {_setting(reasoning)}")
     parts.append(settings.get("endpoint") or ("unknown endpoint" if "endpoint" in varying else ""))
     for key in sorted(varying - {"model", "reasoning", "endpoint"}):
+        if key == "attended":  # whether a person answered approvals
+            parts.append("attended" if settings.get(key) else "unattended")
+            continue
         # The system prompt is a hash: it is long, and only whether it changed matters here.
         name = "system prompt #" if key == "system" else f"{key} "
         parts.append(f"{name}{_setting(settings.get(key))}")

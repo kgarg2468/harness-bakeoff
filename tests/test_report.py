@@ -243,7 +243,7 @@ def out(tmp_path: Path) -> Path:
     for impl, seconds in (("our", 2.5), ("pydantic", 3.25)):
         write_json(out / "live" / "L1" / impl / "result.json", {
             "v": 1, "run_id": "L1", "impl": impl, "model": "gpt-test", "prompt": "What is RocketRide?",
-            "base_url": "https://api.openai.com/v1",
+            "base_url": "https://api.openai.com/v1", "max_steps": 8, "attended": False,
             "final_text": f"answer from {impl}", "stops": ["end_turn"], "requests": 3, "tool_runs": {"c": 1},
             "usage": {"input_tokens": 1234, "output_tokens": 56, "cached_tokens": 0, "cost_usd": None,
                       "cost_source": "none"}, "duration_ms": seconds * 1000, "passed": True,
@@ -653,20 +653,23 @@ def test_a_live_run_that_did_not_pass_is_not_a_sample(out: Path) -> None:
 def write_live(
     live: Path, run_id: str, impl: str, seconds: float, *, prompt: str = "What is RocketRide?",
     model: str = "gpt-test", reasoning: str = "low", system: str = "sys", max_tokens: int = 4096,
+    base_url: str = "https://api.openai.com/v1", max_steps: int = 8, attended: bool = False,
     **extra: Any,
 ) -> None:  # fmt: skip
     """One loop's live run: result.json (plus `extra`), and the session log's thread row with the
-    system prompt and the model config (minus the key), as `bakeoff live` saves them."""
+    system prompt and the model config (minus the key), as `bakeoff live` saves them. `{impl}` in
+    `base_url` becomes the loop's name, as `--base-url` does."""
     folder = live / run_id / impl
-    base_url = "https://api.openai.com/v1"
+    base_url = base_url.replace("{impl}", impl)
     write_json(folder / "result.json", {
         "v": 1, "run_id": run_id, "impl": impl, "model": model, "base_url": base_url,
-        "prompt": prompt, "final_text": "ok", "stops": ["end_turn"], "steps": 1, "requests": 1,
-        "usage": {"input_tokens": 100}, "duration_ms": seconds * 1000, "passed": True,
-        "error": None, "thread": f"live-{impl}", **extra,
+        "max_steps": max_steps, "attended": attended, "prompt": prompt, "final_text": "ok",
+        "stops": ["end_turn"], "steps": 1, "requests": 1, "usage": {"input_tokens": 100},
+        "duration_ms": seconds * 1000, "passed": True, "error": None, "thread": f"live-{impl}",
+        **extra,
     })  # fmt: skip
     write_thread(folder, impl, system=system, model=model, reasoning={"effort": reasoning},
-                 max_tokens=max_tokens)  # fmt: skip
+                 max_tokens=max_tokens, base_url=base_url)  # fmt: skip
 
 
 def write_thread(folder: Path, impl: str, *, system: str = "sys", **config: Any) -> None:
@@ -802,6 +805,67 @@ def test_a_live_run_without_a_readable_log_has_unknown_settings(out: Path, tmp_p
     unknown = "the run's model settings are unknown, so it is not in the live medians"
     assert f"live/L3/pydantic/log.sqlite: missing; {unknown}" in text
     assert "live/L4/our/log.sqlite: unreadable (DatabaseError: file is not a database)" in text
+
+
+@pytest.mark.parametrize(
+    ("key", "first", "second", "labels"),
+    [
+        ("max_steps", 8, 20, ("api.openai.com, max_steps 8", "api.openai.com, max_steps 20")),
+        ("attended", False, True, ("api.openai.com, unattended", "api.openai.com, attended")),
+        # The same host, other routes; within a run the loops' paths differ only in their name.
+        ("base_url", "http://127.0.0.1:8787/s/a/{impl}/v1", "http://127.0.0.1:8787/s/b/{impl}/v1",
+         ("127.0.0.1:8787, path /s/a/{impl}/v1", "127.0.0.1:8787, path /s/b/{impl}/v1")),
+    ],
+)  # fmt: skip
+def test_live_medians_pool_only_runs_of_one_run_setup(
+    out: Path, tmp_path: Path, key: str, first: Any, second: Any, labels: tuple[str, str]
+) -> None:
+    """Runs of one prompt and model config that differ in the step cap, in whether a person
+    approved, or in the route on one host are two groups, each named by what sets it apart."""
+    live = tmp_path / "live"
+    for run_id, value, ours in (
+        ("L1", first, 1.0), ("L2", first, 1.1), ("L3", second, 3.0), ("L4", second, 3.1),
+    ):  # fmt: skip
+        write_live(live, run_id, "our", ours, **{key: value})
+        write_live(live, run_id, "pydantic", 2.0, **{key: value})
+    text = re.sub(r"<[^>]+>", "", make(out, live=live))
+    assert "over 4 live runs" not in text
+    # Newest first among groups of one size: L3/L4 is setup 1.
+    for n, label, seconds in ((1, labels[1], "3.05 s"), (2, labels[0], "1.05 s")):
+        assert (
+            f"Less time per step: median B {seconds} vs A 2.00 s over 2 live runs of one prompt "
+            f"and setup (setup {n}: “What is RocketRide?”; gpt-test, reasoning low, {label};"
+        ) in text
+
+
+def test_live_runs_that_do_not_record_their_run_setup_are_not_pooled(
+    out: Path, tmp_path: Path
+) -> None:
+    """A result.json from before `bakeoff live` recorded max_steps and attended cannot tell
+    them: its run is in no group (not even with other such runs, which may differ in them), and
+    the page says why."""
+    live = tmp_path / "live"
+    for run_id in ("L1", "L2", "L3", "L4"):
+        write_live(live, run_id, "our", 2.0)
+        write_live(live, run_id, "pydantic", 3.0)
+    for run_id, impls in (("L3", ("pydantic",)), ("L4", ("our", "pydantic"))):
+        for impl in impls:
+            path = live / run_id / impl / "result.json"
+            older = {k: v for k, v in json.loads(path.read_text()).items()
+                     if k not in ("max_steps", "attended")}  # fmt: skip
+            write_json(path, older)
+    text = unescape(re.sub(r"<[^>]+>", "", make(out, live=live)))
+    assert "over 2 live runs of one prompt and setup (setup 1:" in text
+    assert "over 4 live runs" not in text and "setup 2" not in text
+    for run_id, who in (("L3", "A"), ("L4", "B, A")):
+        assert (
+            f"live run {run_id} · max_steps, attended unknown (not in the result.json of {who}): "
+            "not in the medians"
+        ) in text
+    assert (
+        "live/L4/our/result.json: no max_steps, attended (older results lack them); the run's "
+        "settings are unknown, so it is not in the live medians"
+    ) in text
 
 
 def test_live_medians_pool_only_runs_of_one_system_prompt(out: Path, tmp_path: Path) -> None:
