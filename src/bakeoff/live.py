@@ -304,16 +304,32 @@ async def _read_line(fd: int, pending: bytearray, stop: asyncio.Future[None]) ->
 # --- one live thread ---------------------------------------------------------------------------------
 
 
-def system_prompt() -> str:
+# RocketRide's skills stop at approval gates and wait for a person. In a run with nobody to
+# answer (no "ask" rules), that would end every build at the first gate.
+UNATTENDED = (
+    "This run is unattended: nobody can answer approval gates. When a skill says to present a"
+    " gate and wait, state what you chose in one line, treat it as approved, and keep going"
+    " until the task is done. Do not write gate state files."
+)
+
+
+def system_prompt(*, attended: bool = True) -> str:
     """The scenarios' system prompt (Rocket Agent builds RocketRide pipelines), plus the skills
-    index when `bakeoff.shared.skills` is available."""
+    index when `bakeoff.shared.skills` is available, plus `UNATTENDED` when nobody approves."""
     base = load_scenario(SCENARIOS_DIR / "S01.json").system
+    if not attended:
+        base = f"{base}\n\n{UNATTENDED}"
     if importlib.util.find_spec("bakeoff.shared.skills") is None:
         return base
     from bakeoff.shared import skills  # optional: lands with the skills package
 
     extra = getattr(skills, "skills_prompt", None)
     return f"{base}\n\n{extra()}" if extra is not None else base
+
+
+def _attended(rules: dict[str, Any]) -> bool:
+    """Whether a person approves anything in this run (some rule says "ask")."""
+    return any(v == "ask" or (isinstance(v, dict) and "ask" in v.values()) for v in rules.values())
 
 
 @dataclass(slots=True)
@@ -362,7 +378,7 @@ class LiveThread:
         try:
             self.thread_id = self.ws.runner.new_thread(
                 impl=self.loop.name,
-                system=system_prompt(),
+                system=system_prompt(attended=_attended(rules)),
                 rules=rules,
                 model=self.model,
                 thread_id=f"live-{impl}",
