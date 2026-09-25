@@ -36,6 +36,7 @@ from bakeoff.shared.contract import (
     ToolSpec,
     TurnInput,
 )
+from bakeoff.shared.invariants import check_prefix, load_wire
 
 PATH = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
 PIPELINE = {  # like the engine's validate_pipeline: `pipeline` is a free-form object
@@ -1181,6 +1182,11 @@ def responses_config(srv: FakeProvider, **kw: Any) -> ModelConfig:
     )
 
 
+def sent(tmp_path: Path) -> list[bytes]:
+    """The request bodies fakeprov recorded for `responses_config`'s cursor, in order."""
+    return [body for body, _ in load_wire(tmp_path / "wire" / "R" / "r1" / "pydantic")]
+
+
 async def test_responses_reasoning_goes_back_verbatim_and_stays_out_of_the_chat_view(
     loop, tmp_path
 ):
@@ -1229,6 +1235,107 @@ async def test_responses_reasoning_goes_back_verbatim_and_stays_out_of_the_chat_
     assert [d["text"] for d in of(first, "reasoning.delta")] == ["Plan", "Go"]
     assert of(first, "usage")[0]["reasoning_tokens"] == 6
     assert of(second, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+
+
+@pytest.mark.parametrize("end", ["completed", "incomplete"])
+async def test_responses_a_reasoning_only_response_keeps_its_place_in_the_history(
+    loop, tmp_path, end
+):
+    """A response that is only a reasoning item (max_output_tokens ran out while the model
+    reasoned: `.incomplete`) is replayed by the library, so it gets an item with no content. The
+    history rebuilt from the items then sends what the run sent, and the retry prompt stays after
+    the user's message. 2.31.1 asks again within the turn; 2.50.0 ends the turn at the token
+    limit (`.incomplete`), and the next turn replays the reasoning."""
+    usage = {"input_tokens": 20, "output_tokens": 16, "reasoning_tokens": 16}
+    answer = [{"text": "Hello!"}, COMPLETED]
+    exchanges = [
+        {"respond": {"stream": [{"reasoning_item": REASONING}, {end: usage}]}},
+        *[{"expect": {"reasoning_replayed": ["rs_1"]}, "respond": {"stream": answer}}] * 2,
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        first = await run(loop, turn([user("hi")], responses_config(srv)), StubTools())
+        history = [user("hi"), *items(first), user("again")]
+        second = await run(loop, turn(history, responses_config(srv)), StubTools())
+
+    reasoning_only = items(first)[0]
+    assert reasoning_only.message == {"role": "assistant", "content": None}
+    assert reasoning_only.native["parts"][0]["signature"] == REASONING["encrypted_content"]
+    asked_again = of(first, "turn.end")[0]["stop"] == "end_turn"
+    assert asked_again or end == "incomplete"
+    assert of(second, "turn.end")[0]["stop"] == "end_turn"
+    bodies = sent(tmp_path)
+    assert len(bodies) == (3 if asked_again else 2)
+    assert (i1 := check_prefix(bodies)).ok, i1.detail
+
+
+async def test_responses_a_retried_stream_extends_a_reasoning_only_step(loop, tmp_path):
+    """The step after a reasoning-only response fails midway (an `error` event) and is retried
+    from the saved items: the retry sends exactly what the failed attempt sent."""
+    cut = {"respond": {"stream": [{"text": "Hel", "done": False}, {"error": {"message": "boom"}}]}}
+    exchanges = [
+        {"respond": {"stream": [{"reasoning_item": REASONING}, COMPLETED]}},
+        {"expect": {"reasoning_replayed": ["rs_1"]}, **cut},
+        {
+            "expect": {"reasoning_replayed": ["rs_1"]},
+            "respond": {"stream": [{"text": "Hi"}, COMPLETED]},
+        },
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        events = await run(
+            loop, turn([user("hi")], responses_config(srv, max_retries=1)), StubTools()
+        )
+
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+    first, failed, retried = sent(tmp_path)
+    assert retried == failed
+    assert (i1 := check_prefix([first, failed, retried])).ok, i1.detail
+
+
+async def test_responses_a_reasoning_item_cut_short_is_never_replayed(loop, tmp_path):
+    """`.incomplete` can end a response before its reasoning item is done: the item has no
+    encrypted content, which is all the API knows it by with store false (404). The loop drops
+    it from any replay, and the response's empty item keeps the history in order."""
+    usage = {"input_tokens": 20, "output_tokens": 16, "reasoning_tokens": 16}
+    answer = {"respond": {"stream": [{"text": "Hello!"}, COMPLETED]}}
+    exchanges = [
+        {
+            "respond": {
+                "stream": [{"reasoning_item": REASONING, "done": False}, {"incomplete": usage}]
+            }
+        },
+        answer,
+        answer,
+    ]
+    with responses_server(tmp_path, *exchanges) as srv:
+        first = await run(loop, turn([user("hi")], responses_config(srv)), StubTools())
+        history = [user("hi"), *items(first), user("again")]
+        second = await run(loop, turn(history, responses_config(srv)), StubTools())
+
+    assert items(first)[0].message == {"role": "assistant", "content": None}
+    assert of(second, "turn.end")[0]["stop"] == "end_turn"
+    bodies = sent(tmp_path)
+    assert not [
+        i for body in bodies for i in json.loads(body)["input"] if i.get("type") == "reasoning"
+    ]
+    assert (i1 := check_prefix(bodies)).ok, i1.detail
+
+
+async def test_an_empty_chat_response_keeps_its_place_in_the_history(loop):
+    """Chat completions too: the library skips an empty response on the wire and asks again,
+    but without its item the rebuilt history would put the retry prompt before the user's
+    message (the library's merge of consecutive requests moves it first)."""
+    replies = [
+        Reply([done(completion=0)]),
+        Reply([*text("Hello!"), done()]),
+        Reply([*text("Hi"), done()]),
+    ]
+    with SSEServer(*replies) as srv:
+        first = await run(loop, turn([user("hi")], config(srv)), StubTools())
+        history = [user("hi"), *items(first), user("again")]
+        await run(loop, turn(history, config(srv)), StubTools())
+
+    assert items(first)[0].message == {"role": "assistant", "content": None}
+    assert (i1 := check_prefix(srv.bodies)).ok, i1.detail
 
 
 @pytest.mark.parametrize("failure", ["error", "failed"])

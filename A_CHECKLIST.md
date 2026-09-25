@@ -69,14 +69,20 @@ If you'd do something differently, edit this file in a PR, and A will be changed
       finished write again; read-only results are saved from the next request node, in call order,
       and the request is sent only after the runner has handled them. A history that ends with the
       user's request is passed as-is, with no `user_prompt`. A crash resume whose history already
-      ends the turn (the final answer, or a cancelled response) sends nothing.*
+      ends the turn (the final answer, or a cancelled response) sends nothing; a response with
+      neither text nor calls is no answer (the library asks again). A complete response with
+      nothing to show (only a Responses reasoning item, which the library replays, or an empty
+      one) still gets an item, with no content: without it the requests on either side would
+      merge on rebuild, and the merge puts the retry prompt before the user's message.*
 - [x] **Cancel**: `CancellationToken`.
       *The token cancels the task that drives the run, so the run gets its own task. Calls a cancel
       leaves open get the same `interrupted` results the library would synthesize, persisted now
       (or by the crash resume, if a crash came first). The library replays an interrupted
       response as it was, so a `ProcessHistory` capability drops its unsigned thinking (the
       signature only arrives at the end of a thinking block, and endpoints that check signatures,
-      like Anthropic, reject it); the item's native keeps it.*
+      like Anthropic, reject it); the item's native keeps it. On the Responses API the signature is
+      a reasoning item's encrypted content, which is on its first part only: a reasoning item
+      none of whose parts is signed is dropped whole, from any response (below).*
 - [x] **Limits**: `UsageLimits(request_limit=max_steps)`, with `UsageLimitExceeded` mapped to `max_steps`.
       *`max_cost_usd` uses `cost_limit` and maps to `budget` (checked first, so crossing it on the
       last step is `budget`). The library drops the response that crosses it from history, though
@@ -148,6 +154,11 @@ The library has no mechanism for these, so A has its own code (counted like ever
 - **The chat-shaped view of a Responses response** (2 lines in `mapping._assistant`, and a
   `responses_api` flag from `_Turn` through `to_openai`): `Item.message` leaves the reasoning
   items out; without this they would look like BYOK thinking fields.
+- **An item for a response with nothing to show** (2 lines in `to_openai`, 1 in `finished`): a
+  reasoning-only or empty response is on the history the library sends from, so it is saved too,
+  or the rebuilt history would merge the requests around it (History, above).
+- **Dropping a Responses reasoning item that has no encrypted content** (5 lines in
+  `mapping.replayable`, and a 2-line `_replayable` that passes the `responses_api` flag).
 - **Importing the SDK's chat and responses resources at module import** (`model.py`, 2 lines):
   the first `OpenAIChatModel` (`OpenAIResponsesModel`) loads them lazily, which blocked the event
   loop for about 0.3 s (0.09 s) inside the first turn on openai 2.x. What remains of the first
@@ -178,7 +189,18 @@ The library has no mechanism for these, so A has its own code (counted like ever
   usage instead (above).
 - **Recorded**: on 2.31.1 a `response.failed` or `response.incomplete` sets no finish reason (2.50.0
   maps them to `error` and `length`), so A tells a failed stream by its missing usage, the same
-  on both. A `response.failed` that does carry usage is taken for a finished response.
+  on both. A `response.failed` that does carry usage is taken for a finished response. So when
+  `max_output_tokens` runs out while the model reasons (OpenAI documents a reasoning-only
+  `.incomplete` output), 2.31.1 asks again with its retry prompt ("Please return text or call a
+  tool."), while 2.50.0 ends the turn with `UnexpectedModelBehavior` (token limit exceeded).
+- **Recorded**: the library merges consecutive requests before it sends them, with tool results
+  and retry prompts first. A response it sends nothing for (a reasoning-only or empty one) still
+  separates two requests in its history, so A saves it (Code A had to add, above).
+- **Worked around** (bug): a response that ends (`.incomplete`) before its reasoning item's done
+  event keeps a thinking part without its encrypted content, which the library replays with
+  `"encrypted_content": null` (on 2.31.1 in the same run, as it asks again); with `store: false`
+  the API answers 404 (fakeprov does; whether OpenAI ends a stream that way is not confirmed).
+  A's `ProcessHistory` drops such an item.
 - **Worked around**: a `cost_limit` drops the response that crosses it from history (above).
 - **Worked around**: `DeferredToolResults` needs an answer for every open call, so there is no
   partial approval (above).

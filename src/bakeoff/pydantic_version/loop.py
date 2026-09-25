@@ -401,7 +401,7 @@ class PydanticLoop:
                         tool_validate_error=_unparsed_args,
                         before_tool_execute=_before_execute,
                     ),
-                    ProcessHistory(mapping.replayable),
+                    ProcessHistory(_replayable),
                 ],
                 name=self.name,
             )
@@ -445,6 +445,10 @@ def _tool(spec: ToolSpec) -> Tool[_Turn]:
     # `validate_pipeline.pipeline` into "must be empty". Our schemas are not strict schemas.
     tool.strict = False
     return tool
+
+
+def _replayable(ctx: RunContext[_Turn], messages: list[ModelMessage]) -> list[ModelMessage]:
+    return mapping.replayable(messages, ctx.deps.responses_api)
 
 
 def _needs_approval(ctx: RunContext[_Turn], tool_def: ToolDefinition, args: dict[str, Any]) -> bool:

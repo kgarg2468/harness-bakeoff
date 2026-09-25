@@ -63,9 +63,14 @@ def to_history(items: list[Item]) -> list[ModelMessage]:
 
 def to_openai(message: ModelMessage, responses_api: bool = False) -> list[dict[str, Any]]:
     """The OpenAI chat messages for one native message: one per tool result or prompt, one per
-    response, none for a response with nothing to send (the model skips those too)."""
+    response. A response cut short with nothing left to send gets none. A complete one with
+    nothing to show (say, only a Responses reasoning item, which the library replays) still gets
+    one, with no content: without it the requests on either side of it merge when the history is
+    rebuilt, and the library's merge puts the retry prompt before the user's message."""
     if isinstance(message, ModelResponse):
         assistant = _assistant(replayable([message])[0], responses_api)
+        if assistant is None and message.state != "interrupted":
+            assistant = {"role": "assistant", "content": None}
         return [assistant] if assistant is not None else []
     out: list[dict[str, Any]] = []
     for part in message.parts:
@@ -80,15 +85,27 @@ def to_openai(message: ModelMessage, responses_api: bool = False) -> list[dict[s
     return out
 
 
-def replayable(messages: list[ModelMessage]) -> list[ModelMessage]:
+def replayable(messages: list[ModelMessage], responses_api: bool = False) -> list[ModelMessage]:
     """The history as the loop replays it (a `ProcessHistory` capability): a response cut short by
     a cancel loses its unsigned thinking. The signature only arrives at the end of a thinking
-    block, and endpoints that check signatures (Anthropic) reject a replay without one."""
+    block, and endpoints that check signatures (Anthropic) reject a replay without one.
+
+    On the Responses API the signature is a reasoning item's encrypted content, the only way the
+    API knows the item with `store: false` (404 without it). It is on the item's first part only,
+    so an item goes whole: kept if a part is signed, else dropped, from any response (one can end,
+    `.incomplete`, before its reasoning item is done)."""
     out: list[ModelMessage] = []
     for message in messages:
-        if isinstance(message, ModelResponse) and message.state == "interrupted":
+        if isinstance(message, ModelResponse):
+            signed = {p.id for p in message.parts if isinstance(p, ThinkingPart) and p.signature}
+            # Unsigned thinking stays if its reasoning item is signed (Responses API), or if the
+            # response is complete (chat completions).
             parts = [
-                p for p in message.parts if not (isinstance(p, ThinkingPart) and not p.signature)
+                p
+                for p in message.parts
+                if not isinstance(p, ThinkingPart)
+                or p.signature
+                or (p.id in signed if responses_api else message.state != "interrupted")
             ]
             if len(parts) < len(message.parts):
                 message = replace(message, parts=parts)
@@ -160,12 +177,13 @@ def finished(history: list[ModelMessage], max_cost_usd: float | None = None) -> 
     """How the turn ended if its end is already saved (a crash came after it): "end_turn" after
     the final answer ("budget" if the turn's cost crossed `max_cost_usd`, as the original run
     reported), "cancelled" after a response cut short (a cancel, or a failed stream that ended
-    the turn). None if the turn goes on."""
+    the turn). None if the turn goes on: a response with no text and no calls (say, reasoning
+    only) is no answer, and the library asks again."""
     turn = this_turn(history)
     response = next((m for m in reversed(turn) if isinstance(m, ModelResponse)), None)
     if response is not None and response.state == "interrupted":
         return "cancelled"
-    if turn and turn[-1] is response and not response.tool_calls:
+    if turn and turn[-1] is response and not response.tool_calls and response.text:
         cost = spent(history).cost or 0
         over = max_cost_usd is not None and cost > Decimal(str(max_cost_usd))
         return "budget" if over else "end_turn"
