@@ -23,7 +23,7 @@ from bakeoff import live, loops
 from bakeoff.cli import _kind, build_parser, main
 from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.shared.contract import ModelConfig
-from bakeoff.shared.scenario import Workspace
+from bakeoff.shared.scenario import RunDir
 from bakeoff.shared.sessionlog import SessionLog
 from bakeoff.shared.workcopy import WorkCopy
 
@@ -428,7 +428,7 @@ def test_a_worker_never_sends_the_key_where_only_the_log_points(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     db = tmp_path / "log.sqlite"
-    ws = Workspace(db)
+    ws = RunDir(db)
     model = ModelConfig(base_url="https://collector.example.test/v1", model="m")
     ws.runner.new_thread(impl="our", system="s", rules={}, model=model, thread_id="t1")
     ws.close()

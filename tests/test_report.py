@@ -102,7 +102,7 @@ def our_events(thread: str = "S01-our") -> list[dict[str, Any]]:
         env(thread, t, 11, 2900, "usage", step=2, input_tokens=900, output_tokens=40, cached_tokens=0, cost_usd=0.0033, cost_source="provider"),
         env(thread, t, 12, 3000, "item", **item(t, "a2", {"role": "assistant", "content": "All done."})),
         env(thread, t, 13, 3100, "turn.end", stop="end_turn", steps=2),
-        env(thread, t, 14, 5000, "commit", sha="abc1234def", files=["a.txt"]),
+        env(thread, t, 14, 5000, "turn.saved", version="abc1234def", files=["a.txt"]),
     ]  # fmt: skip
 
 
@@ -162,7 +162,7 @@ def write_pydantic_log(path: Path, thread: str = "S01-pydantic") -> None:
         commit_sha="fff0000",
         events=[
             event_row(env(thread, t1, 11, 1800, "turn.end", stop="end_turn", steps=1)),
-            event_row(env(thread, t1, 12, 2500, "commit", sha="fff0000", files=[])),
+            event_row(env(thread, t1, 12, 2500, "turn.saved", version="fff0000", files=[])),
         ],
     )
     log.close()  # fmt: skip
@@ -298,7 +298,7 @@ def test_replay_and_wire_data(out: Path) -> None:
     scenarios = {s["id"]: s for s in Page(make(out)).data["scenarios"]}
     ours = scenarios["S01"]["runs"]["our"]["replay"]
     kinds = [c["k"] for c in ours["cards"]]
-    assert kinds == ["user", "assistant", "result", "assistant", "end", "commit"]
+    assert kinds == ["user", "assistant", "result", "assistant", "end", "saved"]
     (tool,) = ours["lanes"]["tools"]
     assert tool["eager"] is True and tool["t0"] == 1.0 and tool["t1"] == 2.1  # ms
     assert [m["end"] for m in ours["lanes"]["model"]] == ["ok", "ok"]
@@ -306,7 +306,7 @@ def test_replay_and_wire_data(out: Path) -> None:
     theirs = scenarios["S01"]["runs"]["pydantic"]["replay"]
     assert [t["kind"] for t in theirs["turns"]] == ["user", "crash"]
     kinds = [c["k"] for c in theirs["cards"]]
-    assert kinds == ["user", "crash", "resume", "retry", "assistant", "end", "commit"]
+    assert kinds == ["user", "crash", "resume", "retry", "assistant", "end", "saved"]
     assert theirs["stats"]["retries"] == 1
     assert [m["end"] for m in theirs["lanes"]["model"]] == ["killed", "retry", "ok"]
     # Wire: the tool list is stored once for all three bodies, found in both layouts.

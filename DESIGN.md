@@ -23,8 +23,8 @@ src/bakeoff/
   shared/
     contract.py        the seam: Loop protocol, Item/Event/ToolCall types, rules (read this first)
     sessionlog.py      SQLite log: threads, turns, items, events (items/events append-only)
-    runner.py          drives one turn: TurnInput -> loop events -> persist -> publish -> git commit
-    workcopy.py        git working copy per thread; one commit per completed turn; revert = new commit
+    runner.py          drives one turn: TurnInput -> loop events -> persist -> publish -> save the workspace
+    workcopy.py        Workspace protocol; WorkCopy: a git repository per thread, one commit per saved version
     toolhost.py        tool registry, JSON-schema validation, permission rules, tool.start/end events
     permissions.py     allow/ask/deny rules with wildcard patterns (ported from OpenCode)
     skills.py          RocketRide skills: frontmatter, the system-prompt section, load_skill paths
@@ -61,10 +61,17 @@ cancel `asyncio.Event`. It yields `Event`s. The shared runner:
    `tool.start` before its tool runs, so a crash cannot hide a run) and other events in
    batches (flush on item, on `tool.start`, on `turn.end`, and every 64 events), then publishes
    each event to the sink (CLI printer, ndjson mirror, tests);
-4. on `turn.end` with stop `end_turn`, `max_steps`, `budget`, `cancelled` or `error`, commits the
-   working copy (`git add -A && git commit --allow-empty`), stores the sha on the turn row
-   together with the `commit` event (one transaction), then publishes `commit` (always the final
-   event of a completed turn, right after the loop's `turn.end`). A `paused` turn is not committed until the resumed turn finishes.
+4. on `turn.end` with stop `end_turn`, `max_steps`, `budget`, `cancelled` or `error`, saves the
+   thread's workspace (`Workspace.save`), stores the version on the turn row together with the
+   `turn.saved` event `{version, files}` (one transaction), then publishes `turn.saved` (always
+   the final event of a completed turn, right after the loop's `turn.end`). A `paused` turn is not
+   saved until the resumed turn finishes.
+
+`Workspace` (`shared/workcopy.py`) is all the runner needs from a thread's files: `save`,
+`revert`, `head` and `recover` (plus `init_sync` when a thread is created). A version is an
+opaque string. The default, `WorkCopy`, is a git repository per thread: `save` is `git add -A &&
+git commit --allow-empty` and a version is the commit sha; `Runner(make_workspace=...)` takes any
+other implementation. Git is not part of the contract.
 
 `ToolHost` is built by the runner with an `emit` callback, so `tool.start` and `tool.end` are
 timed identically for every loop.
@@ -269,7 +276,8 @@ that fails any other way is a plain failure.
 - **I5** the loop writes nothing to stdout/stderr.
 - **I6** no connection leaves 127.0.0.1 (socket guard in tests and in every `bakeoff` command;
   `live` and `chat` also allow the model endpoint's host).
-- **I7** one commit per completed turn; `turns.commit_sha == git rev-parse`.
+- **I7** one saved version per completed turn, each on record as its turn's last event
+  (`turn.saved`); with `WorkCopy`, one git commit each and `turns.commit_sha == git rev-parse`.
 
 ## `our_version`: lean and fast
 

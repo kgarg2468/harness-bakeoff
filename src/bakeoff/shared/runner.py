@@ -1,7 +1,8 @@
-"""Drives turns: TurnInput -> loop events -> persist -> publish -> git commit.
+"""Drives turns: TurnInput -> loop events -> persist -> publish -> save the workspace.
 
 See DESIGN.md, "The seam". The runner is shared by every loop, so persistence, event
-stamping, tool timing and commits are identical for all of them.
+stamping, tool timing and saved versions are identical for all of them. A thread's workspace
+is a `Workspace`; the default is `WorkCopy`, where a saved version is a git commit.
 """
 
 from __future__ import annotations
@@ -30,10 +31,13 @@ from bakeoff.shared.contract import (
     TurnInput,
 )
 from bakeoff.shared.sessionlog import EventRow, SessionLog, event_row, item_to_json
-from bakeoff.shared.workcopy import WorkCopy
+from bakeoff.shared.workcopy import WorkCopy, Workspace
 
 Sink = Callable[[dict[str, Any]], None]
 MakeTools = Callable[[Path, dict[str, Any], Callable[[Event], None]], ToolHost]
+# Opens a thread's workspace at its directory; the second argument is the descriptor of the
+# thread's lock, for a workspace whose processes must keep it (see `_try_lock`).
+MakeWorkspace = Callable[[Path, int | None], Workspace]
 
 _BATCH = 64  # non-item events buffered before a flush
 _CANCEL_POLL_S = 0.05
@@ -41,13 +45,14 @@ _LOCK_POLL_S = 0.02
 _STATUS = {"end_turn": "done", "max_steps": "done", "budget": "done", "cancelled": "cancelled"}
 _DEFAULT_LIMITS = Limits()
 _THREAD_ID = re.compile(r"[\w-]+")
-# While the last git turn is paused, its pending calls must be answered first: a new user
+# While the last workspace turn is paused, its pending calls must be answered first: a new user
 # message or a summary between a call and its result breaks the history (see `Runner.turn`).
 _PAUSED = {"paused": "is paused: resolve the pending approval first"}
-# A revert also waits while the last turn has changes that no commit holds (see `Runner.revert`).
+# A revert also waits while the last turn has changes that no saved version holds (see
+# `Runner.revert`).
 _REVERT_WAITS = {
     **_PAUSED,
-    "error": "failed to commit its changes: run a turn first, its commit includes them",
+    "error": "failed to save its changes: run a turn first, its saved version includes them",
 }
 logger = logging.getLogger(__name__)
 
@@ -207,7 +212,7 @@ class _Publisher:
 
     def publish(self, event: Event) -> None:
         """The ToolHost's `emit` callback. A tool event after the loop's `turn.end` cannot
-        join the stream (`commit` must follow `turn.end` directly), so it is stored on the turn
+        join the stream (`turn.saved` must follow `turn.end` directly), so it is stored on the turn
         row (`late`) at once: also after the row is complete, e.g. from a tool task that
         outlived its loop."""
         if not self.ended:
@@ -230,24 +235,25 @@ class _Publisher:
         stop: str | None = None,
         pending: list[str] | None = None,
         item: Item | None = None,
-        commit: tuple[str, list[str]] | None = None,
+        saved: tuple[str, list[str]] | None = None,
     ) -> None:
-        """Record the end of the turn in one transaction: its status (and commit sha), what is
-        still buffered, and the runner's last events (`item`, then `commit`). They are published
-        only after that, so a consumer that sees `commit` finds the turn complete in the log
-        (rule 7), and nothing is published that the log does not have."""
+        """Record the end of the turn in one transaction: its status (and saved version), what
+        is still buffered, and the runner's last events (`item`, then `turn.saved`). They are
+        published only after that, so a consumer that sees `turn.saved` finds the turn complete
+        in the log (rule 7), and nothing is published that the log does not have."""
         rows = []
         if item is not None:
             rows.append(self._row(self._seq, "item", {"item": item}))
-        if commit is not None:
-            sha, files = commit
-            rows.append(self._row(self._seq + len(rows), "commit", {"sha": sha, "files": files}))
+        if saved is not None:
+            version, files = saved
+            data = {"version": version, "files": files}
+            rows.append(self._row(self._seq + len(rows), "turn.saved", data))
         self._log.set_turn_status(
             self.turn_id,
             status,
             stop=stop,
             pending=pending,
-            commit_sha=None if commit is None else commit[0],
+            commit_sha=None if saved is None else saved[0],
             events=[*self._batch, *rows],
             item=item,
         )
@@ -280,7 +286,8 @@ class NdjsonMirror:
 
 
 class Runner:
-    """Runs turns of any `Loop` against the session log and one git working copy per thread.
+    """Runs turns of any `Loop` against the session log and one workspace per thread
+    (`make_workspace`, by default a git `WorkCopy`).
 
     Each turn, revert and compaction holds the thread's OS lock (see `_try_lock`) while it runs.
     A resume (approval or crash) waits up to `lock_wait_s` seconds for it: it follows the end of
@@ -295,15 +302,17 @@ class Runner:
         make_tools: MakeTools,
         sink: Sink | None = None,
         lock_wait_s: float = 5.0,
+        make_workspace: MakeWorkspace = WorkCopy,
     ) -> None:
         self.log = log
         self.wc_root = wc_root
         self.make_tools = make_tools
         self.sink = sink
         self.lock_wait_s = lock_wait_s
+        self.make_workspace = make_workspace
 
     def workdir(self, thread_id: str) -> Path:
-        """The thread's git working copy."""
+        """The directory of the thread's workspace."""
         return (self.wc_root / thread_id).absolute()
 
     def new_thread(
@@ -316,14 +325,14 @@ class Runner:
         thread_id: str | None = None,
     ) -> str:
         """Create a thread (its meta keeps rules and the model config minus the api key) and
-        its git working copy."""
+        its workspace."""
         thread_id = thread_id or uuid.uuid4().hex[:12]
         if not _THREAD_ID.fullmatch(thread_id):
             raise ValueError(f"thread id must match {_THREAD_ID.pattern}: {thread_id!r}")
         model_meta = asdict(model)
         del model_meta["api_key"]
-        # The repository first: once the thread row exists, every turn can rely on it.
-        WorkCopy(self.workdir(thread_id)).init_sync()
+        # The workspace first: once the thread row exists, every turn can rely on it.
+        self.make_workspace(self.workdir(thread_id), None).init_sync()
         self.log.create_thread(
             thread_id, impl=impl, system=system, meta={"rules": rules, "model": model_meta}
         )
@@ -347,11 +356,12 @@ class Runner:
         approval resume first (it may deny them, with a reason), since a user message between a
         call and its result breaks the history.
 
-        Returns `{"turn_id", "stop", "pending", "commit"}`. A loop exception ends the turn with
-        stop="error" instead of raising. `asyncio.CancelledError` propagates and leaves the turn
-        "running", like a crash; resume it with `Resume(kind="crash")`. Any other failure (git,
-        or the session log) is raised after the turn is recorded without a commit: as "error"
-        (the next turn's commit includes its changes), or still "paused" if it paused. If even
+        Returns `{"turn_id", "stop", "pending", "version"}` (`version`: the saved version, None
+        if the turn was not saved). A loop exception ends the turn with stop="error" instead of
+        raising. `asyncio.CancelledError` propagates and leaves the turn "running", like a crash;
+        resume it with `Resume(kind="crash")`. Any other failure (the workspace, or the session
+        log) is raised after the turn is recorded without a saved version: as "error" (the next
+        turn's saved version includes its changes), or still "paused" if it paused. If even
         that cannot be written, the turn stays "running" for a crash resume.
 
         A resume waits up to `lock_wait_s` for the thread's lock; a new user message raises
@@ -399,7 +409,7 @@ class Runner:
             self._refuse_while(thread_id, "start a user turn", _PAUSED)
         row = self.log.start_turn(thread_id, kind)  # raises if a turn is running (unless crash)
         turn_id = row["id"]
-        wc = WorkCopy(self.workdir(thread_id), lock_fd)
+        ws = self.make_workspace(self.workdir(thread_id), lock_fd)
         pub = _Publisher(self.log, self.sink, thread_id, turn_id, thread["impl"])
         cancel = cancel or asyncio.Event()
         watcher = (
@@ -408,7 +418,7 @@ class Runner:
             else None
         )
         try:
-            await self._reconcile(wc, thread_id, turn_id)
+            await self._reconcile(ws, thread_id, turn_id)
             start: dict[str, Any] = {"turn_id": turn_id}
             if resume is not None:
                 start["resume"] = asdict(resume)
@@ -430,11 +440,11 @@ class Runner:
             if stop == "paused":
                 pending = list(end.get("pending") or [])
                 pub.finish("paused", stop=stop, pending=pending)
-                return {"turn_id": turn_id, "stop": stop, "pending": pending, "commit": None}
-            sha, files = await wc.commit(f"turn {row['idx'] + 1}: {stop}")
-            # The row's status and sha with the `commit` event, which is published after it.
-            pub.finish(_STATUS.get(stop, "error"), stop=stop, commit=(sha, files))
-            return {"turn_id": turn_id, "stop": stop, "pending": [], "commit": sha}
+                return {"turn_id": turn_id, "stop": stop, "pending": pending, "version": None}
+            saved = await ws.save(f"turn {row['idx'] + 1}: {stop}")
+            # The row's status and version with `turn.saved`, which is published after it.
+            pub.finish(_STATUS.get(stop, "error"), stop=stop, saved=saved)
+            return {"turn_id": turn_id, "stop": stop, "pending": [], "version": saved[0]}
         except Exception:  # unlike a crash (CancelledError), a failure ends the turn
             self._record_failure(pub)
             raise
@@ -485,53 +495,53 @@ class Runner:
         return end
 
     async def revert(self, thread_id: str, turn_id: str) -> dict[str, Any]:
-        """Undo a committed turn's changes with a new commit, recorded as a new "revert" turn.
+        """Undo a saved turn's changes with a new version, recorded as a new "revert" turn.
 
         Appends a runner item telling the model what was reverted. Returns the same summary
-        shape as `turn()`. The note, the sha and the `commit` event are recorded in one
-        transaction; if git fails (e.g. a conflict) or the log cannot record them, git is
-        undone and no turn is recorded. If its process dies, the next call on the thread undoes
-        it (see `_retire_dead`). It refuses while the last turn is paused or failed to
-        commit: that turn's changes are not committed, so the revert would take them into its
-        own commit, or lose them if git aborts it.
+        shape as `turn()`. The note, the version and `turn.saved` are recorded in one
+        transaction; if the workspace fails (e.g. a git conflict) or the log cannot record them,
+        the workspace is reset and no turn is recorded. If its process dies, the next call on
+        the thread undoes it (see `_retire_dead`). It refuses while the last turn is paused or
+        failed to save: that turn's changes are in no version, so the revert would take them
+        into its own, or lose them if the workspace aborts it.
         """
         thread = self._thread(thread_id)
         target = next((t for t in self.log.turns(thread_id) if t["id"] == turn_id), None)
         if target is None or not target["commit_sha"]:
-            raise ValueError(f"turn {turn_id} of thread {thread_id} has no commit to revert")
+            raise ValueError(f"turn {turn_id} of thread {thread_id} has no saved version to revert")
         # Held until the revert is fully recorded: while its row says "running", a crash resume
-        # that got the lock would take git's revert commit for one that no turn recorded.
+        # that got the lock would take the workspace's revert for a version no turn recorded.
         with _exclusive(self._lock_path(thread_id)) as lock_fd:
             self._retire_dead(thread_id, lock_fd)
             self._refuse_while(thread_id, "revert", _REVERT_WAITS)
             row = self.log.start_turn(thread_id, "revert")
-            wc = WorkCopy(self.workdir(thread_id), lock_fd)
+            ws = self.make_workspace(self.workdir(thread_id), lock_fd)
             try:
-                await self._reconcile(wc, thread_id, row["id"])  # e.g. after a failed revert
-                head = await wc.head()
-                sha, files = await wc.revert(target["commit_sha"])
+                await self._reconcile(ws, thread_id, row["id"])  # e.g. after a failed revert
+                head = await ws.head()
+                saved = await ws.revert(target["commit_sha"])
             except Exception:
                 self._drop_turn(row["id"])  # it recorded nothing
                 raise
-            files_text = ", ".join(files) or "none"
+            files_text = ", ".join(saved[1]) or "none"
             note = f"[harness] Reverted turn {target['idx'] + 1}; files: {files_text}"
             message = {"role": "user", "content": note}
             try:
                 pub = _Publisher(self.log, self.sink, thread_id, row["id"], thread["impl"])
                 item = Item(f"{row['id']}:revert", row["id"], message)
-                pub.finish("done", item=item, commit=(sha, files))
+                pub.finish("done", item=item, saved=saved)
             except Exception:  # nothing is recorded: the thread goes back to where it was
-                with _logged_failure(f"undoing git's revert for turn {row['id']}"):
-                    await wc.recover(head, keep=False)
+                with _logged_failure(f"undoing the workspace's revert for turn {row['id']}"):
+                    await ws.recover(head, keep=False)
                 self._drop_turn(row["id"])
                 raise
-        return {"turn_id": row["id"], "stop": None, "pending": [], "commit": sha}
+        return {"turn_id": row["id"], "stop": None, "pending": [], "version": saved[0]}
 
     def compact(self, thread_id: str, summary: str) -> Item:
         """Append a compaction item (contract rule 8) as its own "compact" turn.
 
         The item and the finished row are recorded in one transaction, or nothing is.
-        Compaction changes no files, so the turn has no commit. It is refused while the last
+        Compaction changes no files, so the turn saves no version. It is refused while the last
         turn is paused: the summary would come between the pending calls and their results.
         """
         thread = self._thread(thread_id)
@@ -554,7 +564,7 @@ class Runner:
         return item
 
     def _lock_path(self, thread_id: str) -> Path:
-        # Next to the working copy, not inside it, so it is never committed.
+        # Next to the workspace, not inside it, so it is never saved.
         return self.workdir(thread_id).parent / f"{thread_id}.lock"
 
     def _thread(self, thread_id: str) -> dict[str, Any]:
@@ -564,14 +574,14 @@ class Runner:
         return thread
 
     def _record_failure(self, pub: _Publisher) -> None:
-        """Record the end of a turn that failed before its commit was recorded, with its
+        """Record the end of a turn that failed before its saved version was recorded, with its
         buffered events (e.g. a turn.end whose flush failed).
 
         A paused turn stays "paused" with its pending calls: the next turn must answer them.
-        Any other turn becomes "error" without a commit, so it does not block the thread; the
-        next turn repairs git and its commit includes the changes. Best effort: if the log fails
-        again (e.g. it is still locked), that is only logged, so the caller raises the first
-        error, and the turn stays "running" for a crash resume to take over.
+        Any other turn becomes "error" without a version, so it does not block the thread; the
+        next turn repairs the workspace and its version includes the changes. Best effort: if
+        the log fails again (e.g. it is still locked), that is only logged, so the caller raises
+        the first error, and the turn stays "running" for a crash resume to take over.
         """
         end = pub.end or {}
         stop = end.get("stop", "error")
@@ -598,9 +608,9 @@ class Runner:
         Called with the thread's lock held. Every revert and compaction holds it while it runs,
         so a "running" one is dead: its process died, or its failure could not be recorded. It
         recorded nothing (each records its end in one transaction). A compaction is deleted; a
-        revert is marked "error" and the next `_reconcile` undoes what git did for it. A dead
-        loop turn is left for a crash resume. Without OS locks (`lock_fd` None) a running turn
-        may be alive, so nothing is retired.
+        revert is marked "error" and the next `_reconcile` undoes what the workspace did for it.
+        A dead loop turn is left for a crash resume. Without OS locks (`lock_fd` None) a running
+        turn may be alive, so nothing is retired.
         """
         last = self.log.last_turn(thread_id)
         if lock_fd is None or last is None or last["status"] != "running":
@@ -611,40 +621,41 @@ class Runner:
             self.log.set_turn_status(last["id"], "error")
 
     def _refuse_while(self, thread_id: str, what: str, waits: dict[str, str]) -> None:
-        """Raise if the thread's last git turn has no commit and a status in `waits`: it left
-        something that must be resolved before `what`."""
-        turns = self._git_turns(thread_id)
+        """Raise if the thread's last workspace turn has no saved version and a status in
+        `waits`: it left something that must be resolved before `what`."""
+        turns = self._ws_turns(thread_id)
         last = turns[-1] if turns else None
-        # A revert without a sha recorded nothing, and `_reconcile` undoes what git did for it.
+        # A revert without a version recorded nothing, and `_reconcile` undoes its changes.
         if last is None or last["kind"] == "revert" or last["commit_sha"]:
             return
         if last["status"] in waits:
             raise RuntimeError(f"cannot {what}: turn {last['id']} {waits[last['status']]}")
 
-    def _git_turns(self, thread_id: str) -> list[dict[str, Any]]:
-        """The thread's turns that use the working copy (all but compactions), in order."""
+    def _ws_turns(self, thread_id: str) -> list[dict[str, Any]]:
+        """The thread's turns that use the workspace (all but compactions), in order."""
         return [t for t in self.log.turns(thread_id) if t["kind"] != "compact"]
 
-    async def _reconcile(self, wc: WorkCopy, thread_id: str, turn_id: str) -> None:
-        """Before turn `turn_id` uses git, repair what the git turn before it left, if that turn
-        died ("running") or failed ("error" without a sha): git may hold a commit that no turn
-        recorded, a stale lock, or a revert in progress.
+    async def _reconcile(self, ws: Workspace, thread_id: str, turn_id: str) -> None:
+        """Before turn `turn_id` uses the workspace, repair what the workspace turn before it
+        left, if that turn died ("running") or failed ("error" without a version): the workspace
+        may hold a version that no turn recorded (with git: a commit, a stale lock, or a revert
+        in progress).
 
-        A revert records its note, sha and commit event at once, so one without a sha recorded
-        nothing: undo all that git did for it (it started from a clean tree at the last recorded
-        commit) and mark it "error", so the model never sees changes it was not told about. For
-        any other turn, move HEAD back to the last recorded commit; the changes after it stay
-        staged, so this turn's commit includes them.
+        A revert records its note, version and `turn.saved` at once, so one without a version
+        recorded nothing: undo all that the workspace did for it (it started from a clean tree
+        at the last recorded version) and mark it "error", so the model never sees changes it
+        was not told about. For any other turn, go back to the last recorded version and keep
+        the files, so this turn's version includes the changes.
         """
-        turns = [t for t in self._git_turns(thread_id) if t["id"] != turn_id]
+        turns = [t for t in self._ws_turns(thread_id) if t["id"] != turn_id]
         last = turns[-1] if turns else None
         if last is None or last["status"] not in ("running", "error") or last["commit_sha"]:
             return
-        shas = [t["commit_sha"] for t in turns if t["commit_sha"]]
+        versions = [t["commit_sha"] for t in turns if t["commit_sha"]]
         if last["kind"] != "revert":
-            await wc.recover(shas[-1] if shas else None)
+            await ws.recover(versions[-1] if versions else None)
             return
-        await wc.recover(shas[-1] if shas else None, keep=False)
+        await ws.recover(versions[-1] if versions else None, keep=False)
         if last["status"] == "running":
             self.log.set_turn_status(last["id"], "error")
 

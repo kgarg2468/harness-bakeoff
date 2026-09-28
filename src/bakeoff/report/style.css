@@ -141,7 +141,7 @@ svg.lanes [data-tip] { cursor:help; }
 .card.result, .card.ask { border-left-color:#8a939d; } .card.ask, .card.resume { border-left-color:var(--warn); }
 .card.error, .card.crash { border-left-color:var(--bad); background:#fffafa; }
 .card.retry { border-left-color:var(--warn); background:#fffcf7; }
-.card.end, .card.commit, .card.note, .card.summary { background:#fafbfc; }
+.card.end, .card.saved, .card.note, .card.summary { background:#fafbfc; }
 .card .tag { font-size:10.5px; font-weight:800; border-radius:999px; padding:0 7px; }
 .card .tag.ok { background:var(--ok-soft); color:var(--ok); } .card .tag.bad { background:var(--bad-soft); color:var(--bad); }
 .card .tag.warn { background:var(--warn-soft); color:var(--warn); }

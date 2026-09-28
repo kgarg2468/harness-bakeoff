@@ -126,7 +126,7 @@
     model: "One bar per model request (a step): pale while waiting for the first token, solid while the answer streams in.",
     tools: "One bar per tool run, from start to end. Tools that run at the same time get their own rows.",
     approval: "◆ the loop asked for an approval; ● the user's answer (green: allowed, red: denied).",
-    git: "● a git commit after a finished turn; ■ a compaction (the history is replaced by a summary).",
+    git: "● a saved version (a git commit) after a finished turn; ■ a compaction (the history is replaced by a summary).",
   };
   const GLYPH = { retry: ["↻", "var(--warn)"], error: ["✕", "var(--bad)"], cancel: ["■", "var(--ink)"], killed: ["✕", "var(--bad)"], cut: ["✂", "var(--ink)"] };
 
@@ -213,10 +213,10 @@
       const cx = x(lay.abs(g.turn, g.t));
       const cy = yGit + 7;
       if (g.kind === "compact") {
-        svg.append(s("rect", { x: cx - 3.5, y: cy - 3.5, width: 7, height: 7, style: "fill:var(--muted)", "data-tip": "compaction: the history before this point is replaced by a summary (no commit)" }));
+        svg.append(s("rect", { x: cx - 3.5, y: cy - 3.5, width: 7, height: 7, style: "fill:var(--muted)", "data-tip": "compaction: the history before this point is replaced by a summary (nothing saved)" }));
       } else {
         const revert = turns[g.turn] && turns[g.turn].kind === "revert" ? "revert " : "";
-        svg.append(s("circle", { cx, cy, r: 4, style: "fill:var(--ink)", "data-tip": `${revert}commit ${String(g.sha || "").slice(0, 7)}\nfiles: ${(g.files || []).join(", ") || "none"}` }));
+        svg.append(s("circle", { cx, cy, r: 4, style: "fill:var(--ink)", "data-tip": `${revert}saved version ${String(g.version || "").slice(0, 7)}\nfiles: ${(g.files || []).join(", ") || "none"}` }));
       }
     }
     svg.append(s("line", { class: "axis", x1: LEFT, x2: LEFT + PW, y1: yAxis, y2: yAxis }));
@@ -241,7 +241,7 @@
   }
   const TITLES = {
     user: "User", note: "Harness note", summary: "Compaction summary", assistant: "Model", result: "Tool result",
-    ask: "Approval asked", resume: "Resumed", retry: "Retry", error: "Error", end: "Turn ended", commit: "Commit",
+    ask: "Approval asked", resume: "Resumed", retry: "Retry", error: "Error", end: "Turn ended", saved: "Saved",
     crash: "Worker killed",
   };
   const STOP_TAG = { end_turn: "ok", error: "bad" };
@@ -254,7 +254,7 @@
     "not run": ["nt", "not run", "The loop wrote this result without running the tool, e.g. because the turn reached its step limit or was cancelled."],
   };
   // Card titles that are glossary terms.
-  const TITLE_TERM = { result: "tool-result", ask: "approval", retry: "retry", commit: "commit", end: "turn" };
+  const TITLE_TERM = { result: "tool-result", ask: "approval", retry: "retry", saved: "saved", end: "turn" };
 
   function cardBody(c) {
     switch (c.k) {
@@ -295,8 +295,8 @@
           c.error ? h("div", { class: "bad-t", text: c.error }) : null,
         ];
       }
-      case "commit":
-        return [h("div", {}, h("code", { text: String(c.sha || "").slice(0, 7) }), ` ${(c.files || []).join(", ") || "no file changes"}`)];
+      case "saved":
+        return [h("div", {}, h("code", { text: String(c.version || "").slice(0, 7) }), ` ${(c.files || []).join(", ") || "no file changes"}`)];
       case "crash":
         return [h("div", { text: "The worker process was killed here (crash test). The turn never ended; the next turn resumes it." })];
       default:

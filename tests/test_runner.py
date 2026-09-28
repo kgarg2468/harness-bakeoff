@@ -32,7 +32,7 @@ WRITE_TURN = [
     "tool.end",
     "item",
     "turn.end",
-    "commit",
+    "turn.saved",
 ]
 
 
@@ -173,7 +173,7 @@ async def test_user_turn(runner, log, tid, published):
 
     turn_id = f"{tid}.0"
     head = git(runner.workdir(tid), "rev-parse", "HEAD")
-    assert summary == {"turn_id": turn_id, "stop": "end_turn", "pending": [], "commit": head}
+    assert summary == {"turn_id": turn_id, "stop": "end_turn", "pending": [], "version": head}
     assert types(log, tid) == WRITE_TURN
     events = log.events(tid)
     assert published == events
@@ -182,7 +182,7 @@ async def test_user_turn(runner, log, tid, published):
     assert [e["t_us"] for e in events] == sorted(e["t_us"] for e in events)
     assert events[0]["data"] == {"turn_id": turn_id}
     assert events[1]["data"]["item"]["message"] == {"role": "user", "content": "build it"}
-    assert events[-1]["data"] == {"sha": head, "files": ["a.pipe"]}
+    assert events[-1]["data"] == {"version": head, "files": ["a.pipe"]}
 
     (turn_input,) = loop.inputs
     assert turn_input.system == "You build pipelines."
@@ -202,6 +202,50 @@ async def test_user_turn(runner, log, tid, published):
     )
     assert git(runner.workdir(tid), "log", "-1", "--format=%s") == "turn 1: end_turn"
     assert [i.message["role"] for i in log.items(tid)] == ["user", "assistant", "tool"]
+
+
+class Snapshots:
+    """A `Workspace` without git: a version is a numbered copy of the files' text."""
+
+    versions: ClassVar[dict[str, list[dict[str, str]]]] = {}
+
+    def __init__(self, root, lock_fd):
+        self.root = root
+
+    def init_sync(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        Snapshots.versions.setdefault(str(self.root), [{}])
+
+    async def save(self, message):
+        versions = Snapshots.versions[str(self.root)]
+        files = {p.name: p.read_text() for p in self.root.iterdir()}
+        changed = sorted(
+            n for n in files.keys() | versions[-1].keys() if files.get(n) != versions[-1].get(n)
+        )
+        versions.append(files)
+        return await self.head(), changed
+
+    async def revert(self, version):
+        raise NotImplementedError
+
+    async def head(self):
+        return f"v{len(Snapshots.versions[str(self.root)]) - 1}"
+
+    async def recover(self, version, *, keep=True):
+        pass
+
+
+async def test_the_workspace_need_not_be_git(log, tmp_path, published):
+    runner = Runner(
+        log, tmp_path / "wc", StubTools, sink=published.append, make_workspace=Snapshots
+    )
+    tid = runner.new_thread(impl="our", system="s", rules=RULES, model=MODEL)
+    summary = await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
+    assert summary["version"] == "v1"
+    assert published[-1]["type"] == "turn.saved"
+    assert published[-1]["data"] == {"version": "v1", "files": ["a.pipe"]}
+    assert log.last_turn(tid)["commit_sha"] == "v1"
+    assert not (runner.workdir(tid) / ".git").exists()
 
 
 async def test_next_turn_sees_history_and_seq_continues(runner, log, tid):
@@ -234,7 +278,7 @@ async def test_pause_then_approve_in_another_process(runner, log, tid, tmp_path)
         "turn_id": f"{tid}.0",
         "stop": "paused",
         "pending": [call_id],
-        "commit": None,
+        "version": None,
     }
     paused = log.last_turn(tid)
     assert (paused["status"], paused["pending"], paused["commit_sha"]) == (
@@ -352,7 +396,7 @@ async def test_a_turn_cannot_start_while_a_revert_runs_git(runner, log, tid):
         runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two"),
         return_exceptions=True,
     )
-    assert reverted["commit"]
+    assert reverted["version"]
     assert isinstance(rejected, RuntimeError)
     assert "running turn" in str(rejected) or "busy" in str(rejected)
     assert [(t["kind"], t["status"]) for t in log.turns(tid)] == [
@@ -371,9 +415,9 @@ async def test_loop_exception_ends_turn_with_error(runner, log, tid):
 
     summary = await runner.turn(FakeLoop(boom), tid, model=MODEL, user_text="go")
     assert summary["stop"] == "error"
-    assert summary["commit"]
+    assert summary["version"]
     events = log.events(tid)
-    assert [e["type"] for e in events][-3:] == ["error", "turn.end", "commit"]
+    assert [e["type"] for e in events][-3:] == ["error", "turn.end", "turn.saved"]
     assert events[-3]["data"] == {"kind": "loop", "message": "ValueError: boom", "retryable": False}
     assert events[-2]["data"] == {"stop": "error", "steps": 1, "error": "ValueError: boom"}
     assert log.last_turn(tid)["status"] == "error"
@@ -409,7 +453,7 @@ async def test_event_data_that_is_not_json_ends_the_turn_with_error(runner, log,
 
     summary = await runner.turn(FakeLoop(script), tid, model=MODEL, user_text="go")
     assert summary["stop"] == "error"
-    assert types(log, tid) == ["turn.start", "item", "error", "turn.end", "commit"]
+    assert types(log, tid) == ["turn.start", "item", "error", "turn.end", "turn.saved"]
     assert "not JSON serializable" in log.events(tid)[2]["data"]["message"]
     assert [i.message["role"] for i in log.items(tid)] == ["user"]
     assert log.last_turn(tid)["status"] == "error"
@@ -584,30 +628,30 @@ async def test_a_turn_the_log_cannot_finish_twice_is_left_for_a_crash_resume(
         assert check.ok, check.detail
 
 
-async def test_the_commit_event_is_stored_with_the_turn_row(runner, log, tid, published):
+async def test_the_saved_event_is_stored_with_the_turn_row(runner, log, tid, published):
     reader = SessionLog(runner.wc_root.parent / "log.sqlite")
     seen = []
 
-    def sink(envelope):  # a consumer that sees `commit` finds the turn complete in the log
-        if envelope["type"] == "commit":
+    def sink(envelope):  # a consumer that sees `turn.saved` finds the turn complete in the log
+        if envelope["type"] == "turn.saved":
             turn = reader.last_turn(tid)
             seen.append((reader.events(tid)[-1] == envelope, turn["commit_sha"], turn["status"]))
 
     runner.sink = sink
     summary = await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
-    assert seen == [(True, summary["commit"], "done")]
+    assert seen == [(True, summary["version"], "done")]
     reader.close()
 
 
-async def test_a_commit_the_log_cannot_record_is_not_published(
+async def test_a_saved_version_the_log_cannot_record_is_not_published(
     runner, log, tid, monkeypatch, published
 ):
-    fail_storing(log, monkeypatch, has("commit"))
+    fail_storing(log, monkeypatch, has("turn.saved"))
     with pytest.raises(sqlite3.OperationalError):
         await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
     turn = log.last_turn(tid)
     assert (turn["status"], turn["stop"], turn["commit_sha"]) == ("error", "end_turn", None)
-    assert "commit" not in [e["type"] for e in published]
+    assert "turn.saved" not in [e["type"] for e in published]
     assert published == log.events(tid)  # the sink saw exactly what the log has
     # git's commit is recorded by no turn: the next turn builds on the last recorded one.
     await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")
@@ -680,7 +724,7 @@ async def test_loop_without_turn_end(runner, log, tid):
     assert log.last_turn(tid)["status"] == "error"
 
 
-async def test_commit_directly_follows_turn_end(runner, log, tid, published):
+async def test_turn_saved_directly_follows_turn_end(runner, log, tid, published):
     async def sloppy(turn, tools, cancel):
         try:
             yield Event("turn.end", {"stop": "max_steps", "steps": 12})
@@ -691,10 +735,10 @@ async def test_commit_directly_follows_turn_end(runner, log, tid, published):
 
     summary = await runner.turn(FakeLoop(sloppy), tid, model=MODEL, user_text="go")
     assert summary["stop"] == "max_steps"
-    assert types(log, tid) == ["turn.start", "item", "turn.end", "commit"]
+    assert types(log, tid) == ["turn.start", "item", "turn.end", "turn.saved"]
     assert published == log.events(tid)
     assert log.last_turn(tid)["status"] == "done"
-    assert published[-1]["data"] == {"sha": log.last_turn(tid)["commit_sha"], "files": []}
+    assert published[-1]["data"] == {"version": log.last_turn(tid)["commit_sha"], "files": []}
     (late,) = log.last_turn(tid)["late"]  # kept as evidence, outside the stream
     assert (late["type"], late["data"]["call_id"]) == ("tool.end", "c9")
     assert late["t_us"] >= published[-2]["t_us"]
@@ -715,7 +759,7 @@ async def test_a_tool_run_after_turn_end_fails_i2(runner, log, tid):
 
     await runner.turn(FakeLoop(reruns), tid, model=MODEL, user_text="go")
     events = log.events(tid)
-    assert [e["type"] for e in events][-2:] == ["turn.end", "commit"]
+    assert [e["type"] for e in events][-2:] == ["turn.end", "turn.saved"]
     assert [x["type"] for x in log.last_turn(tid)["late"]] == ["tool.start", "tool.end"]
     check = check_tool_results(log.items(tid), events, log.turns(tid))
     call_id = f"{tid}.0:c"
@@ -841,9 +885,9 @@ async def test_batching_and_publish_order(log, tmp_path):
             stored = envelope["data"]["item"]["id"] in [i.id for i in reader.items(tid)]
             if not stored or reader.events(tid)[-1] != envelope:
                 unstored.append(envelope)
-        if envelope["type"] == "commit":  # the turn row is already complete
+        if envelope["type"] == "turn.saved":  # the turn row is already complete
             turn = reader.last_turn(tid)
-            if (turn["status"], turn["commit_sha"]) != ("done", envelope["data"]["sha"]):
+            if (turn["status"], turn["commit_sha"]) != ("done", envelope["data"]["version"]):
                 unstored.append(envelope)
 
     async def deltas(turn, tools, cancel):
@@ -900,14 +944,14 @@ async def test_revert(runner, log, tid, published):
 
     wd = runner.workdir(tid)
     head = git(wd, "rev-parse", "HEAD")
-    assert summary == {"turn_id": f"{tid}.2", "stop": None, "pending": [], "commit": head}
+    assert summary == {"turn_id": f"{tid}.2", "stop": None, "pending": [], "version": head}
     assert not (wd / "a.pipe").exists()
     assert (wd / "b.pipe").exists()
     note = log.items(tid)[-1]
     assert note.message == {"role": "user", "content": "[harness] Reverted turn 1; files: a.pipe"}
     assert note.native is None
-    assert [e["type"] for e in published] == ["item", "commit"]
-    assert published[1]["data"] == {"sha": head, "files": ["a.pipe"]}
+    assert [e["type"] for e in published] == ["item", "turn.saved"]
+    assert published[1]["data"] == {"version": head, "files": ["a.pipe"]}
     turn = log.last_turn(tid)
     assert (turn["kind"], turn["status"], turn["commit_sha"]) == ("revert", "done", head)
     assert check_commits(log, tid, wd).ok
@@ -934,7 +978,7 @@ async def test_revert_holds_the_thread_lock_until_it_is_recorded(log, tmp_path):
     tid = runner.new_thread(impl="our", system="s", rules={}, model=MODEL)
     await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
     await runner.revert(tid, f"{tid}.0")
-    assert locked == [("item", True), ("commit", True)]
+    assert locked == [("item", True), ("turn.saved", True)]
     with _exclusive(runner._lock_path(tid)):  # released afterwards
         pass
 
@@ -946,7 +990,7 @@ async def test_revert_errors_record_no_turn(runner, log, tid):
     await runner.turn(no_op, tid, model=MODEL, user_text="two")  # commits the change to a.pipe
     with pytest.raises(RuntimeError, match="git revert failed"):
         await runner.revert(tid, f"{tid}.0")
-    with pytest.raises(ValueError, match="no commit"):
+    with pytest.raises(ValueError, match="no saved version"):
         await runner.revert(tid, f"{tid}.9")
     assert len(log.turns(tid)) == 2
     assert check_commits(log, tid, runner.workdir(tid)).ok
@@ -1020,12 +1064,12 @@ async def test_a_user_turn_or_compaction_waits_for_a_paused_turn(runner, log, ti
     assert check.ok, check.detail
 
 
-async def test_revert_waits_for_a_turn_that_failed_to_commit(runner, log, tid):
+async def test_revert_waits_for_a_turn_that_failed_to_save(runner, log, tid):
     await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="one")
     (runner.workdir(tid) / ".git" / "index.lock").write_text("")
     with pytest.raises(RuntimeError, match="git add failed"):
         await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")
-    with pytest.raises(RuntimeError, match="failed to commit its changes: run a turn first"):
+    with pytest.raises(RuntimeError, match="failed to save its changes: run a turn first"):
         await runner.revert(tid, f"{tid}.0")
     no_op = FakeLoop(only(Event("turn.end", {"stop": "end_turn", "steps": 0})))
     await runner.turn(no_op, tid, model=MODEL, user_text="three")
@@ -1050,7 +1094,7 @@ async def test_a_revert_the_log_cannot_record_is_undone(runner, log, tid, monkey
     wd = runner.workdir(tid)
     assert [t["kind"] for t in log.turns(tid)] == ["user"]  # no revert turn
     assert published == []  # nothing was announced
-    assert git(wd, "rev-parse", "HEAD") == first["commit"]  # git's revert is undone
+    assert git(wd, "rev-parse", "HEAD") == first["version"]  # git's revert is undone
     assert (wd / "a.pipe").exists()
     assert git(wd, "status", "--porcelain") == ""
     await runner.turn(FakeLoop(writes("b.pipe")), tid, model=MODEL, user_text="two")
@@ -1238,7 +1282,7 @@ async def test_git_keeps_the_thread_lock_after_its_caller_is_gone(runner, tid, m
     hook.chmod(0o755)
     lock_path = runner._lock_path(tid)
     fd = _try_lock(lock_path)
-    commit = asyncio.create_task(WorkCopy(wd, fd).commit("turn 1: end_turn"))
+    commit = asyncio.create_task(WorkCopy(wd, fd).save("turn 1: end_turn"))
     for _ in range(500):
         if (wd / "started").exists():
             break

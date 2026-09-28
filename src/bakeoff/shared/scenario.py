@@ -127,7 +127,7 @@ def check_quiet(stdout: str, stderr: str) -> Check:
 # --- sessions: one directory with log.sqlite, wc/ and events.ndjson -------------------------
 
 
-class Workspace:
+class RunDir:
     """A run directory: the session log, the working copies and the event mirror.
 
     `sinks` get every published event after the mirror has it (so a crash in a sink never loses
@@ -249,7 +249,7 @@ async def worker_turn(
     workers). The loop comes from the registry by the thread's impl; the model from its meta.
     A `bakeoff cancel` from another process stops it. Returns the runner's summary plus the pid.
     """
-    ws = Workspace(db, wc=wc, events=events, engine_delay_ms=engine_delay_ms, sinks=sinks)
+    ws = RunDir(db, wc=wc, events=events, engine_delay_ms=engine_delay_ms, sinks=sinks)
     try:
         thread = ws.thread(thread_id)
         loop = loops.load(thread["impl"])()
@@ -329,7 +329,7 @@ class _ScenarioRun:
             timeout_s=MODEL_TIMEOUT_S,
             **temperature,
         )
-        self.ws = Workspace(
+        self.ws = RunDir(
             directory / "log.sqlite", engine_delay_ms=sc.engine["delay_ms"], sinks=[self._on_event]
         )
         # I5: what this process wrote while the loop existed, then each child's extra output.

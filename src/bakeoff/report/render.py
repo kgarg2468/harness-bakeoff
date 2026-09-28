@@ -90,7 +90,7 @@ GLOSSARY: dict[str, tuple[str, str]] = {
     ),
     "working-copy": (
         "working copy",
-        "The folder of files the agent reads and edits in a scenario. It is a git repository, so every turn can be committed and undone.",
+        "The folder of files the agent reads and edits in a scenario. It is a git repository, so every turn can be saved and undone.",
     ),
     "turn": (
         "turn",
@@ -116,11 +116,11 @@ GLOSSARY: dict[str, tuple[str, str]] = {
         "approval",
         "Some tools need a yes from the user first. The turn pauses; the answer resumes it, possibly in a new process.",
     ),
-    "commit": (
-        "commit",
-        "A git snapshot of the working copy taken after every finished turn, so any turn can be undone.",
+    "saved": (
+        "saved version",
+        "A snapshot of the working copy taken after every finished turn (a git commit here), so any turn can be undone.",
     ),
-    "revert": ("revert", "Undoing an earlier turn's file changes with a new commit."),
+    "revert": ("revert", "Undoing an earlier turn's file changes with a new saved version."),
     "compaction": (
         "compaction",
         "Replacing old history with a short summary so the conversation keeps fitting the model's context window.",
@@ -158,8 +158,8 @@ GLOSSARY: dict[str, tuple[str, str]] = {
         "The loop prints nothing to stdout or stderr: it will run inside the engine process.",
     ),
     "I7": (
-        "I7 one commit per turn",
-        "Exactly one git commit per finished turn, matching the session log.",
+        "I7 one saved version per turn",
+        "Exactly one saved version (a git commit) per finished turn, matching the session log.",
     ),
     "wire": (
         "wire",
@@ -968,7 +968,7 @@ def replay(page: Page) -> str:
     intro = (
         f"<p class='lede'>Two loops, one scenario, one time axis. {term('lane', 'Lanes')} show when each "
         f"loop waits for the model during a {term('step')}, streams, runs tools, asks for an "
-        f"{term('approval')} and makes a git {term('commit')} of the {term('working-copy')}. Drag the "
+        f"{term('approval')} and saves a {term('saved', 'version')} of the {term('working-copy')}. Drag the "
         "scrubber or press play; the cards below each timeline are the transcript up to that moment, "
         f"each turn ending with its {term('stop')}. Idle time between {term('turn', 'turns')} (a user "
         "deciding, a new process starting) is cut, the same way for both loops.</p>"
@@ -991,7 +991,7 @@ def replay(page: Page) -> str:
 </div>
 <div class="rp-key small">
   <span><i class="sw wait"></i>waiting for the first token</span><span><i class="sw strm"></i>streaming</span>
-  <span><i class="sw tool"></i>tool running</span><span>◆ approval asked</span><span>● commit</span>
+  <span><i class="sw tool"></i>tool running</span><span>◆ approval asked</span><span>● saved version</span>
   <span class="muted">{term("eager", "eager")} tools start before the stream ends</span>
 </div>
 <div class="cols" id="rp-cols"></div>
@@ -1594,7 +1594,7 @@ def glossary() -> str:
 
 
 _JS_TERMS = ("stop", "step", "tokens", "tool-result", "approval", "retry", "crash-resume",
-             "commit", "turn", "byte-prefix")  # fmt: skip
+             "saved", "turn", "byte-prefix")  # fmt: skip
 
 
 def js_data(page: Page) -> dict[str, Any]:

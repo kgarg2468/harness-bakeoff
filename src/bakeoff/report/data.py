@@ -471,7 +471,7 @@ def build_replay(events: list[dict[str, Any]], turns: list[dict[str, Any]]) -> d
 
     Lanes: `model` (one segment per request: waiting for the first token, then streaming),
     `tools` (tool.start to tool.end, stacked when they overlap), `perm` (approval asked and
-    answered) and `git` (commits, reverts, compaction)."""
+    answered) and `git` (saved versions, i.e. git commits, reverts, compaction)."""
     rows = {t["id"]: t for t in turns}
     by_turn: dict[str, list[dict]] = {}
     for e in events:
@@ -692,13 +692,13 @@ class _TurnWalk:
                       "pending": data.get("pending") or [], "error": data.get("error"),
                       "usage": dict(self.usage)})  # fmt: skip
 
-    def on_commit(self, t: float, data: dict, is_late: bool) -> None:
+    def on_turn_saved(self, t: float, data: dict, is_late: bool) -> None:
         files = sorted(map(str, data.get("files") or []))
-        sha = data.get("sha")
+        version = data.get("version")
         self.lanes["git"].append(
-            {"turn": self.ti, "t": t, "kind": "commit", "sha": sha, "files": files}
+            {"turn": self.ti, "t": t, "kind": "saved", "version": version, "files": files}
         )
-        self.card(t, {"k": "commit", "sha": sha, "files": files})
+        self.card(t, {"k": "saved", "version": version, "files": files})
 
 
 # --- wire recordings ----------------------------------------------------------------------

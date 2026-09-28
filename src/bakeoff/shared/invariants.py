@@ -492,13 +492,14 @@ def check_seq(events: Sequence[dict[str, Any]], items: Sequence[Item]) -> Check:
 
 
 def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
-    """I7: one commit per completed turn, in order; HEAD is the last turn's commit; and each
-    commit is on record as its turn's last event (rule 7).
+    """I7: one saved version per completed turn, in order; the workspace's head is the last
+    turn's version; and each is on record as its turn's last event, `turn.saved` (rule 7).
+    The workspace here is a git `WorkCopy`, so a version is a commit.
 
-    Completed = done, error or cancelled. Compaction turns change no files and have no
-    commit; paused turns are committed by the turn that resumes them. An "error" turn without
-    a commit failed to commit: a later turn's commit includes its changes, so a later git turn
-    must have a commit. (A revert without a commit recorded nothing, and the runner undid what
+    Completed = done, error or cancelled. Compaction turns change no files and save no
+    version; paused turns are saved by the turn that resumes them. An "error" turn without a
+    version failed to save: a later turn's version includes its changes, so a later workspace
+    turn must have one. (A revert without a version recorded nothing, and the runner undid what
     git did for it.)
     """
     all_turns = log.turns(thread_id)
@@ -534,7 +535,7 @@ def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
         "commits": len(commits),
         "uncommitted": [t["id"] for t in turns if not t["commit_sha"]] + stranded,
         "unknown": [t["id"] for t in turns if t["commit_sha"] and t["commit_sha"] not in commits],
-        "commit_events": _commit_event_problems(all_turns, log.events(thread_id)),
+        "saved_events": _saved_event_problems(all_turns, log.events(thread_id)),
     }
     if info["uncommitted"] or info["unknown"]:
         detail = f"turns without a commit: {info['uncommitted']}; unknown shas: {info['unknown']}"
@@ -543,36 +544,36 @@ def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
             f"{len(commits)} commits after init for {len(turns)} completed turns"
             " (HEAD or order does not match the turn rows)"
         )
-    elif info["commit_events"]:
+    elif info["saved_events"]:
         detail = (
-            "turns whose commit event is missing, repeated, not their last event or for"
-            f" another sha: {info['commit_events']}"
+            "turns whose turn.saved event is missing, repeated, not their last event or for"
+            f" another version: {info['saved_events']}"
         )
     else:
         return Check("I7", True, f"{len(turns)} turns, one commit each; HEAD matches", info)
     return Check("I7", False, detail, info)
 
 
-def _commit_event_problems(
+def _saved_event_problems(
     turns: Sequence[dict[str, Any]], events: Sequence[dict[str, Any]]
 ) -> list[str]:
-    """The turns whose stored events break rule 7: a turn with a commit sha has exactly one
-    `commit` event, for that sha, as its last event; any other turn has none."""
+    """The turns whose stored events break rule 7: a turn with a saved version has exactly one
+    `turn.saved` event, for that version, as its last event; any other turn has none."""
     by_turn: dict[str, list[dict[str, Any]]] = {}
     for event in events:
         by_turn.setdefault(event["turn"], []).append(event)
     problems = []
     for turn in turns:
         stream = by_turn.get(turn["id"], [])
-        commits = [e for e in stream if e["type"] == "commit"]
+        saved = [e for e in stream if e["type"] == "turn.saved"]
         if turn["commit_sha"]:
             ok = (
-                len(commits) == 1
-                and stream[-1] is commits[0]
-                and commits[0]["data"].get("sha") == turn["commit_sha"]
+                len(saved) == 1
+                and stream[-1] is saved[0]
+                and saved[0]["data"].get("version") == turn["commit_sha"]
             )
         else:
-            ok = not commits
+            ok = not saved
         if not ok:
             problems.append(turn["id"])
     return problems

@@ -1,4 +1,8 @@
-"""Git working copy per thread: one commit per completed turn; a revert is a new commit."""
+"""A thread's workspace: where its files live, with one saved version per completed turn.
+
+`Workspace` is what the runner needs from it. `WorkCopy` is the implementation here: a git
+repository per thread, where a version is a commit and a revert is a new commit.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,7 @@ import os
 import subprocess
 from contextlib import suppress
 from pathlib import Path
+from typing import Protocol
 
 # Fixed identity, no signing, and none of the user's global ignore or attributes files: git
 # reads those from ~/.config/git even when there is no global config file. Hooks and fsmonitor
@@ -51,8 +56,36 @@ def _failed(root: Path, args: tuple[str, ...], stderr: bytes) -> RuntimeError:
     return RuntimeError(f"git {args[0]} failed in {root}: {stderr.decode().strip()}")
 
 
+class Workspace(Protocol):
+    """The operations the runner uses on a thread's files. A version is an opaque string (a git
+    sha in `WorkCopy`). The runner calls them only while it holds the thread's lock."""
+
+    def init_sync(self) -> None:
+        """Create the workspace with an empty first version (blocking). Idempotent."""
+        ...
+
+    async def save(self, message: str) -> tuple[str, list[str]]:
+        """Save everything as a new version, even if nothing changed: (version, changed files)."""
+        ...
+
+    async def revert(self, version: str) -> tuple[str, list[str]]:
+        """Undo `version` as a new version; on a conflict, change nothing and raise."""
+        ...
+
+    async def head(self) -> str:
+        """The current version."""
+        ...
+
+    async def recover(self, version: str | None, *, keep: bool = True) -> None:
+        """Go back to `version` (None: the first one) after a save or revert that no turn
+        recorded. With `keep` the files stay as they are, for the next save; without it they are
+        reset to `version`."""
+        ...
+
+
 class WorkCopy:
-    """A git repository at `root` on branch `main`, starting with an empty commit.
+    """A git repository at `root` on branch `main`, starting with an empty commit. Implements
+    `Workspace`: `save` is a commit.
 
     `lock_fd` is the descriptor of the thread's lock (see `runner._try_lock`). Every git process
     inherits it, so the lock lasts until the last of them exits, even if the caller dies first.
@@ -117,7 +150,7 @@ class WorkCopy:
         """`init_sync` without blocking the event loop."""
         await asyncio.to_thread(self.init_sync)
 
-    async def commit(self, message: str) -> tuple[str, list[str]]:
+    async def save(self, message: str) -> tuple[str, list[str]]:
         """Commit everything in the working tree (even if nothing changed)."""
         await self._git("add", "-A")
         await self._git("commit", "-q", "--allow-empty", "-m", message)

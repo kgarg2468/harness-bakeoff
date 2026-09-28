@@ -70,7 +70,7 @@ New to the repo? [`docs/learn/bakeoff-101.html`](docs/learn/bakeoff-101.html) is
 A turn starts with your message. The shared runner saves it and hands the loop the whole history. Boxes with a coloured border are the loop's own code, A or B; the grey ones are shared.
 
 - **Each step is one streamed model request.** The loop builds it from the full history and streams the answer: text, reasoning and tool calls. B builds each request from cached bytes and starts read-only tools while the model is still streaming; A does it all through pydantic-ai's `Agent.iter()`.
-- **The loop only yields events.** It never writes the log, git or the screen itself. The shared runner saves each item to a SQLite session log, publishes each event, and ends a completed turn with one git commit in the thread's working copy.
+- **The loop only yields events.** It never writes the log, the working copy or the screen itself. The shared runner saves each item to a SQLite session log, publishes each event, and ends a completed turn by saving a version of the thread's working copy (one git commit here) and publishing `turn.saved`.
 - **Tools go through one shared ToolHost.** It checks arguments against each tool's JSON schema, applies the permission rules (allow, ask or deny, per tool and per file pattern) and times every run. The tools are RocketRide's: list, describe and validate pipeline components against the real node catalog, read and edit files, and load the RocketRide pipeline skills.
 - **Ask means pause.** The turn ends as `paused`. You approve or deny later, even from another process (`bakeoff approve`), and the turn picks up where it stopped. A denied call never runs; the model gets the reason as its result.
 - **A crash is just another resume.** If the worker dies mid-turn, `bakeoff resume` rebuilds the turn from the saved history. A tool whose result was saved never runs twice.
@@ -85,7 +85,7 @@ The seam is [`src/bakeoff/shared/contract.py`](src/bakeoff/shared/contract.py): 
 
 - **One seam.** Only `our_version/` and `pydantic_version/` are counted. Everything else is shared and identical for both.
 - **Same scenarios, same fake model.** `fakeprov` is a scripted OpenAI- and OpenRouter-style streaming server on 127.0.0.1. Each loop gets its own copy of the same script, and every request body is recorded.
-- **Judged from the outside.** Pass or fail comes only from the recorded requests and the session log, never from what a loop reports about itself. Every scenario also checks the invariants: **I1** history is append-only, **I2** every tool call gets exactly one result, **I3** the event sequence has no gaps, **I5** the loop prints nothing, **I7** one git commit per completed turn. A socket guard enforces **I6**: no connection leaves 127.0.0.1.
+- **Judged from the outside.** Pass or fail comes only from the recorded requests and the session log, never from what a loop reports about itself. Every scenario also checks the invariants: **I1** history is append-only, **I2** every tool call gets exactly one result, **I3** the event sequence has no gaps, **I5** the loop prints nothing, **I7** one saved version (a git commit) per completed turn. A socket guard enforces **I6**: no connection leaves 127.0.0.1.
 - **Predictions first.** [`PREDICTIONS.md`](PREDICTIONS.md) was committed before either loop was written.
 - **A is used the recommended way.** [`A_CHECKLIST.md`](A_CHECKLIST.md) ties each choice to the pydantic-ai docs, and its reviewer can change A to match. It also lists the code A had to add and the library behaviours it works around.
 - **Same feature floor.** Both loops have retries with backoff, provider-reported cost, feedback on bad tool arguments, cancel, a step cap, approvals that survive a restart, and crash resume. Each is covered by a test, so neither loop looks small by skipping work.
@@ -135,9 +135,9 @@ src/bakeoff/
   our_version/         B: our loop on raw httpx (counted; files ported from Pi say so at the top)
   shared/              everything else, identical for both
     contract.py        the seam: the Loop protocol, Item and Event types, the rules (read this first)
-    runner.py          drives one turn: loop events -> session log -> publish -> git commit
+    runner.py          drives one turn: loop events -> session log -> publish -> save a version
     sessionlog.py      SQLite log of threads, turns, items and events
-    workcopy.py        one git working copy per thread; one commit per completed turn
+    workcopy.py        the Workspace the runner saves to; WorkCopy: one git repository per thread
     toolhost.py        tool registry, argument checks, permission checks, tool timing
     permissions.py     allow / ask / deny rules with wildcards (ported from OpenCode)
     tools/             file tools, RocketRide engine tools, load_skill

@@ -33,7 +33,7 @@ from bakeoff.shared import netguard, permissions
 from bakeoff.shared.contract import Limits, Loop, ModelConfig, Resume
 from bakeoff.shared.scenario import (
     Captured,
-    Workspace,
+    RunDir,
     capture_output,
     check_invariants,
     decide,
@@ -238,8 +238,9 @@ class Printer:
             self._line(f"[error {data.get('kind')}: {_short(data.get('message'), 300)}]")
         elif kind == "turn.end":
             self._line(f"[turn end: {data.get('stop')}, {data.get('steps')} steps]")
-        elif kind == "commit":
-            self._line(f"[commit {data['sha'][:10]}: {', '.join(data['files']) or 'no files'}]")
+        elif kind == "turn.saved":
+            files = ", ".join(data["files"]) or "no files"
+            self._line(f"[saved {data['version'][:10]}: {files}]")
 
 
 def stdin_ask(out: TextIO, stdin: TextIO | None = None) -> Ask:
@@ -388,7 +389,7 @@ class LiveThread:
         self.limits = Limits(max_steps=max_steps)
         self.attended = _attended(rules)
         self.loop = loop or loops.load(impl)()
-        self.ws = Workspace(directory / "log.sqlite", sinks=[Printer(term)])
+        self.ws = RunDir(directory / "log.sqlite", sinks=[Printer(term)])
         try:
             self.thread_id = self.ws.runner.new_thread(
                 impl=self.loop.name,

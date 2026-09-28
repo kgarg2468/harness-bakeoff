@@ -6,8 +6,8 @@ the line-count comparison covers exactly the code the decision is about.
 
 Rules every Loop must follow (tests enforce them, see DESIGN.md):
 
-1. A loop only *yields events*. It never touches the session log, git, the UI
-   or stdout/stderr. The shared runner persists and publishes what it yields.
+1. A loop only *yields events*. It never touches the session log, the workspace,
+   the UI or stdout/stderr. The shared runner persists and publishes what it yields.
 2. A loop keeps no state between turns (connection pools and caches are fine).
    It rebuilds everything from `TurnInput.history`, so "resume after approval"
    and "resume after a crash" are the same code path.
@@ -27,8 +27,9 @@ Rules every Loop must follow (tests enforce them, see DESIGN.md):
 6. When `cancel` is set, stop within 200 ms, leave no orphan tool calls, and
    end with `turn.end` stop="cancelled".
 7. The last event a loop emits in every turn is `turn.end`. After it, the runner
-   may add exactly one `commit` event (completed turns only), so consumers treat
-   `commit` as "turn fully done" and `turn.end` as "the loop is done".
+   may add exactly one `turn.saved` event (completed turns only: the version of the
+   thread's workspace that holds the turn's changes), so consumers treat `turn.saved`
+   as "turn fully done" and `turn.end` as "the loop is done".
 8. If history contains a compaction item (`Item.compaction`), a request carries
    only the system prompt plus the last compaction item and everything after it.
 """
@@ -60,7 +61,7 @@ SHARED_EVENTS = (
     "turn.start",  # {turn_id, resume?}: runner
     "tool.start",  # {call_id, name}: ToolHost
     "tool.end",  # {call_id, name, ok, ms}: ToolHost
-    "commit",  # {sha, files}: runner, after a turn completes
+    "turn.saved",  # {version, files}: runner, after a turn completes (a git sha here)
 )
 
 

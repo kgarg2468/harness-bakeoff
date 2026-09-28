@@ -525,18 +525,18 @@ def log(tmp_path):
     log.close()
 
 
-def event(log, turn_id, type_="commit", **data):
+def event(log, turn_id, type_="turn.saved", **data):
     env = {"v": 1, "thread": "th", "turn": turn_id, "impl": "our", "seq": log.next_seq("th")}
     return event_row({**env, "t_us": 0, "type": type_, "data": data})
 
 
 async def committed_turn(log, wc, status="done", kind="user"):
-    """A turn as the runner records it: the sha on the row, a `commit` event last."""
+    """A turn as the runner records it: the sha on the row, a `turn.saved` event last."""
     turn = log.start_turn("th", kind)
     log.append_events([event(log, turn["id"], "turn.start")])
-    sha, files = await wc.commit(f"turn {turn['idx']}")
-    commit = event(log, turn["id"], sha=sha, files=files)
-    log.set_turn_status(turn["id"], status, stop="end_turn", commit_sha=sha, events=[commit])
+    sha, files = await wc.save(f"turn {turn['idx']}")
+    saved = event(log, turn["id"], version=sha, files=files)
+    log.set_turn_status(turn["id"], status, stop="end_turn", commit_sha=sha, events=[saved])
     return sha
 
 
@@ -598,26 +598,26 @@ async def test_each_commit_is_its_turns_last_event(log, tmp_path):
     assert check_commits(log, "th", wc.root).ok
     log.append_events([event(log, "th.0", "text.delta", text="after the commit")])
     check = check_commits(log, "th", wc.root)
-    assert (check.ok, check.info["commit_events"]) == (False, ["th.0"])
-    assert "commit event is missing, repeated, not their last event" in check.detail
+    assert (check.ok, check.info["saved_events"]) == (False, ["th.0"])
+    assert "turn.saved event is missing, repeated, not their last event" in check.detail
 
     turn = log.start_turn("th", "user")  # the sha is on the row, but no commit event
     (wc.root / "a.pipe").write_text("{}")
-    sha, _ = await wc.commit("turn 1")
+    sha, _ = await wc.save("turn 1")
     log.set_turn_status(turn["id"], "done", stop="end_turn", commit_sha=sha)
-    assert check_commits(log, "th", wc.root).info["commit_events"] == ["th.0", "th.1"]
+    assert check_commits(log, "th", wc.root).info["saved_events"] == ["th.0", "th.1"]
     # A commit event for another sha, or for a turn without one, is wrong too.
-    log.append_events([event(log, "th.1", sha="0" * 40)])
+    log.append_events([event(log, "th.1", version="0" * 40)])
     compact = log.start_turn("th", "compact")["id"]
-    log.set_turn_status(compact, "done", events=[event(log, compact, sha=sha)])
-    assert check_commits(log, "th", wc.root).info["commit_events"] == ["th.0", "th.1", "th.2"]
+    log.set_turn_status(compact, "done", events=[event(log, compact, version=sha)])
+    assert check_commits(log, "th", wc.root).info["saved_events"] == ["th.0", "th.1", "th.2"]
 
 
 async def test_extra_commit_fails(log, tmp_path):
     wc = WorkCopy(tmp_path / "wc")
     await wc.init()
     await committed_turn(log, wc)
-    await wc.commit("not a turn")
+    await wc.save("not a turn")
     check = check_commits(log, "th", wc.root)
     assert not check.ok
     assert "2 commits after init for 1 completed turns" in check.detail

@@ -303,7 +303,7 @@ async def test_result_json_shape_and_layout(real_provider: FakeProvider, tmp_pat
     types = [
         json.loads(line)["type"] for line in (directory / "events.ndjson").read_text().splitlines()
     ]
-    assert types[0] == "turn.start" and types[-2:] == ["turn.end", "commit"]
+    assert types[0] == "turn.start" and types[-2:] == ["turn.end", "turn.saved"]
 
 
 async def test_a_run_id_is_never_reused(real_provider: FakeProvider, tmp_path: Path) -> None:
@@ -887,7 +887,7 @@ async def test_cancel_command_reaches_a_worker_turn(
 ) -> None:
     """`bakeoff cancel` from another process stops the turn a `bakeoff turn` worker runs."""
     db = tmp_path / "log.sqlite"
-    ws = scenario.Workspace(db)
+    ws = scenario.RunDir(db)
     model = ModelConfig(base_url=real_provider.base_url("S07", "r1", "our"), model="m")
     ws.runner.new_thread(impl="our", system="s", rules={"*": "allow"}, model=model, thread_id="t1")
     ws.close()
