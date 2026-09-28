@@ -178,7 +178,9 @@ class ModelConfig:
 class TurnInput:
     thread_id: str
     turn_id: str
-    system: str  # frozen for the whole thread
+    # The thread's system prompt. It changes only between turns, and then history has the
+    # runner's note of the change before the user's message (`Runner.turn`).
+    system: str
     history: list[Item]  # everything so far, including this turn's user item
     resume: Resume | None
     limits: Limits

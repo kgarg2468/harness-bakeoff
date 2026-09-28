@@ -220,8 +220,16 @@ _RESPONSES_OPS = {
 # The ops that end a Responses stream: every stream has exactly one, as its last op.
 _RESPONSES_ENDS = ("completed", "incomplete", "error", "failed", "stall")
 
+_DECISION = {"enum": ["allow", "ask", "deny"]}
+_RULES = {
+    "type": "object",
+    "additionalProperties": {
+        "anyOf": [_DECISION, {"type": "object", "additionalProperties": _DECISION}]
+    },
+}
 _STEPS = {
-    "user": _obj({"user": _STR, "cancel_after_ms": _INT0}, "user"),
+    # `system` and `rules` change the thread's settings from this turn on (`Runner.turn`).
+    "user": _obj({"user": _STR, "cancel_after_ms": _INT0, "system": _STR, "rules": _RULES}, "user"),
     "approve": _obj(
         {
             "approve": _obj(
@@ -243,7 +251,6 @@ _STEPS = {
 _REQUIRED = tuple("id title system model rules limits engine driver exchanges expect".split())
 # Event types a `crash_after` step can narrow down to one tool call (see fakeprov/README.md).
 _CALL_EVENTS = ("tool_call.ready", "permission.asked", "tool.start", "tool.end", "item")
-_DECISION = {"enum": ["allow", "ask", "deny"]}
 _KINDS = {"enum": ["openrouter", "openai_compat", "openai_responses"]}
 _STYLE = {"enum": ["openrouter", "openai"]}
 _STRICT = {
@@ -358,19 +365,13 @@ def _schema(api: Api) -> dict[str, Any]:
         "temperature": {"type": ["number", "null"]},
         "compat": {"type": "object"},
     }
-    rules = {
-        "type": "object",
-        "additionalProperties": {
-            "anyOf": [_DECISION, {"type": "object", "additionalProperties": _DECISION}]
-        },
-    }
     return _obj(
         {
             "id": _STR,
             "title": _STR,
             "system": _STR,
             "model": _obj(model, "kind", "model"),
-            "rules": rules,
+            "rules": _RULES,
             "limits": _obj({"max_steps": _INT1}, "max_steps"),
             "engine": _obj({"delay_ms": _INT0}, "delay_ms"),
             **styles,
@@ -478,6 +479,8 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
             turns += 1
         if "crash_after" in step and (i + 1 == len(steps) or "user" not in steps[i + 1]):
             fail(f"$.driver[{i}]", "crash_after must be followed by a user step")
+        if crashed and ({"system", "rules"} & set(step)):
+            fail(f"$.driver[{i}]", "the user step after crash_after cannot change settings")
         if "call_id" in step:
             referenced.add(step["call_id"])
             if step["crash_after"] not in _CALL_EVENTS:

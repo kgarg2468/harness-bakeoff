@@ -14,10 +14,10 @@ from typing import Any
 
 import httpx
 import pytest
-from test_our_loop import OBJ, SYSTEM, Server, StubTools, items, no_wait, of, run, user
+from test_our_loop import NOTE, OBJ, SYSTEM, Server, StubTools, items, no_wait, of, run, user
 
 from bakeoff.our_version.responses import input_items, static_body
-from bakeoff.shared.contract import Item, ModelConfig
+from bakeoff.shared.contract import Item, Limits, ModelConfig, TurnInput
 
 MODEL = ModelConfig(
     base_url="http://127.0.0.1:9/v1",
@@ -395,6 +395,22 @@ async def test_a_call_done_incomplete_never_runs(end: dict[str, Any]) -> None:
     (item,) = items(events)  # kept as cut output, never replayed
     assert item.status == "incomplete" and "tool_calls" not in item.message
     assert events[-1].data["stop"] == "error"
+
+
+async def test_a_new_system_prompt_rebuilds_the_cached_prefix() -> None:
+    """As on chat completions: the new system prompt goes first, then the history as before."""
+    server = Server(answer("one"), answer("two"))
+    loop, tools = server.loop(), StubTools()
+    history = [user("hi")]
+    history += items(await run(loop, history, tools, model=MODEL))
+    history += [Item("n1", "t2", NOTE), user("again")]
+    changed = TurnInput("thread-1", "t2", "You fix pipelines.", history, None, Limits(), MODEL)
+    events = [e async for e in loop.run_turn(changed, tools, asyncio.Event())]
+    assert events[-1].data["stop"] == "end_turn"
+    first, second = (json.loads(body)["input"] for body in server.bodies)
+    assert first[0] == {"role": "developer", "content": SYSTEM}
+    assert second[0] == {"role": "developer", "content": "You fix pipelines."}
+    assert second[1:] == [*first[1:], message("one"), NOTE, history[-1].message]
 
 
 def test_request_options_and_items_without_native() -> None:

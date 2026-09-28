@@ -58,6 +58,8 @@ logger = logging.getLogger(__name__)
 
 # Starts the content of a compaction item; see contract rule 8.
 SUMMARY_PREFIX = "[harness] Conversation summary:"
+# Starts the content of the item that notes a change of the thread's settings (`Runner.turn`).
+CONFIG_PREFIX = "[harness] Configuration changed:"
 
 try:
     import fcntl
@@ -123,11 +125,29 @@ async def _wait_lock(lock_path: Path, wait_s: float) -> int | None:
 
 def _check_loop_item(item: Any, turn_id: str) -> None:
     """A loop's items belong to its own turn, and only the runner writes compaction items
-    (contract rule 8): a loop cannot make history before an item of its own disappear."""
+    (contract rule 8) and notes of changed settings: a loop cannot make history before an item
+    of its own disappear, or change the system prompt behind one (I1)."""
     if getattr(item, "compaction", False):
         raise ValueError(f"item {item.id!r} is a compaction item: only the runner compacts")
+    if getattr(item, "id", None) in (f"{turn_id}:user", f"{turn_id}:config"):
+        raise ValueError(f"item {item.id!r} has the id of a runner item")
     if getattr(item, "turn_id", turn_id) != turn_id:
         raise ValueError(f"item {item.id!r} belongs to turn {item.turn_id!r}, not {turn_id!r}")
+
+
+def _new_settings(
+    thread: dict[str, Any], system: str | None, rules: dict[str, Any] | None
+) -> tuple[dict[str, Any], str] | None:
+    """The thread's settings (`{"system", "meta"}`) with a new system prompt and new rules, and
+    the note that says what changed; None if nothing changes."""
+    changes, settings = [], {"system": thread["system"], "meta": thread["meta"]}
+    if system is not None and system != thread["system"]:
+        changes.append("a new system prompt")
+        settings["system"] = system
+    if rules is not None and rules != thread["meta"]["rules"]:
+        changes.append(f"new permission rules {json.dumps(rules)}")
+        settings["meta"] = {**thread["meta"], "rules": rules}
+    return (settings, f"{CONFIG_PREFIX} {', and '.join(changes)}.") if changes else None
 
 
 @contextmanager
@@ -175,10 +195,16 @@ class _Publisher:
         # that is not JSON fails here, at the event that carries it.
         return event_row(env)
 
-    def emit(self, type_: str, data: dict[str, Any]) -> None:
+    def emit(
+        self, type_: str, data: dict[str, Any], *, settings: dict[str, Any] | None = None
+    ) -> None:
+        """Stamp, persist and publish one event. `settings` (with an `item`) replaces the
+        thread's system prompt and meta in the item's transaction."""
         row = self._row(self._seq, type_, data)
         if type_ == "item":
-            self._log.append_item(self._thread, data["item"], [*self._batch, row])
+            self._log.append_item(
+                self._thread, data["item"], [*self._batch, row], settings=settings
+            )
             self._batch.clear()
         elif type_ == "tool.start":
             self._log.append_events([*self._batch, row])
@@ -350,12 +376,21 @@ class Runner:
         limits: Limits = _DEFAULT_LIMITS,
         cancel: asyncio.Event | None = None,
         watch_cancel: bool = False,
+        system: str | None = None,
+        rules: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run one turn: a new user message, or a resume (approval or crash).
 
         While the last turn is paused, a new user message is refused: the pending calls need an
         approval resume first (it may deny them, with a reason), since a user message between a
         call and its result breaks the history.
+
+        `system` and `rules` are the thread's system prompt and permission rules from this turn
+        on. If they differ from the thread's, the runner stores them and appends a runner item
+        before the user's message, a user message that starts with `CONFIG_PREFIX` and names
+        what changed, so the history explains why the request prefix changed (I1 lets it reset
+        there). Only a new user message changes them: on a resume they must be None or unchanged,
+        since a note between a call and its result breaks the history.
 
         Returns `{"turn_id", "stop", "pending", "version"}` (`version`: the saved version, None
         if the turn was not saved). A loop exception ends the turn with stop="error" instead of
@@ -373,6 +408,8 @@ class Runner:
         thread = self._thread(thread_id)
         if loop.name != thread["impl"]:
             raise ValueError(f"thread {thread_id} belongs to {thread['impl']!r}, not {loop.name!r}")
+        if resume is not None and _new_settings(thread, system, rules):
+            raise ValueError("the system prompt and the rules change with a user message only")
         wait_s = self.lock_wait_s if resume is not None else 0.0
         lock_fd = await _wait_lock(self._lock_path(thread_id), wait_s)
         try:
@@ -387,6 +424,8 @@ class Runner:
                 cancel,
                 watch_cancel,
                 lock_fd,
+                system,
+                rules,
             )
         finally:
             _unlock(lock_fd)
@@ -403,6 +442,8 @@ class Runner:
         cancel: asyncio.Event | None,
         watch_cancel: bool,
         lock_fd: int | None,
+        system: str | None,
+        rules: dict[str, Any] | None,
     ) -> dict[str, Any]:
         kind = resume.kind if resume else "user"
         self._retire_dead(thread_id, lock_fd)
@@ -424,6 +465,11 @@ class Runner:
             if resume is not None:
                 start["resume"] = asdict(resume)
             pub.emit("turn.start", start)
+            if changed := _new_settings(thread, system, rules):
+                settings, note = changed
+                item = Item(f"{turn_id}:config", turn_id, {"role": "user", "content": note})
+                pub.emit("item", {"item": item}, settings=settings)
+                thread = {**thread, **settings}
             if user_text is not None:
                 message = {"role": "user", "content": user_text}
                 pub.emit("item", {"item": Item(f"{turn_id}:user", turn_id, message)})

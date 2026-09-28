@@ -48,12 +48,13 @@ out/                   generated: log.sqlite, wc/, wire/, metrics.json, report.h
 
 ## The seam
 
-Read `src/bakeoff/shared/contract.py`. In short, a `Loop` gets a `TurnInput` (frozen system
+Read `src/bakeoff/shared/contract.py`. In short, a `Loop` gets a `TurnInput` (the thread's system
 prompt, full history, optional resume decisions, limits, model config), a `ToolHost`, and a
 cancel `asyncio.Event`. It yields `Event`s. The shared runner:
 
 1. creates the turn row and appends the user's message as an `Item` (so `history` already ends
-   with the user item when the loop starts; on resume there is no new user item);
+   with the user item when the loop starts; on resume there is no new user item), after a note
+   of changed settings if the turn brings any (below);
 2. emits `turn.start`, then consumes the loop's events, stamping each with
    `{v, thread, turn, impl, seq, t_us, type, data}` (`seq` has no gaps per thread; `t_us` is
    microseconds since turn start);
@@ -113,9 +114,20 @@ history, so reasoning items go back verbatim with their `encrypted_content`.
 
 `Item.native` is loop-private. `pydantic_version` stores pydantic-ai's native `ModelMessage` JSON
 there (each item gets the native of exactly what it shows) and rebuilds its history from it.
-Items the runner created (user messages, revert notes, compaction summaries) have `native=None`, and every
-loop must handle them. A compaction item (`Item.compaction=True`, a user message starting with
-`[harness] Conversation summary:`) replaces everything before it (contract rule 8).
+Items the runner created (user messages, revert notes, notes of changed settings, compaction
+summaries) have `native=None`, and every loop must handle them. A compaction item
+(`Item.compaction=True`, a user message starting with `[harness] Conversation summary:`) replaces
+everything before it (contract rule 8).
+
+The system prompt and the permission rules can change between turns. `Runner.turn(system=...,
+rules=...)` compares them with the thread's; if they differ, it stores them on the thread and,
+in the same transaction, appends a runner item `<turn>:config` before the user's message: a user
+message that starts with `[harness] Configuration changed:` and names what changed (new rules are
+quoted, since the model cannot see them otherwise). So the history says why the request prefix
+changed, and I1 lets the system messages change there. Only a user turn changes settings: on a
+resume the note would come between calls and their results. Both loops build the request prefix
+from `TurnInput.system` (B caches it per thread, keyed on the system prompt, the model config and
+the tools), and the runner builds each turn's ToolHost from the thread's rules.
 
 ### Resume
 
@@ -259,6 +271,7 @@ recordings and the session log, never from what a loop says about itself.
 | S13 | BYOK thinking: `openai_compat` endpoint, non-OpenAI model name, reasoning requested | the reasoning parameter reaches the wire |
 | S14 | BYOK strict endpoint: 400 if body has `reasoning`, `reasoning_effort` or `stream_options` (configured via compat flags) | the turn finishes |
 | S15 | compaction hand-off: runner appends a summary item; loop sends [system, summary, new user] | prefix resets only at the compaction boundary |
+| S17 | settings change between turns: a new system prompt and rules that make `write_file` ask | the new system prompt, the kept history, the runner's note, the new message; the write asks, then runs once |
 | R01 | Responses API (`gpt-6-luna`, effort `xhigh`, summary `auto`): text only | `store: false`, `include` has `reasoning.encrypted_content`, `reasoning.summary` sent, Responses tools; exact text; usage from `response.completed` |
 | R02 | reasoning + one function call + its `function_call_output`, then the answer | the reasoning item replayed exactly as sent; tool ran once |
 | R03 | commentary + 3 function calls in one response; `write_file` asks; approve in a new process | as S05; the resumed request replays reasoning, commentary (`phase`) and all calls |
@@ -288,7 +301,8 @@ that fails any other way is a plain failure.
 
 - **I1 append-only**: each request's `messages` (Responses API: `instructions`, then the `input`
   items) are a prefix of the next request's (semantic equality; byte equality reported
-  separately). Resets only at a compaction item.
+  separately). Resets only at a compaction item, and the system messages change only where a new
+  note of changed settings follows the history kept from the request before.
 - **I2** every tool call gets exactly one result; no call id runs twice (`tool.start` count);
   every run ends before its turn's `turn.end` (no orphan tools); and every result comes from a
   run, unless the user denied the call or its turn stopped early (cancelled, max_steps, budget,

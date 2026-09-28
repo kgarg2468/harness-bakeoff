@@ -366,7 +366,12 @@ class _ScenarioRun:
                     await self._child(n, "turn", args, killed=True)
                     crash = None
                 elif "user" in step:
-                    await self._turn(user_text=step["user"], cancel_ms=step.get("cancel_after_ms"))
+                    await self._turn(
+                        user_text=step["user"],
+                        cancel_ms=step.get("cancel_after_ms"),
+                        system=step.get("system"),
+                        rules=step.get("rules"),
+                    )
                 elif "approve" in step:
                     await self._approve(n, step)
                 elif "resume" in step:
@@ -385,6 +390,8 @@ class _ScenarioRun:
         user_text: str | None = None,
         resume: Resume | None = None,
         cancel_ms: int | None = None,
+        system: str | None = None,
+        rules: dict[str, Any] | None = None,
     ) -> None:
         cancel = asyncio.Event()
         timers: list[asyncio.TimerHandle] = []
@@ -411,6 +418,8 @@ class _ScenarioRun:
                 resume=resume,
                 limits=self.limits,
                 cancel=cancel,
+                system=system,
+                rules=rules,
             )
         finally:
             self._on_start = None

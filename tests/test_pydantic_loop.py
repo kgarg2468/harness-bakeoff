@@ -739,6 +739,28 @@ async def test_compaction_item_resets_the_request_prefix(loop):
     ]
 
 
+async def test_a_new_system_prompt_is_sent_from_the_turn_that_brings_it(loop):
+    """The runner changed the thread's settings: the run's instructions are the new system
+    prompt, and the history follows as before, with the runner's note."""
+    note = {"role": "user", "content": "[harness] Configuration changed: a new system prompt."}
+    with SSEServer(Reply([*text("one"), done()]), Reply([*text("two"), done()])) as srv:
+        history = [user("hi")]
+        history += items(await run(loop, turn(history, config(srv)), StubTools()))
+        history += [Item("n1", "t2", note), user("again")]
+        changed = TurnInput("th", "t2", "You fix pipelines.", history, None, Limits(), config(srv))
+        events = await run(loop, changed, StubTools())
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+    first, second = (request["messages"] for request in srv.requests)
+    assert first[0] == {"role": "system", "content": "SYS"}
+    assert second == [
+        {"role": "system", "content": "You fix pipelines."},
+        *first[1:],
+        {"role": "assistant", "content": "one"},
+        note,
+        {"role": "user", "content": "again"},
+    ]
+
+
 async def test_rate_limit_retry_is_visible_and_honours_retry_after(loop):
     limited = Reply(
         status=429,

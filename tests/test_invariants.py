@@ -242,6 +242,57 @@ def test_a_reset_still_compares_the_system_bytes():
     assert check_prefix([before, encode(SYSTEM, SUMMARY)], COMPACTION, TURNS).info["byte_prefix"]
 
 
+NOTE = {"role": "user", "content": "[harness] Configuration changed: a new system prompt."}
+NEW_SYSTEM = {"role": "system", "content": "new sys"}
+CONFIG = [Item("t.1:config", "t.1", NOTE)]
+CONFIG_TURNS = [{"id": "t.0", "kind": "user"}, {"id": "t.1", "kind": "user"}]
+
+
+def test_the_system_prompt_may_change_at_a_configuration_note():
+    before = encode(SYSTEM, USER, ANSWER)
+    after = encode(NEW_SYSTEM, USER, ANSWER, NOTE, user("next"))
+    later = encode(NEW_SYSTEM, USER, ANSWER, NOTE, user("next"), ANSWER)
+    check = check_prefix([before, after, later], CONFIG, CONFIG_TURNS)
+    assert (check.ok, check.info["resets"]) == (True, [1]), check.detail
+    assert check.info["byte_prefix"]  # the history after the system prompt kept its bytes
+    # Without the note, or with a history that changed as well, the change is a violation.
+    for bad in [
+        encode(NEW_SYSTEM, USER, ANSWER, user("next")),
+        encode(NEW_SYSTEM, USER, NOTE, user("next")),  # the answer was dropped
+        encode(NEW_SYSTEM, user("edited"), ANSWER, NOTE, user("next")),
+    ]:
+        assert not check_prefix([before, bad], CONFIG, CONFIG_TURNS).ok, bad
+    # The note must be new to the request: one the previous request already had is no reset.
+    had = encode(SYSTEM, USER, ANSWER, NOTE)
+    assert not check_prefix([had, encode(NEW_SYSTEM, USER, ANSWER, NOTE)], CONFIG, CONFIG_TURNS).ok
+    # Only the runner's note of a user turn counts, not a message that looks like one.
+    assert not check_prefix([before, after], [Item("t.1:x", "t.1", NOTE)], CONFIG_TURNS).ok
+    compact_turn = [{"id": "t.1", "kind": "compact"}]
+    assert not check_prefix([before, after], CONFIG, compact_turn).ok
+    assert not check_prefix([before, after], CONFIG).ok
+
+
+def test_a_configuration_change_may_come_with_a_compaction():
+    log_items = [*COMPACTION, Item("t.2:config", "t.2", NOTE)]
+    turns = [*TURNS, {"id": "t.2", "kind": "user"}]
+    before = encode(SYSTEM, USER, ANSWER)
+    check = check_prefix(
+        [before, encode(NEW_SYSTEM, SUMMARY, NOTE, user("next"))], log_items, turns
+    )
+    assert (check.ok, check.info["resets"]) == (True, [1]), check.detail
+    no_note = encode(NEW_SYSTEM, SUMMARY, user("next"))
+    assert not check_prefix([before, no_note], log_items, turns).ok
+
+
+def test_responses_instructions_may_change_at_a_configuration_note():
+    note_parts = {"role": "user", "content": [{"type": "input_text", "text": NOTE["content"]}]}
+    before = responses_body(R_USER, R_ANSWER)
+    after = responses_body(R_USER, R_ANSWER, note_parts, R_USER, instructions="new sys")
+    check = check_prefix([before, after], CONFIG, CONFIG_TURNS)
+    assert (check.ok, check.info["resets"]) == (True, [1]), check.detail
+    assert not check_prefix([before, after]).ok
+
+
 def test_unreadable_body_fails():
     check = check_prefix([encode(SYSTEM, USER), b'{"model": "m"}'])
     assert not check.ok

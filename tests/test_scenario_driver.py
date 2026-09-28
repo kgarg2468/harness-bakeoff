@@ -878,7 +878,7 @@ def test_load_tells_missing_loops_from_broken_ones(
 
 def test_scenario_ids_are_every_file_in_order() -> None:
     ids = scenario.scenario_ids()
-    assert ids[0] == "R01" and ids[-1] == "S15" and {"R05", "S01", "S12b"} <= set(ids)
+    assert ids[0] == "R01" and ids[-1] == "S17" and {"R05", "S01", "S12b"} <= set(ids)
     assert ids == sorted(p.stem for p in SCENARIOS_DIR.glob("*.json"))
 
 

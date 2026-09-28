@@ -1023,6 +1023,34 @@ async def test_crash_after_an_incomplete_answer_asks_again(usage: dict[str, Any]
     assert items(events)[0].message["content"] == "Done." and events[-1].data["stop"] == "end_turn"
 
 
+NOTE = {"role": "user", "content": "[harness] Configuration changed: a new system prompt."}
+
+
+async def test_a_new_system_prompt_rebuilds_the_cached_prefix() -> None:
+    """The request prefix is cached per thread and keyed on the system prompt (among others). A
+    turn with a new one, after the runner changed the thread's settings, sends it, then the
+    history as before, byte for byte."""
+    server = Server(reply("one"), reply("two"))
+    loop, tools = server.loop(), StubTools()
+    history = [user("hi")]
+    history += items(await run(loop, history, tools))
+    history += [Item("n1", "t2", NOTE), user("again")]
+    changed = TurnInput("thread-1", "t2", "You fix pipelines.", history, None, Limits(), MODEL)
+    events = [e async for e in loop.run_turn(changed, tools, asyncio.Event())]
+    assert events[-1].data["stop"] == "end_turn"
+    first, second = server.messages(0), server.messages(1)
+    assert first[0] == {"role": "system", "content": SYSTEM}
+    assert second == [
+        {"role": "system", "content": "You fix pipelines."},
+        *first[1:],
+        {"role": "assistant", "content": "one"},
+        NOTE,
+        history[-1].message,
+    ]
+    tail = server.bodies[0][server.bodies[0].index(b'{"role":"user"') : -2]
+    assert tail in server.bodies[1]
+
+
 async def test_compaction_item_resets_the_prefix() -> None:
     summary = {"role": "user", "content": "[harness] Conversation summary: built a pipe."}
     history = [

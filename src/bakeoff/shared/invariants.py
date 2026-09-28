@@ -58,20 +58,33 @@ def check_prefix(
     `instructions` (the system prompt, if sent there) followed by its `input` items.
     `ok` is semantic equality; byte equality of the raw elements is reported in
     `info["byte_prefix"]`. A prefix may reset only at a new compaction summary, placed right
-    after the unchanged system messages (contract rule 8). Only the compaction `items` of
-    the runner's "compact" turns (`turns`, as `SessionLog.turns` returns them) count as
-    summaries, so neither a look-alike message nor a loop's own item can fake a reset. They
-    are matched in log order: a reset moves to a compaction item after the one the prefix
-    starts from, never back to an older one, and two compactions may share a summary text.
+    after the unchanged system messages (contract rule 8), or at a configuration change: the
+    system messages may differ from the previous request's only if the part of the request
+    that the previous one lacks holds a configuration-change note, and the history before it is
+    still the previous request's (unless a new compaction summary starts it over as well).
+    Only the runner's items count (`turns`, as `SessionLog.turns` returns them): the compaction
+    `items` of "compact" turns as summaries, and the `<turn>:config` items of "user" turns as
+    notes, so neither a look-alike message nor a loop's own item can fake a reset. Summaries are
+    matched in log order: a reset moves to a compaction item after the one the prefix starts
+    from, never back to an older one, and two compactions may share a summary text.
     """
-    compact_turns = {t["id"] for t in turns if t["kind"] == "compact"}
+    kinds = {t["id"]: t["kind"] for t in turns}
     summary_messages = [
-        item.message for item in items if item.compaction and item.turn_id in compact_turns
+        item.message for item in items if item.compaction and kinds.get(item.turn_id) == "compact"
     ]
-    # A summary is a user message: in the Responses API the same shape is an input message.
+    config_messages = [
+        item.message
+        for item in items
+        if item.id == f"{item.turn_id}:config" and kinds.get(item.turn_id) == "user"
+    ]
+    # Both are user messages: in the Responses API the same shape is an input message.
     summaries = {
         "chat": [_semantic(m) for m in summary_messages],
         "responses": [_semantic_item(m) for m in summary_messages],
+    }
+    configs = {
+        "chat": [_semantic(m) for m in config_messages],
+        "responses": [_semantic_item(m) for m in config_messages],
     }
     requests: list[_Conversation] = []
     for i, body in enumerate(bodies):
@@ -92,19 +105,18 @@ def check_prefix(
             used = _next_summary(summaries[requests[0].api], first[n], -1)
     for i in range(1, len(requests)):
         prev, cur = requests[i - 1], requests[i]
-        kept = len(prev.semantic)  # the elements that must reach `cur` unchanged
+        kept, at = prev.raw, 0  # the raw elements that must reach `cur`, from `at`, unchanged
         j = _first_difference(prev.semantic, cur.semantic)
         if j is not None:
-            k = _reset_to(prev.semantic, cur.semantic, summaries[cur.api], used)
-            if k < 0:
+            reset = _reset(prev, cur, summaries[cur.api], configs[cur.api], used)
+            if reset is None:
                 violations.append({"request": i, "message": j})
                 continue
-            used = k
+            used, kept, at = reset
             resets.append(i)
-            kept = _system_count(prev.semantic)
-        k = _first_difference(prev.raw[:kept], cur.raw)
+        k = _first_difference(kept, cur.raw[at:])
         if k is not None:
-            byte_mismatches.append({"request": i, "message": k})
+            byte_mismatches.append({"request": i, "message": at + k})
     info = {
         "requests": len(requests),
         "apis": sorted({r.api for r in requests}),
@@ -121,8 +133,8 @@ def check_prefix(
         )
     else:
         detail = (
-            f"{len(requests)} requests append-only ({len(resets)} compaction resets);"
-            f" byte-identical prefix: {'yes' if not byte_mismatches else 'no'}"
+            f"{len(requests)} requests append-only ({len(resets)} resets at a compaction or a"
+            f" configuration change); byte-identical prefix: {'yes' if not byte_mismatches else 'no'}"
         )
     return Check("I1", not violations, detail, info)
 
@@ -253,18 +265,34 @@ def _system_count(messages: list[dict[str, Any]]) -> int:
     )
 
 
-def _reset_to(
-    prev: list[dict[str, Any]],
-    cur: list[dict[str, Any]],
+def _reset(
+    prev: _Conversation,
+    cur: _Conversation,
     summaries: list[dict[str, Any]],
+    configs: list[dict[str, Any]],
     used: int,
-) -> int:
-    """Where `cur` starts over as rule 8 says (`prev`'s system messages, then a summary): the
-    index of the first compaction item after `used` with that summary, or -1 if none."""
-    n = _system_count(prev)
-    if len(cur) <= n or cur[:n] != prev[:n]:
-        return -1
-    return _next_summary(summaries, cur[n], used)
+) -> tuple[int, list[bytes], int] | None:
+    """How `cur` may start over from `prev`, or None if it may not. With the same system
+    messages, only as rule 8 says: then comes the first compaction item after `used`. With other
+    system messages, only at a configuration change: the part of `cur` that `prev` lacks holds a
+    note of `configs`, and before it comes `prev`'s history, or a new compaction summary.
+
+    Returns (the compaction item the prefix now starts from, the raw elements of `prev` that
+    must start `cur` from index `at` unchanged, `at`)."""
+    p, c = prev.semantic, cur.semantic
+    n, m = _system_count(p), _system_count(c)
+    if c[:m] == p[:n]:
+        k = _next_summary(summaries, c[n], used) if len(c) > n else -1
+        return None if k < 0 else (k, prev.raw[:n], 0)
+    rest = c[m:]
+    k = _next_summary(summaries, rest[0], used) if rest else -1
+    if k >= 0:  # a compaction came first: nothing of `prev` is left
+        new, kept = rest[1:], []
+    elif _first_difference(p[n:], rest) is None:
+        k, new, kept = used, rest[len(p) - n :], prev.raw[n:]
+    else:
+        return None
+    return (k, kept, m) if any(element in configs for element in new) else None
 
 
 def _next_summary(summaries: list[dict[str, Any]], message: dict[str, Any], after: int) -> int:

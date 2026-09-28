@@ -63,7 +63,7 @@ a file (JSON schema plus cross-checks) and raises `ScenarioError` naming the exa
 | Key | Meaning |
 |---|---|
 | `id`, `title` | `S01` ...; one-line description |
-| `system` | the thread's frozen system prompt |
+| `system` | the thread's system prompt (a user step may change it) |
 | `model` | `{"kind": "openrouter" \| "openai_compat" \| "openai_responses", "model", "reasoning"?, "temperature"?, "compat"?}` → `ModelConfig` (passed through unchanged; `temperature: null` sends none, absent keeps `ModelConfig`'s default). `openai_responses` scripts the [Responses API](#responses-api-mode) |
 | `rules` | permission rules, e.g. `{"*": "allow", "write_file": "ask"}` |
 | `limits` | `{"max_steps"}` → `Limits` |
@@ -78,7 +78,7 @@ a file (JSON schema plus cross-checks) and raises `ScenarioError` naming the exa
 
 | Step | Meaning |
 |---|---|
-| `{"user": str, "cancel_after_ms"?: int}` | run a turn with this user message; set `cancel` that many ms after the turn starts |
+| `{"user": str, "cancel_after_ms"?: int, "system"?: str, "rules"?: {...}}` | run a turn with this user message; set `cancel` that many ms after the turn starts; `system` and `rules` change the thread's settings from this turn on (`Runner.turn`, which notes the change in history). Not after `crash_after` |
 | `{"approve": {"allow"?: [ids] \| "all", "deny"?: [ids], "reason"?: str}, "new_process": bool}` | answer the pending `permission.asked` calls and resume (`Resume(kind="approval")`), in a fresh process if `new_process` |
 | `{"crash_after": "<event type>", "call_id"?: str}` | run the **next** user step in a child process that SIGKILLs itself when its runner publishes the first event of this type; with `call_id`, the first one about that call (see below) |
 | `{"resume": "crash"}` | resume the killed turn (`Resume(kind="crash")`) |
@@ -324,6 +324,7 @@ The next request replays the done reasoning item verbatim, the function call and
 | S13 | BYOK thinking: `openai_compat`, `qwen3-32b`, `reasoning_effort` on the wire, `reasoning_content` back |
 | S14 | BYOK strict endpoint: 400 on `reasoning`, `reasoning_effort` or `stream_options` |
 | S15 | compaction: after the summary a request is `[system, summary, new user]`, then append-only |
+| S17 | settings change between turns: a new system prompt and rules under which `write_file` asks; the request after the change is `[new system, history, note, new user]`; approve |
 | R01 | Responses API, `gpt-6-luna` at effort `xhigh`: the request shape (`store: false`, `include` has `reasoning.encrypted_content`, Responses-style tools, no `temperature`/`max_tokens`/`reasoning_effort`); reasoning with a summary, then the answer |
 | R02 | reasoning (two summary parts), one `describe_component` call, its output, then the answer; the reasoning item is replayed exactly as its done event sent it |
 | R03 | reasoning, a `commentary` message and three calls in one response (`validate_pipeline` and `describe_component` allowed, `write_file` asks); approve in a new process; the resumed request replays everything, `phase` included |

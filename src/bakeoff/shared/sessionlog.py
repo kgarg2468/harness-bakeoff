@@ -228,9 +228,22 @@ class SessionLog:
 
     # items and events
 
-    def append_item(self, thread_id: str, item: Item, events: Iterable[EventRow] = ()) -> int:
-        """Append an item (seq = its position in history) plus `events`, in one transaction."""
+    def append_item(
+        self,
+        thread_id: str,
+        item: Item,
+        events: Iterable[EventRow] = (),
+        *,
+        settings: dict[str, Any] | None = None,
+    ) -> int:
+        """Append an item (seq = its position in history) plus `events`, in one transaction.
+        `settings` (`{"system", "meta"}`) replaces the thread's in the same transaction."""
         with self._tx() as db:
+            if settings is not None:
+                db.execute(
+                    "UPDATE threads SET system = ?, meta = ? WHERE id = ?",
+                    (settings["system"], json.dumps(settings["meta"]), thread_id),
+                )
             seq = self._insert_item(db, thread_id, item)
             self._insert_events(db, events)
         return seq
