@@ -49,8 +49,9 @@ out/                   generated: log.sqlite, wc/, wire/, metrics.json, report.h
 ## The seam
 
 Read `src/bakeoff/shared/contract.py`. In short, a `Loop` gets a `TurnInput` (the thread's system
-prompt, full history, optional resume decisions, limits, model config), a `ToolHost`, and a
-cancel `asyncio.Event`. It yields `Event`s. The shared runner:
+prompt, full history, an optional resume with decisions, delivered results and the calls still
+waiting, limits, model config), a `ToolHost`, and a cancel `asyncio.Event`. It yields `Event`s.
+The shared runner:
 
 1. creates the turn row and appends the user's message as an `Item` (so `history` already ends
    with the user item when the loop starts; on resume there is no new user item), after a note
@@ -207,16 +208,16 @@ Permission rules (OpenCode style), per thread:
 ```
 
 A tool maps to a decision, or to `{glob-on-path: decision}` with the first match winning. Paths
-that escape the working copy are always denied.
+that escape the working copy are always denied. `ToolHost.check()` is async, so a runtime can
+read its rules from a database; loop B awaits it on its early-start path and when it schedules a
+step's calls, loop A in a `before_tool_execute` hook (`A_CHECKLIST.md`, Approvals).
 
 `ToolSpec.timeout_s` limits a run: `ToolHost.run()` fails a call whose tool takes longer
 (`<tool> timed out after N s`); no shared tool sets one yet. A running tool may report how it is
 getting on (`ToolContext.progress`), which the ToolHost sends as `tool.progress`
 `{call_id, name, message}`. A tool that starts work which finishes later raises `ToolPending`,
 and `run()` returns a pending result (Resume, above). `build_toolhost(background=[...])` makes
-the named tools do only that, for the scenarios. `ToolHost.check()` is async, so a runtime can
-read its rules from a database; loop B awaits it on its early-start path and when it schedules a
-step's calls, loop A in a `before_tool_execute` hook (`A_CHECKLIST.md`, Approvals).
+the named tools do only that, for the scenarios.
 
 ## Skills
 
@@ -229,7 +230,8 @@ their text files (`.md`, `.json`, `.pipe`, not the `tools/*.py` helpers) to
 
 Progressive disclosure: `skills_prompt()` (`shared/skills.py`) is the system-prompt section. It
 lists only `name: description` per skill and tells the model to call `load_skill` before acting on
-a matching task; it is deterministic, so appending it keeps the thread's system prompt frozen.
+a matching task; it is deterministic, so appending it keeps the thread's system prompt the same
+from request to request.
 `load_skill` returns the `SKILL.md`, or a file it mentions, after one harness paragraph: the
 ToolHost's real tool names, and that instructions to run scripts or tools not in that list do not
 apply here. `file` is read as the skill writes it: relative to the skill (`GATE_PROTOCOL.md`,
@@ -350,8 +352,8 @@ that fails any other way is a plain failure.
   note of changed settings follows the history kept from the request before.
 - **I2** every tool call gets exactly one result; no call id runs twice (`tool.start` count);
   every run ends before its turn's `turn.end` (no orphan tools); and every result comes from a
-  run, unless the user denied the call or its turn stopped early (cancelled, max_steps, budget,
-  error).
+  run (a delivered one from the run that started its work), unless the user denied the call or
+  its turn stopped early (cancelled, max_steps, budget, error).
 - **I3** `seq` has no gaps; `item` events == item rows.
 - **I5** the loop writes nothing to stdout/stderr.
 - **I6** no connection leaves 127.0.0.1 (socket guard in tests and in every `bakeoff` command;
