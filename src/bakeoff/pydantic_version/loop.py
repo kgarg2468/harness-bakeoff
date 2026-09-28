@@ -70,6 +70,7 @@ from pydantic_ai.usage import RunUsage
 from bakeoff.pydantic_version import mapping
 from bakeoff.pydantic_version.model import build_model, run_settings
 from bakeoff.shared.contract import (
+    CONTEXT_NEAR_LIMIT,
     Event,
     Item,
     ModelConfig,
@@ -121,8 +122,10 @@ class _Turn:
     decided: set[str]  # the calls the user answered in this resume
     read_only: set[str]  # tool names
     responses_api: bool  # the model speaks OpenAI's Responses API
+    context_window: int | None = None  # ModelConfig.context_window
     out: asyncio.Queue[Event | None] = field(default_factory=asyncio.Queue)
     steps: int = 0
+    near_limit: bool = False  # context.near_limit was emitted (once per turn)
     attempt: int = 0  # of the current step
     # (status, monotonic time, reason) of the last failed attempt, until the next one starts.
     failure: tuple[int | None, float, str] | None = None
@@ -206,7 +209,13 @@ class _Turn:
                     self.items.append(item)
                     self.emit("item", {"item": item})
         for step, response in self.responses:
-            self.emit("usage", _usage(response, step))
+            usage = _usage(response, step)
+            self.emit("usage", usage)
+            window, used = self.context_window, usage["input_tokens"]
+            if window and not self.near_limit and used >= CONTEXT_NEAR_LIMIT * window:
+                # The response's input fills the context window: say so, once (rule 8).
+                self.near_limit = True
+                self.emit("context.near_limit", {"input_tokens": used, "context_window": window})
         self.responses.clear()
 
 
@@ -242,6 +251,7 @@ class PydanticLoop:
         read_only = {spec.name for spec in tools.specs() if spec.read_only}
         responses_api = turn.model.kind == "openai_responses"
         state = _Turn(turn.turn_id, tools, turn.limits.max_steps, decided, read_only, responses_api)
+        state.context_window = turn.model.context_window
         task = asyncio.create_task(self._drive(turn, state, cancel))
         try:
             while (event := await state.out.get()) is not None:

@@ -326,6 +326,7 @@ class _ScenarioRun:
             kind=sc.model["kind"],  # as the scenario says: it picks the API a loop must speak
             reasoning=sc.model.get("reasoning"),
             compat=sc.model.get("compat") or {},
+            context_window=sc.model.get("context_window"),
             timeout_s=MODEL_TIMEOUT_S,
             **temperature,
         )
@@ -644,6 +645,7 @@ class Observed:
     # per cancelled turn: (turn id, ms from the cancel to turn.end); ms is 0.0 if the turn
     # ended before its cancel fired, None if it never started or never ended
     cancels: list[tuple[str | None, float | None]] = field(default_factory=list)
+    events: dict[str, int] = field(default_factory=dict)  # event type -> how many the log has
 
 
 ToolSpan = tuple[str, int, int | None]
@@ -687,6 +689,7 @@ def observe(
         bodies=bodies,
         tool_spans=tool_spans(events),
         cancels=[cancel_latency(events, mark) for mark in cancels],
+        events=dict(Counter(e["type"] for e in events)),
     )
 
 
@@ -810,6 +813,8 @@ def _expect(key: str, want: Any, obs: Observed) -> tuple[bool, str]:
             return equal(sources[0] if len(sources) == 1 else sources)
         case "tools_overlap":
             return _overlap(want, obs.tool_spans)
+        case "events":
+            return equal({kind: obs.events.get(kind, 0) for kind in want})
         case "cancel_within_ms":
             if not obs.cancels:
                 return False, "no turn was cancelled"

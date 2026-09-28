@@ -64,7 +64,7 @@ a file (JSON schema plus cross-checks) and raises `ScenarioError` naming the exa
 |---|---|
 | `id`, `title` | `S01` ...; one-line description |
 | `system` | the thread's system prompt (a user step may change it) |
-| `model` | `{"kind": "openrouter" \| "openai_compat" \| "openai_responses", "model", "reasoning"?, "temperature"?, "compat"?}` → `ModelConfig` (passed through unchanged; `temperature: null` sends none, absent keeps `ModelConfig`'s default). `openai_responses` scripts the [Responses API](#responses-api-mode) |
+| `model` | `{"kind": "openrouter" \| "openai_compat" \| "openai_responses", "model", "reasoning"?, "temperature"?, "compat"?, "context_window"?}` → `ModelConfig` (passed through unchanged; `temperature: null` sends none, absent keeps `ModelConfig`'s default). `openai_responses` scripts the [Responses API](#responses-api-mode) |
 | `rules` | permission rules, e.g. `{"*": "allow", "write_file": "ask"}` |
 | `limits` | `{"max_steps"}` → `Limits` |
 | `engine` | `{"delay_ms"}` → `MockEngine(delay_ms=...)` |
@@ -162,6 +162,7 @@ Responses are deterministic: identical for every run and impl.
 | `usage` | `{input_tokens, output_tokens, cached_tokens}`: the totals over all usage events |
 | `cost_source` | every usage event's `cost_source` equals it: `provider` (billed cost from the provider), `estimate` (a price table) or `none` (no cost available, never guessed) |
 | `tools_overlap` | `[call_id, ...]` (at least 2): the tools of these calls ran at the same time. Each ran once, in one turn, and the last `tool.start` comes before the first `tool.end` (event `t_us`) |
+| `events` | `{event type: n}`: the log holds exactly n events of that type, all turns and processes together (e.g. `{"context.near_limit": 1}`) |
 | `cancel_within_ms` | every turn the driver cancels (`cancel_after_ms`) has its `turn.end` at most this many ms after the driver set `cancel`. The driver notes when it set it; `t_us` in the log gives the rest. A turn that ends before its cancel fires passes this key; `stops` judges it |
 
 Tool call ids are `call_<scenario>_<n>`, unique per scenario; the loader rejects references
@@ -328,6 +329,7 @@ The next request replays the done reasoning item verbatim, the function call and
 | S15 | compaction: after the summary a request is `[system, summary, new user]`, then append-only |
 | S17 | settings change between turns: a new system prompt and rules under which `write_file` asks; the request after the change is `[new system, history, note, new user]`; approve |
 | S18 | a user message with images: a text part, an `image_url` by URL and one inline (a data URL, `detail: low`); both requests carry the parts as sent |
+| S19 | context nearly full (`context_window` 10,000): 8,200 then 8,600 input tokens in one turn give one `context.near_limit`; the driver compacts; the next turn is small |
 | R01 | Responses API, `gpt-6-luna` at effort `xhigh`: the request shape (`store: false`, `include` has `reasoning.encrypted_content`, Responses-style tools, no `temperature`/`max_tokens`/`reasoning_effort`); reasoning with a summary, then the answer |
 | R02 | reasoning (two summary parts), one `describe_component` call, its output, then the answer; the reasoning item is replayed exactly as its done event sent it |
 | R03 | reasoning, a `commentary` message and three calls in one response (`validate_pipeline` and `describe_component` allowed, `write_file` asks); approve in a new process; the resumed request replays everything, `phase` included |

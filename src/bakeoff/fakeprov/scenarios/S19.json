@@ -1,0 +1,68 @@
+{
+  "id": "S19",
+  "title": "Context nearly full: context.near_limit once per turn, then the runtime compacts between turns",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5", "context_window": 10000},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [
+    {"user": "Which lanes does the chat component output?"},
+    {"compact": "The user asked which lanes the chat component outputs: questions."},
+    {"user": "And which lanes does the llm_openai component take?"}
+  ],
+  "exchanges": [
+    {
+      "note": "8,200 input tokens: at least 80% of the 10,000-token window, so context.near_limit follows this step's usage.",
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {"id": "call_S19_1", "name": "describe_component", "arguments": {"name": "chat"}}
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 8200, "completion_tokens": 40, "cost": 0.0246}}
+        ]
+      }
+    },
+    {
+      "note": "Fuller still, but the turn has said it once already.",
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 4,
+        "tool_result_contains": {"call_S19_1": "questions"}
+      },
+      "respond": {
+        "stream": [
+          {"text": "The chat component outputs questions.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 8600, "completion_tokens": 20, "cost": 0.0258}}
+        ]
+      }
+    },
+    {
+      "note": "The runtime compacted between the turns: system, summary, the new message; far from the limit.",
+      "expect": {
+        "last_role": "user",
+        "messages_len": 3,
+        "messages_at": [{"index": 1, "role": "user", "contains": "outputs: questions"}]
+      },
+      "respond": {
+        "stream": [
+          {"text": "llm_openai takes questions and outputs answers.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1200, "completion_tokens": 20, "cost": 0.0036}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn", "end_turn"],
+    "requests": 3,
+    "commits": 2,
+    "events": {"context.near_limit": 1, "usage": 3},
+    "text_contains": "llm_openai takes questions"
+  }
+}

@@ -32,6 +32,9 @@ Rules every Loop must follow (tests enforce them, see DESIGN.md):
    as "turn fully done" and `turn.end` as "the loop is done".
 8. If history contains a compaction item (`Item.compaction`), a request carries
    only the system prompt plus the last compaction item and everything after it.
+   A loop never writes summaries: when a response's input fills the context
+   window to `CONTEXT_NEAR_LIMIT`, it emits `context.near_limit` (at most once
+   per turn), and the runtime decides whether to compact between turns.
 
 Turn ownership (the runtime's side of the seam):
 
@@ -58,6 +61,10 @@ from typing import Any, Literal, Protocol
 Decision = Literal["allow", "ask", "deny"]
 StopReason = Literal["end_turn", "paused", "max_steps", "budget", "cancelled", "error"]
 
+# The share of `ModelConfig.context_window` a response's input tokens must reach for the loop
+# to emit `context.near_limit` (rule 8).
+CONTEXT_NEAR_LIMIT = 0.8
+
 # Event types. Loops emit the first group; the runner and ToolHost emit the rest.
 LOOP_EVENTS = (
     "request.start",  # {step, attempt}
@@ -66,6 +73,7 @@ LOOP_EVENTS = (
     "tool_call.ready",  # {call_id, name, arguments}: a call's arguments are complete
     "item",  # {item: Item}: the only event that changes durable history
     "usage",  # {step, input_tokens, output_tokens, cached_tokens, reasoning_tokens, cost_usd, cost_source}
+    "context.near_limit",  # {input_tokens, context_window}: after the step's usage (rule 8)
     "retry",  # {attempt, status, wait_ms, reason}
     "permission.asked",  # {call_id, name, arguments}
     "error",  # {kind, message, retryable}
@@ -180,6 +188,8 @@ class ModelConfig:
     compat: dict[str, Any] = field(default_factory=dict)
     max_retries: int = 3
     timeout_s: float = 600.0
+    # The model's context window in tokens, if known: `context.near_limit` needs it (rule 8).
+    context_window: int | None = None
 
 
 @dataclass(slots=True, frozen=True)

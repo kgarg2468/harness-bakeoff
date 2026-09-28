@@ -350,6 +350,12 @@ _FINAL_EXPECT = _obj(
         "tools_overlap": {"type": "array", "items": _STR, "minItems": 2, "uniqueItems": True},
         # Every turn the driver cancels (`cancel_after_ms`) ends this soon after the cancel.
         "cancel_within_ms": {"type": "number", "minimum": 0},
+        # {event type: n}: how many events of that type the log holds, all turns together.
+        "events": {
+            "type": "object",
+            "propertyNames": {"enum": [*LOOP_EVENTS, *SHARED_EVENTS]},
+            "additionalProperties": _INT0,
+        },
     },
     "stops",
 )
@@ -381,6 +387,7 @@ def _schema(api: Api) -> dict[str, Any]:
         # null: send no temperature (reasoning models reject one); absent: ModelConfig's default
         "temperature": {"type": ["number", "null"]},
         "compat": {"type": "object"},
+        "context_window": _INT1,
     }
     return _obj(
         {

@@ -16,7 +16,16 @@ from typing import Any, Literal
 
 import httpx
 
-from bakeoff.shared.contract import Event, Item, ToolCall, ToolHost, ToolResult, ToolSpec, TurnInput
+from bakeoff.shared.contract import (
+    CONTEXT_NEAR_LIMIT,
+    Event,
+    Item,
+    ToolCall,
+    ToolHost,
+    ToolResult,
+    ToolSpec,
+    TurnInput,
+)
 
 from .compat import REASONING_FIELDS, merge_detail, static_body, usage_fields
 from .provider import (
@@ -142,6 +151,7 @@ class _Turn:
         self.steps = len(spent)
         self.cost = sum(u.get("cost_usd") or 0.0 for u in spent)
         self.unpriced = any(u.get("cost_source") == "none" for u in spent)
+        self.near_limit = False  # context.near_limit was emitted (once per turn)
         self.ended = False
         self.jobs: dict[str, asyncio.Task[ToolResult]] = {}  # tool runs by call id
         self.tasks: set[asyncio.Task[Any]] = set()  # everything the cancel watcher must stop
@@ -251,7 +261,8 @@ class _Turn:
                     await self._stop_jobs()
                     cut = stream.partial() or {"role": "assistant", "content": None}
                     yield self._item(cut, status="incomplete", usage=usage)
-                    yield Event("usage", usage)
+                    for event in self._usage(usage):
+                        yield event
                     if self.cancel.is_set():  # it came while the body's end drained (rule 6)
                         yield self._end("cancelled")
                         return
@@ -263,7 +274,8 @@ class _Turn:
                     if not call.ready:
                         yield await self._ready(call)
                 yield self._item(stream.message(), usage=usage, native=stream.native)
-                yield Event("usage", usage)
+                for event in self._usage(usage):
+                    yield event
                 if calls := stream.tool_calls():
                     async for event in self._tools_within_cap(calls):
                         yield event
@@ -451,6 +463,18 @@ class _Turn:
         task = self._spawn(coro)
         await asyncio.wait([task])
         return task
+
+    def _usage(self, usage: dict[str, Any]) -> list[Event]:
+        """The step's `usage`, then `context.near_limit` the first time this turn that a
+        response's input fills the context window to CONTEXT_NEAR_LIMIT (rule 8)."""
+        events = [Event("usage", usage)]
+        window, used = self.model.context_window, usage["input_tokens"]
+        if window and not self.near_limit and used >= CONTEXT_NEAR_LIMIT * window:
+            self.near_limit = True
+            events.append(
+                Event("context.near_limit", {"input_tokens": used, "context_window": window})
+            )
+        return events
 
     def _item(
         self,

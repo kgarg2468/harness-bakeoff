@@ -108,8 +108,10 @@ def test_every_expect_key_passes_on_matching_facts(tmp_path: Path) -> None:
         "cost_usd": 0.003,
         "usage": {"input_tokens": 30, "output_tokens": 5, "cached_tokens": 5},
         "cost_source": "provider",
+        "events": {"context.near_limit": 1, "retry": 0},
     }
-    results = evaluate_expect(expect, observed(tmp_path, usage=usage))
+    events = {"usage": 2, "context.near_limit": 1}
+    results = evaluate_expect(expect, observed(tmp_path, usage=usage, events=events))
     assert set(results) == set(expect)
     assert all(r["ok"] for r in results.values()), results
 
@@ -128,6 +130,7 @@ def test_each_expect_key_explains_a_mismatch(tmp_path: Path) -> None:
         "cost_usd": 0.25,
         "usage": {"input_tokens": 2},
         "cost_source": "none",
+        "events": {"context.near_limit": 1},
     }
     results = evaluate_expect(expect, observed(tmp_path, usage=usage))
     details = {key: r["detail"] for key, r in results.items() if not r["ok"]}
@@ -141,6 +144,7 @@ def test_each_expect_key_explains_a_mismatch(tmp_path: Path) -> None:
     assert details["text_contains"] == "missing 'bye' in 'Hello, team!'"
     assert details["cost_usd"] == "got 0.5, expected 0.25"
     assert details["cost_source"] == "got estimate, expected none"
+    assert details["events"] == "got {'context.near_limit': 0}, expected {'context.near_limit': 1}"
 
 
 def test_cost_source_needs_usage_events_and_one_source(tmp_path: Path) -> None:
@@ -878,7 +882,7 @@ def test_load_tells_missing_loops_from_broken_ones(
 
 def test_scenario_ids_are_every_file_in_order() -> None:
     ids = scenario.scenario_ids()
-    assert ids[0] == "R01" and ids[-1] == "S18" and {"R05", "S01", "S12b"} <= set(ids)
+    assert ids[0] == "R01" and ids[-1] == "S19" and {"R05", "S01", "S12b"} <= set(ids)
     assert ids == sorted(p.stem for p in SCENARIOS_DIR.glob("*.json"))
 
 

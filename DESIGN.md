@@ -126,6 +126,12 @@ summaries) have `native=None`, and every loop must handle them. A compaction ite
 (`Item.compaction=True`, a user message starting with `[harness] Conversation summary:`) replaces
 everything before it (contract rule 8).
 
+A loop never writes a summary. With `ModelConfig.context_window` set, it emits
+`context.near_limit` `{input_tokens, context_window}` right after the `usage` of the first
+response in a turn whose input tokens reach 80% of the window (`contract.CONTEXT_NEAR_LIMIT`),
+and at most once per turn. The runtime decides whether to compact before the next turn
+(`Runner.compact`).
+
 The system prompt and the permission rules can change between turns. `Runner.turn(system=...,
 rules=...)` compares them with the thread's; if they differ, it stores them on the thread and,
 in the same transaction, appends a runner item `<turn>:config` before the user's message: a user
@@ -280,6 +286,7 @@ recordings and the session log, never from what a loop says about itself.
 | S15 | compaction hand-off: runner appends a summary item; loop sends [system, summary, new user] | prefix resets only at the compaction boundary |
 | S17 | settings change between turns: a new system prompt and rules that make `write_file` ask | the new system prompt, the kept history, the runner's note, the new message; the write asks, then runs once |
 | S18 | a user message with a text part and two image parts (by URL, and inline with `detail: low`) | the parts reach the model as sent, in every request |
+| S19 | context nearly full: 8,200 then 8,600 input tokens of a 10,000-token window; the runtime compacts; the next turn is small | `context.near_limit` once (after step 1's usage); the request after the compaction is [system, summary, new user] |
 | R01 | Responses API (`gpt-6-luna`, effort `xhigh`, summary `auto`): text only | `store: false`, `include` has `reasoning.encrypted_content`, `reasoning.summary` sent, Responses tools; exact text; usage from `response.completed` |
 | R02 | reasoning + one function call + its `function_call_output`, then the answer | the reasoning item replayed exactly as sent; tool ran once |
 | R03 | commentary + 3 function calls in one response; `write_file` asks; approve in a new process | as S05; the resumed request replays reasoning, commentary (`phase`) and all calls |

@@ -1023,6 +1023,38 @@ async def test_crash_after_an_incomplete_answer_asks_again(usage: dict[str, Any]
     assert items(events)[0].message["content"] == "Done." and events[-1].data["stop"] == "end_turn"
 
 
+def step_reply(n: int, prompt_tokens: int) -> httpx.Response:
+    """A response with one read call (id c<n>) that used `prompt_tokens` of input."""
+    usage = {"prompt_tokens": prompt_tokens, "completion_tokens": 5}
+    return sse(
+        call(0, '{"name": "a"}', f"c{n}", "describe_component"),
+        finish("tool_calls", usage),
+        "data: [DONE]",
+    )
+
+
+async def test_context_near_limit_is_said_once_per_turn_after_the_usage() -> None:
+    """At 80% of the context window (8,000 of 10,000 tokens) the loop says so, once in a turn,
+    right after the step's usage. Compacting is the runtime's decision, between turns."""
+    answer = sse(delta(content="done"), finish("stop", {"prompt_tokens": 9_500}), "data: [DONE]")
+    server = Server(step_reply(0, 7_999), step_reply(1, 8_000), step_reply(2, 9_000), answer)
+    model = ModelConfig(base_url=MODEL.base_url, model=MODEL.model, context_window=10_000)
+    history = [user("go")]
+    events = await run(server.loop(), history, StubTools(), model=model)
+    near = [n for n, e in enumerate(events) if e.type == "context.near_limit"]
+    assert [events[n].data for n in near] == [{"input_tokens": 8_000, "context_window": 10_000}]
+    assert events[near[0] - 1].data == of(events, "usage")[1]  # right after step 2's usage
+    # A new turn says it again; without a known window nothing is said.
+    history += [*items(events), user("more")]
+    again = await run(Server(reply("ok")).loop(), history, StubTools(), model=model)
+    assert of(again, "context.near_limit") == []  # "ok" used no tokens: below the limit
+    hot = sse(delta(content="ok"), finish("stop", {"prompt_tokens": 9_900}), "data: [DONE]")
+    again = await run(Server(hot).loop(), history, StubTools(), model=model)
+    assert of(again, "context.near_limit") == [{"input_tokens": 9_900, "context_window": 10_000}]
+    unknown = await run(Server(hot).loop(), history, StubTools())
+    assert of(unknown, "context.near_limit") == []
+
+
 PARTS = [
     {"type": "text", "text": "What is in this sketch?"},
     {"type": "image_url", "image_url": {"url": "https://example.com/sketch"}},

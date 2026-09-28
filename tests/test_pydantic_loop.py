@@ -769,6 +769,36 @@ async def test_a_new_system_prompt_is_sent_from_the_turn_that_brings_it(loop):
     ]
 
 
+async def test_context_near_limit_is_said_once_per_turn_after_the_usage(loop):
+    """At 80% of the context window (8,000 of 10,000 tokens) the loop says so, once in a turn,
+    right after the step's usage."""
+
+    def step(n: int, prompt: int) -> Reply:
+        return Reply(
+            [
+                *tool_call(0, f"c{n}", "read_file", '{"path": "a"}'),
+                done("tool_calls", prompt=prompt),
+            ]
+        )
+
+    replies = [
+        step(0, 7_999),
+        step(1, 8_000),
+        step(2, 9_000),
+        Reply([*text("done"), done(prompt=9_500)]),
+    ]
+    with SSEServer(*replies, Reply([*text("ok"), done(prompt=9_900)])) as srv:
+        cfg = config(srv, context_window=10_000)
+        events = await run(loop, turn([user("go")], cfg), StubTools())
+        history = [user("go"), *items(events), user("more")]
+        again = await run(loop, turn(history, cfg), StubTools())
+
+    near = [n for n, e in enumerate(events) if e.type == "context.near_limit"]
+    assert [events[n].data for n in near] == [{"input_tokens": 8_000, "context_window": 10_000}]
+    assert events[near[0] - 1].type == "usage" and events[near[0] - 1].data["step"] == 2
+    assert of(again, "context.near_limit") == [{"input_tokens": 9_900, "context_window": 10_000}]
+
+
 PARTS = [
     {"type": "text", "text": "What is in this sketch?"},
     {"type": "image_url", "image_url": {"url": "https://example.com/sketch"}},
