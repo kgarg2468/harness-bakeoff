@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from bakeoff import loops
+from bakeoff import cli, loops
 from bakeoff.fakeprov.script import SCENARIOS_DIR
 from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.our_version import OurLoop
@@ -750,7 +750,7 @@ def test_the_scenario_command_ends_even_if_a_task_ignores_every_cancel(tmp_path:
     script = f"""
 import sys
 from dataclasses import replace
-from bakeoff import loops
+from bakeoff import cli, loops
 from bakeoff.cli import main
 from bakeoff.shared import scenario
 scenario.STRAY_WAIT_S = 0.2
@@ -949,3 +949,15 @@ async def test_a_provider_that_cannot_start_releases_the_run_id(tmp_path, monkey
     assert not (tmp_path / "runs" / "retry").exists()
     summary = await run_matrix(["S01"], ["our"], out=tmp_path, run_id="retry")
     assert summary and (tmp_path / "runs" / "retry" / "S01" / "our" / "result.json").is_file()
+
+
+def test_deliver_options_become_results() -> None:
+    results = cli._results(["c1=valid: a=b"], ["c2=engine down"])
+    assert results == {
+        "c1": ToolResult("c1", True, "valid: a=b"),
+        "c2": ToolResult("c2", False, "engine down", "failed"),
+    }
+    with pytest.raises(ValueError, match="expected CALL_ID=TEXT"):
+        cli._results(["no-equals"], [])
+    with pytest.raises(ValueError, match="at least one"):
+        cli._results([], [])

@@ -218,8 +218,14 @@ class Printer:
         elif kind == "tool_call.ready":
             self.names[data["call_id"]] = data["name"]
             self._line(f"-> {data['name']}({_args(data['arguments'])})")
+        elif kind == "tool.progress":
+            name = self.names.get(data["call_id"], data.get("name", "tool"))
+            self._line(f"   .. {name}: {_short(data.get('message'), 140)}")
         elif kind == "tool.end":
             self.ends[data["call_id"]] = data
+            if data.get("pending"):
+                name = self.names.get(data["call_id"], data.get("name", "tool"))
+                self._line(f"   .. {name} started; its result comes later")
         elif kind == "item" and data["item"]["message"].get("role") == "tool":
             message = data["item"]["message"]
             call_id = message.get("tool_call_id")
@@ -236,6 +242,9 @@ class Printer:
             )
         elif kind == "error":
             self._line(f"[error {data.get('kind')}: {_short(data.get('message'), 300)}]")
+        elif kind == "context.near_limit":
+            used, window = data.get("input_tokens"), data.get("context_window")
+            self._line(f"[context nearly full: {used} of {window} tokens]")
         elif kind == "turn.end":
             self._line(f"[turn end: {data.get('stop')}, {data.get('steps')} steps]")
         elif kind == "turn.saved":

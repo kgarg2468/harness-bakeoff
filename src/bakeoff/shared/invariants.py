@@ -417,7 +417,8 @@ def check_tool_results(
     Runs are the `tool.start` events plus those the turn rows (`SessionLog.turns`) keep in
     `late`: tools that started after their loop's `turn.end`. A result must come from a run
     (`ToolHost.run`), unless the user denied the call (`Resume.decisions`, recorded in
-    `turn.start`) or the result's turn stopped early (`_EARLY_STOPS`).
+    `turn.start`) or the result's turn stopped early (`_EARLY_STOPS`). A result delivered by a
+    later resume (contract rule 9) comes from the run that started its work.
     """
     calls: Counter[Any] = Counter()
     results: Counter[Any] = Counter()
@@ -529,7 +530,7 @@ def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
     The workspace here is a git `WorkCopy`, so a version is a commit.
 
     Completed = done, error or cancelled. Compaction turns change no files and save no
-    version; paused turns are saved by the turn that resumes them. An "error" turn without a
+    version; paused and waiting turns are saved by the turn that resumes them. An "error" turn without a
     version failed to save: a later turn's version includes its changes, so a later workspace
     turn must have one. (A revert without a version recorded nothing, and the runner undid what
     git did for it.)

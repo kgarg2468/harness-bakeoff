@@ -30,6 +30,7 @@ from pydantic_ai import (
     Agent,
     AgentRun,
     ApprovalRequired,
+    CallDeferred,
     CancellationToken,
     CostNotFoundWarning,
     DeferredToolRequests,
@@ -77,6 +78,7 @@ from bakeoff.shared.contract import (
     Resume,
     ToolCall,
     ToolHost,
+    ToolResult,
     ToolSpec,
     TurnInput,
 )
@@ -123,6 +125,7 @@ class _Turn:
     read_only: set[str]  # tool names
     responses_api: bool  # the model speaks OpenAI's Responses API
     context_window: int | None = None  # ModelConfig.context_window
+    waiting: set[str] = field(default_factory=set)  # calls whose results are still to come
     out: asyncio.Queue[Event | None] = field(default_factory=asyncio.Queue)
     steps: int = 0
     near_limit: bool = False  # context.near_limit was emitted (once per turn)
@@ -252,6 +255,7 @@ class PydanticLoop:
         responses_api = turn.model.kind == "openai_responses"
         state = _Turn(turn.turn_id, tools, turn.limits.max_steps, decided, read_only, responses_api)
         state.context_window = turn.model.context_window
+        state.waiting = set(turn.resume.waiting) if turn.resume else set()
         task = asyncio.create_task(self._drive(turn, state, cancel))
         try:
             while (event := await state.out.get()) is not None:
@@ -333,7 +337,7 @@ class PydanticLoop:
         if pending := mapping.pending_calls(history):
             # The library needs an answer for every open call; `_before_execute` checks again
             # those the user did not decide, and asks again if `check()` says "ask" (rule 5).
-            deferred = DeferredToolResults(approvals=_approvals(turn.resume, pending))
+            deferred = _answers(turn.resume, pending)
         limits = turn.limits
         cost_limit = None if limits.max_cost_usd is None else Decimal(str(limits.max_cost_usd))
         model = self._model(turn.model)
@@ -417,7 +421,7 @@ class PydanticLoop:
                 state.flush(mapping.close_pending(saved))
             raise
         if result is not None and isinstance(result.output, DeferredToolRequests):
-            return _pause(state, result.output.approvals)
+            return _defer(state, result.output)
         return {"stop": "end_turn"}
 
     def _agent(self, specs: list[ToolSpec]) -> Agent[_Turn, str | DeferredToolRequests]:
@@ -453,6 +457,8 @@ def _tool(spec: ToolSpec) -> Tool[_Turn]:
         # handled everything queued before it (this call's tool_call.ready, earlier results).
         await ctx.deps.out.join()
         result = await ctx.deps.tools.run(_running_call(ctx))
+        if result.pending:  # the work goes on elsewhere: the library's external call (rule 9)
+            raise CallDeferred
         # The library's three outcomes for a call that did not succeed (A_CHECKLIST).
         if result.ok:
             return result.content
@@ -500,13 +506,16 @@ def _unparsed_args(
 async def _before_execute(
     ctx: RunContext[_Turn], /, *, call: ToolCallPart, tool_def: ToolDefinition, args: Any
 ) -> Any:
-    """Decides, before a call runs, whether it may. The step cap is checked before the next
+    """Decides, before a call runs, whether it may. A call that waits for a result from
+    elsewhere is deferred again, never run (rule 9). The step cap is checked before the next
     request, so the calls of the last allowed response would run although their results can
     never be sent: skip them (each still gets a result). Every call the user did not decide in
     this resume (a new one, a crash resume's, or one the user left out) awaits `check()` here and
     is deferred for approval if it must be asked (rule 5). `ApprovalRequiredToolset` cannot await
     its function, and the rules may live in a database (A_CHECKLIST)."""
     turn = ctx.deps
+    if call.tool_call_id in turn.waiting:
+        raise CallDeferred
     if ctx.usage.requests >= turn.max_steps:
         raise SkipToolExecution(_STEP_CAP_RESULT)
     if call.tool_call_id not in turn.decided and await turn.tools.check(_to_call(call)) == "ask":
@@ -531,23 +540,44 @@ def _call_data(part: ToolCallPart) -> dict[str, Any]:
     return {"call_id": call.id, "name": call.name, "arguments": call.arguments}
 
 
-def _approvals(resume: Resume | None, pending: list[ToolCallPart]) -> dict[str, bool | ToolDenied]:
-    """The user's answers for the open calls; a call without one is approved here and re-checked
-    before it runs (`_before_execute`). `run()` still enforces "deny" rules."""
+def _answers(resume: Resume | None, pending: list[ToolCallPart]) -> DeferredToolResults:
+    """An answer for each open call, as the library needs: a result that finished elsewhere
+    (`Resume.results`) as the external call's result, the user's denial as `ToolDenied`, and any
+    other call approved here and decided before it runs (`_before_execute`: deferred again while
+    it waits, asked again, or run). `run()` still enforces "deny" rules."""
     decisions = resume.decisions if resume else {}
+    delivered = resume.results if resume else {}
     reason = (resume.reason if resume else None) or "no reason given"
-    return {
-        call.tool_call_id: ToolDenied(f"Denied by user: {reason}")
-        if decisions.get(call.tool_call_id) == "deny"
-        else True
-        for call in pending
-    }
+    answers = DeferredToolResults()
+    for call in pending:
+        call_id = call.tool_call_id
+        if (result := delivered.get(call_id)) is not None:
+            answers.calls[call_id] = _returned(result)
+        elif decisions.get(call_id) == "deny":
+            answers.approvals[call_id] = ToolDenied(f"Denied by user: {reason}")
+        else:
+            answers.approvals[call_id] = True
+    return answers
 
 
-def _pause(state: _Turn, calls: list[ToolCallPart]) -> dict[str, Any]:
-    for call in calls:
+def _returned(result: ToolResult) -> Any:
+    """A delivered result as the library takes an external call's: its content, a retry prompt
+    for bad arguments, or a failure."""
+    if result.ok:
+        return result.content
+    if result.error == "invalid_args":
+        return ModelRetry(result.content)
+    return ToolFailed(result.content)
+
+
+def _defer(state: _Turn, requests: DeferredToolRequests) -> dict[str, Any]:
+    """How a run that deferred calls ends: paused if a call must be asked (the calls whose
+    work goes on elsewhere wait on), else waiting for those (rule 9)."""
+    for call in requests.approvals:
         state.emit("permission.asked", _call_data(call))
-    return {"stop": "paused", "pending": [call.tool_call_id for call in calls]}
+    if requests.approvals:
+        return {"stop": "paused", "pending": [call.tool_call_id for call in requests.approvals]}
+    return {"stop": "waiting", "pending": [call.tool_call_id for call in requests.calls]}
 
 
 def _retry_reason(exc: BaseException | None) -> str | None:

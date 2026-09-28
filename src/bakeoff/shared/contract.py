@@ -9,8 +9,8 @@ Rules every Loop must follow (tests enforce them, see DESIGN.md):
 1. A loop only *yields events*. It never touches the session log, the workspace,
    the UI or stdout/stderr. The shared runner persists and publishes what it yields.
 2. A loop keeps no state between turns (connection pools and caches are fine).
-   It rebuilds everything from `TurnInput.history`, so "resume after approval"
-   and "resume after a crash" are the same code path.
+   It rebuilds everything from `TurnInput.history`, so "resume after approval",
+   "resume with tool results" and "resume after a crash" are the same code path.
 3. Every durable change is an `item` event. The next model request must be the
    previous request's messages plus new items only: history is append-only.
 4. Every tool call gets exactly one tool-result item, including on deny and
@@ -35,6 +35,17 @@ Rules every Loop must follow (tests enforce them, see DESIGN.md):
    A loop never writes summaries: when a response's input fills the context
    window to `CONTEXT_NEAR_LIMIT`, it emits `context.near_limit` (at most once
    per turn), and the runtime decides whether to compact between turns.
+9. A tool may start work that finishes later: `run()` returns a result with
+   `pending=True`, and the call gets no result item yet (rule 4 holds once the
+   result comes). The loop handles the step's other calls under the usual
+   ordering, then ends the turn with stop="waiting" and the pending ids (or
+   "paused", if a call must be asked; the pending calls wait on). On every
+   resume `Resume.waiting` lists the calls still waiting: the loop never runs
+   them. `Resume.results` holds finished results (a "tool_result" resume, or
+   the crash resume of one): the loop appends one result item for each, never
+   running its call, then goes on with the next model request, or ends
+   "waiting" again, without a request, if calls are still waiting. A cancel
+   gives a waiting call of the step a result like any other (rule 6).
 
 Turn ownership (the runtime's side of the seam):
 
@@ -46,8 +57,8 @@ Turn ownership (the runtime's side of the seam):
   a resume after a crash takes it once the dead holder's lock has expired.
 
 In this repo a turn runs in the task that calls `Runner.turn`: a worker process
-of its own for `bakeoff turn`, `approve` and `resume`, which no client holds
-open. The lock is an OS file lock per thread (`runner._try_lock`), which
+of its own for `bakeoff turn`, `approve`, `deliver` and `resume`, which no client
+holds open. The lock is an OS file lock per thread (`runner._try_lock`), which
 the kernel drops when the process that holds it dies.
 """
 
@@ -59,7 +70,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 Decision = Literal["allow", "ask", "deny"]
-StopReason = Literal["end_turn", "paused", "max_steps", "budget", "cancelled", "error"]
+StopReason = Literal["end_turn", "paused", "waiting", "max_steps", "budget", "cancelled", "error"]
 
 # The share of `ModelConfig.context_window` a response's input tokens must reach for the loop
 # to emit `context.near_limit` (rule 8).
@@ -77,21 +88,23 @@ LOOP_EVENTS = (
     "retry",  # {attempt, status, wait_ms, reason}
     "permission.asked",  # {call_id, name, arguments}
     "error",  # {kind, message, retryable}
-    "turn.end",  # {stop: StopReason, steps, pending?: [call_id], error?}
+    "turn.end",  # {stop: StopReason, steps, pending?: [call_id], error?}: pending if paused/waiting
 )
 SHARED_EVENTS = (
     "turn.start",  # {turn_id, resume?}: runner
     "tool.start",  # {call_id, name}: ToolHost
-    "tool.end",  # {call_id, name, ok, ms}: ToolHost
+    "tool.progress",  # {call_id, name, message}: ToolHost, what a running tool reports
+    "tool.end",  # {call_id, name, ok, ms, pending?}: ToolHost; pending: the work goes on (rule 9)
     "turn.saved",  # {version, files}: runner, after a turn completes (a git sha here)
 )
 # Events a runtime may deliver live without storing them: they show a turn as it happens, and
 # nothing that resumes or judges a turn reads them. The stored events are the rest: messages
 # (`item`), tool start and end, permission requests, usage, and the turn boundaries (turn.start,
-# turn.end, turn.saved), plus request.start, tool_call.ready, retry and error. A runtime that
+# turn.end, turn.saved), plus request.start, tool_call.ready, context.near_limit, retry and
+# error. A runtime that
 # does not store an event gives it no `seq`, so the stored seqs still have no gaps (I3). The
 # reference runner stores every event.
-LIVE_ONLY_EVENTS = ("text.delta", "reasoning.delta")
+LIVE_ONLY_EVENTS = ("text.delta", "reasoning.delta", "tool.progress")
 
 
 @dataclass(slots=True, frozen=True)
@@ -100,6 +113,7 @@ class ToolSpec:
     description: str
     parameters: dict[str, Any]  # JSON schema of the arguments object
     read_only: bool = False  # safe to start before the model finishes streaming
+    timeout_s: float | None = None  # the ToolHost fails a run that takes longer (None: no limit)
 
 
 @dataclass(slots=True, frozen=True)
@@ -121,6 +135,9 @@ class ToolResult:
     # or the user), or the tool itself failed. None when ok=True. Loops may map these onto
     # their own idioms (e.g. pydantic-ai's ModelRetry for invalid_args).
     error: ToolError | None = None
+    # The tool started work that finishes later (rule 9): no result item now. The content says
+    # what started; the result comes in `Resume.results` of a later resume.
+    pending: bool = False
 
 
 # What a user message says: text, or a list of content parts in the OpenAI chat format,
@@ -162,9 +179,14 @@ class Limits:
 
 @dataclass(slots=True, frozen=True)
 class Resume:
-    kind: Literal["approval", "crash"]
+    kind: Literal["approval", "crash", "tool_result"]
     decisions: dict[str, Literal["allow", "deny"]] = field(default_factory=dict)
     reason: str | None = None  # shown to the model when a call is denied
+    # Finished results of waiting calls, by call id (rule 9): a "tool_result" resume's, or what
+    # the crash resume of one delivers again.
+    results: dict[str, ToolResult] = field(default_factory=dict)
+    # Set by the runner on every resume: the calls whose results are still to come. Never run.
+    waiting: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)

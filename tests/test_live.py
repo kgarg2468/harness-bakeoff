@@ -728,3 +728,26 @@ def test_cli_worker_errors_are_reported(tmp_path: Path, capsys: pytest.CaptureFi
     assert main(["resume", "nope", "--db", str(db)]) == 1
     assert "unknown thread nope" in capsys.readouterr().err
     assert main(["cancel", "nope", "--db", str(db)]) == 1
+
+
+def test_the_printer_shows_progress_waiting_calls_and_a_full_context() -> None:
+    out = io.StringIO()
+    printer = live.Printer(out)
+
+    def show(kind: str, **data: Any) -> None:
+        printer({"type": kind, "data": data})
+
+    show("tool_call.ready", call_id="c1", name="validate_pipeline", arguments="{}")
+    show("tool.progress", call_id="c1", name="validate_pipeline", message="3 of 5 components")
+    show("tool.end", call_id="c1", name="validate_pipeline", ok=True, ms=2.0, pending=True)
+    show("context.near_limit", input_tokens=8200, context_window=10000)
+    show("turn.end", stop="waiting", steps=1, pending=["c1"])
+    show("turn.saved", version="0123456789abcdef", files=["a.pipe"])
+    assert out.getvalue().splitlines() == [
+        "-> validate_pipeline()",
+        "   .. validate_pipeline: 3 of 5 components",
+        "   .. validate_pipeline started; its result comes later",
+        "[context nearly full: 8200 of 10000 tokens]",
+        "[turn end: waiting, 1 steps]",
+        "[saved 0123456789: a.pipe]",
+    ]

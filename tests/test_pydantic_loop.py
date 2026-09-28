@@ -558,6 +558,120 @@ async def test_cancel_during_a_slow_tool_closes_the_open_call(loop):
     assert sorted(m["tool_call_id"] for m in tool_messages) == ["c1", "c2"]  # no repair needed
 
 
+class Background(StubTools):
+    """StubTools whose `validate_pipeline` only starts its work: the result is pending."""
+
+    async def run(self, call: ToolCall) -> ToolResult:
+        if call.name != "validate_pipeline":
+            return await super().run(call)
+        self.runs.append(call)
+        self.running[call.id].set()
+        return ToolResult(call.id, True, "validation started", pending=True)
+
+
+def _waiting_batch() -> Reply:
+    calls = [
+        tool_call(0, "c1", "validate_pipeline", '{"path": "a.pipe"}'),  # starts work for later
+        tool_call(1, "c2", "read_file", '{"path": "a"}'),
+        tool_call(2, "c3", "write_file", '{"path": "b", "content": "x"}'),
+        tool_call(3, "c4", "validate_pipeline", '{"path": "b.pipe"}'),  # starts work for later
+    ]
+    return Reply([*(chunk for c in calls for chunk in c), done("tool_calls")])
+
+
+def _delivered(call_id: str, text: str = "valid") -> ToolResult:
+    return ToolResult(call_id, True, f"{call_id}: {text}")
+
+
+async def test_a_tool_that_runs_for_minutes_makes_the_turn_wait(loop):
+    """Rule 9 on the library's deferred tools: a pending result is an external call
+    (`CallDeferred`), a delivered one goes back in `DeferredToolResults.calls`, and a call still
+    waiting is deferred again before it can run. No request is sent while calls wait."""
+    tools = Background()
+    history = [user("check it")]
+    with SSEServer(
+        _waiting_batch(), Reply([*text("c1 is valid, c4 has an error."), done()])
+    ) as srv:
+        events = await run(loop, turn(history, config(srv)), tools)
+        assert of(events, "turn.end") == [{"stop": "waiting", "steps": 1, "pending": ["c1", "c4"]}]
+        assert sorted(i.message.get("tool_call_id") or "" for i in items(events)) == [
+            "",
+            "c2",
+            "c3",
+        ]
+        history += items(events)
+
+        part = Resume("tool_result", results={"c1": _delivered("c1")}, waiting=("c4",))
+        events = await run(loop, turn(history, config(srv), resume=part), tools)
+        assert of(events, "turn.end") == [{"stop": "waiting", "steps": 1, "pending": ["c4"]}]
+        assert [i.message for i in items(events)] == [
+            {"role": "tool", "tool_call_id": "c1", "content": "c1: valid"}
+        ]
+        history += items(events)
+
+        crash, fresh = Resume("crash", waiting=("c4",)), PydanticLoop()
+        events = await run(fresh, turn(history, config(srv), resume=crash), tools)
+        await fresh.aclose()
+        assert of(events, "turn.end") == [{"stop": "waiting", "steps": 1, "pending": ["c4"]}]
+        assert items(events) == []
+        assert len(srv.requests) == 1  # nothing was sent while a call waited
+
+        rest = Resume("tool_result", results={"c4": _delivered("c4", "1 error")})
+        events = await run(loop, turn(history, config(srv), resume=rest), tools)
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+    assert [c.id for c in tools.runs].count("c1") == 1 and [c.id for c in tools.runs].count(
+        "c4"
+    ) == 1
+    sent = [m["tool_call_id"] for m in srv.requests[1]["messages"] if m["role"] == "tool"]
+    assert sorted(sent) == ["c1", "c2", "c3", "c4"]
+    first, second = srv.requests
+    assert second["messages"][: len(first["messages"])] == first["messages"]
+
+
+async def test_a_delivered_failure_reaches_the_model_as_a_failure(loop):
+    tools = Background()
+    history = [user("check it")]
+    with SSEServer(_waiting_batch(), Reply([*text("Both failed."), done()])) as srv:
+        history += items(await run(loop, turn(history, config(srv)), tools))
+        failed = {c: ToolResult(c, False, f"{c}: engine down", "failed") for c in ("c1", "c4")}
+        events = await run(
+            loop, turn(history, config(srv), resume=Resume("tool_result", results=failed)), tools
+        )
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+    sent = {
+        m["tool_call_id"]: m["content"] for m in srv.requests[1]["messages"] if m["role"] == "tool"
+    }
+    assert "c1: engine down" in sent["c1"] and "c4: engine down" in sent["c4"]
+
+
+async def test_an_ask_pauses_and_the_waiting_calls_wait_on(loop):
+    tools = Background({"write_file": "ask"})
+    history = [user("check it")]
+    with SSEServer(_waiting_batch()) as srv:
+        events = await run(loop, turn(history, config(srv)), tools)
+        assert of(events, "turn.end") == [{"stop": "paused", "steps": 1, "pending": ["c3"]}]
+        history += items(events)
+        approve = Resume("approval", {"c3": "allow"}, waiting=("c1", "c4"))
+        events = await run(loop, turn(history, config(srv), resume=approve), tools)
+    assert of(events, "turn.end") == [{"stop": "waiting", "steps": 1, "pending": ["c1", "c4"]}]
+    assert [i.message["tool_call_id"] for i in items(events)] == ["c3"]
+    assert sorted(c.id for c in tools.runs) == ["c1", "c2", "c3", "c4"]  # each once
+
+
+async def test_a_cancel_gives_a_waiting_call_a_result(loop):
+    tools = Background(slow="read_file")
+    cancel = asyncio.Event()
+    with SSEServer(_waiting_batch()) as srv:
+        task = asyncio.create_task(run(loop, turn([user("go")], config(srv)), tools, cancel))
+        await tools.running["c2"].wait()
+        await asyncio.sleep(0.05)
+        cancel.set()
+        events = await task
+    assert of(events, "turn.end") == [{"stop": "cancelled", "steps": 1}]
+    answered = sorted(i.message["tool_call_id"] for i in items(events)[1:])
+    assert answered == ["c1", "c2", "c3", "c4"]  # the waiting calls too
+
+
 async def test_max_steps_stops_after_exactly_that_many_requests(loop):
     looping = [
         Reply([*tool_call(0, f"c{i}", "read_file", '{"path": "a"}'), done("tool_calls")])

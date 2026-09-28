@@ -55,6 +55,9 @@ class Scenario:
     # completions), or "responses" (the Responses API, the only style of its scenarios).
     style: str
     strict: dict[str, Any]
+    # Tools whose runs start work that finishes later (`ToolHostImpl`'s `background`): their
+    # calls wait until a `deliver` step delivers their results.
+    background_tools: list[str] = field(default_factory=list)
 
     @property
     def api(self) -> Api:
@@ -254,6 +257,14 @@ _STEPS = {
         {"crash_after": {"enum": [*LOOP_EVENTS, *SHARED_EVENTS]}, "call_id": _STR}, "crash_after"
     ),
     "resume": _obj({"resume": {"const": "crash"}}, "resume"),
+    # {call id: content}: the finished results of waiting calls, as a "tool_result" resume.
+    "deliver": _obj(
+        {
+            "deliver": {"type": "object", "minProperties": 1, "additionalProperties": _STR},
+            "new_process": _BOOL,
+        },
+        "deliver",
+    ),
     "revert": _obj({"revert": _INT1}, "revert"),
     "compact": _obj({"compact": _STR}, "compact"),
 }
@@ -400,6 +411,7 @@ def _schema(api: Api) -> dict[str, Any]:
             "engine": _obj({"delay_ms": _INT0}, "delay_ms"),
             **styles,
             "strict": _STRICT[api],
+            "background_tools": {"type": "array", "items": _STR, "uniqueItems": True},
             "driver": {"type": "array", "minItems": 1, "items": _kinds(_STEPS)},
             "exchanges": {
                 "type": "array",
@@ -439,6 +451,7 @@ def load_scenario(path: Path) -> Scenario:
         **{key: data[key] for key in _REQUIRED},
         style=data.get("style", default_style or "openrouter"),
         strict=data.get("strict", {}),
+        background_tools=data.get("background_tools", []),
     )
 
 
@@ -499,11 +512,21 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
     turns = 0  # steps that run a turn to its end in this process
     for i, step in enumerate(steps):
         crashed = i > 0 and "crash_after" in steps[i - 1]
-        if "approve" in step or "resume" in step or ("user" in step and not crashed):
+        if (
+            "approve" in step
+            or "resume" in step
+            or ({"user", "deliver"} & set(step) and not crashed)
+        ):
             turns += 1
-        if "crash_after" in step and (i + 1 == len(steps) or "user" not in steps[i + 1]):
-            fail(f"$.driver[{i}]", "crash_after must be followed by a user step")
-        if crashed and ({"system", "rules"} & set(step) or not isinstance(step["user"], str)):
+        if "crash_after" in step and (
+            i + 1 == len(steps) or not {"user", "deliver"} & set(steps[i + 1])
+        ):
+            fail(f"$.driver[{i}]", "crash_after must be followed by a user or deliver step")
+        if (
+            crashed
+            and "user" in step
+            and ({"system", "rules"} & set(step) or not isinstance(step["user"], str))
+        ):
             # It runs as `bakeoff turn --user TEXT` in a child process.
             fail(f"$.driver[{i}]", "the user step after crash_after takes text only, no settings")
         if "call_id" in step:
@@ -514,6 +537,7 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
             allowed = approve.get("allow", [])
             referenced |= set(approve.get("deny", []))
             referenced |= set() if allowed == "all" else set(allowed)
+        referenced |= set(step.get("deliver", {}))
     if unknown := sorted(referenced - set(call_ids)):
         fail("$.expect", f"unknown tool call ids: {unknown}")
     if len(data["expect"]["stops"]) != turns:

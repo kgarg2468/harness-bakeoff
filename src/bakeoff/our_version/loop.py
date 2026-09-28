@@ -141,6 +141,9 @@ class _Turn:
         resume = turn.resume
         self.user = resume.decisions if resume else {}
         self.reason = (resume.reason if resume else None) or "no reason given"
+        # Results that finished elsewhere, and calls whose results are still to come (rule 9).
+        self.delivered = resume.results if resume else {}
+        self.waiting = set(resume.waiting) if resume else set()
         # A resume continues the logical turn (all after the last user item), so the limits count
         # the steps and cost it already spent.
         history = turn.history
@@ -165,7 +168,7 @@ class _Turn:
         # Incomplete items (cancelled or truncated output) are never replayed: they are no answer.
         last = next((_role(it) for it in reversed(history) if it.status == "complete"), None)
         try:
-            if pending := self._pending():  # approval or crash resume
+            if pending := self._pending():  # approval, tool_result or crash resume
                 async for event in self._tools_within_cap(pending):
                     yield event
             elif last == "assistant":
@@ -377,8 +380,8 @@ class _Turn:
 
     async def _tools_within_cap(self, calls: list[ToolCall]) -> AsyncIterator[Event]:
         """`_tools`, unless this step was the last one allowed: then no call runs, each still
-        gets a result (no orphans), and the turn ends with max_steps, or cancelled if the
-        cancel came first (contract rule 6)."""
+        gets a result (no orphans; a delivered one its own), and the turn ends with max_steps,
+        or cancelled if the cancel came first (contract rule 6), or waiting while calls wait."""
         if self.steps < self.turn.limits.max_steps:
             async for event in self._tools(calls):
                 yield event
@@ -386,10 +389,21 @@ class _Turn:
         # A cancel can land at any point here, even while these results are being published
         # (each yield hands control to the runner): the user stopped the turn, so it must not
         # be reported as a step limit. Read the flag afresh for every result and for the end.
+        waiting = []
         for call in calls:
-            text = CANCELLED if self.cancel.is_set() else _STEP_CAP
-            yield self._result(ToolResult(call.id, False, text))
-        yield self._end("cancelled" if self.cancel.is_set() else "max_steps")
+            if (delivered := self.delivered.get(call.id)) is not None:
+                yield self._result(delivered)
+            elif call.id in self.waiting:
+                waiting.append(call.id)
+            else:
+                text = CANCELLED if self.cancel.is_set() else _STEP_CAP
+                yield self._result(ToolResult(call.id, False, text))
+        if self.cancel.is_set():
+            for call_id in waiting:
+                yield self._result(ToolResult(call_id, False, CANCELLED))
+            yield self._end("cancelled")
+        else:
+            yield self._end("waiting", pending=waiting) if waiting else self._end("max_steps")
 
     async def _tools(self, calls: list[ToolCall]) -> AsyncIterator[Event]:
         """Run the calls and append one result per call, in call order.
@@ -397,14 +411,12 @@ class _Turn:
         Consecutive read-only calls run concurrently. Any other call runs alone, after everything
         before it, and everything after waits for it, so no call sees older state than the calls
         before it left. "ask" calls pause the turn; the calls after the first of them run on resume.
+        A call whose tool starts work that finishes later gets no result now, nor does one that
+        already waits: the turn then ends waiting (rule 9). A delivered result is appended as
+        the call's own, without running it.
         """
-        asked = [
-            c
-            for c in calls
-            if c.id not in self.jobs
-            and c.id not in self.user
-            and await self.tools.check(c) == "ask"
-        ]
+        settled = self.jobs.keys() | self.user.keys() | self.delivered.keys() | self.waiting
+        asked = [c for c in calls if c.id not in settled and await self.tools.check(c) == "ask"]
         for call in asked:
             yield Event(
                 "permission.asked",
@@ -415,27 +427,48 @@ class _Turn:
         for i, call in enumerate(now):
             if call.id in self.jobs or self.user.get(call.id) == "deny":
                 continue  # started early, or denied by the user
+            if call.id in self.delivered or call.id in self.waiting:
+                continue  # finished elsewhere, or still running there: nothing to start
             if call.name in self.read_only:  # allowed, or denied by a rule (run() enforces that)
                 self._start(call)
                 continue
             for c in now[done:i]:  # a write waits for everything before it ...
-                yield self._result(await self._outcome(c))
+                if event := await self._answer(c):
+                    yield event
             self._start(call)
-            yield self._result(await self._outcome(call))  # ... and everything after waits for it
+            if event := await self._answer(call):  # ... and everything after waits for it
+                yield event
             done = i + 1
         for call in now[done:]:
-            yield self._result(await self._outcome(call))
-        if self.cancel.is_set():  # no orphans: calls that did not run get a result too
-            for call in calls[len(now) :]:
-                yield self._result(ToolResult(call.id, False, CANCELLED))
+            if event := await self._answer(call):
+                yield event
+        if self.cancel.is_set():  # no orphans: calls that did not run, or wait, get a result too
+            for n, call in enumerate(calls):
+                if n >= len(now) or call.id in self.waiting:
+                    yield self._result(ToolResult(call.id, False, CANCELLED))
             yield self._end("cancelled")
         elif asked:
             yield self._end("paused", pending=[call.id for call in asked])
+        elif waiting := [call.id for call in calls if call.id in self.waiting]:
+            yield self._end("waiting", pending=waiting)
 
     def _start(self, call: ToolCall) -> None:
         self.jobs[call.id] = self._spawn(self.tools.run(call))
 
+    async def _answer(self, call: ToolCall) -> Event | None:
+        """The result item of a call once its outcome is known, or None if the call waits: its
+        tool started work that finishes later, now or in an earlier turn (rule 9)."""
+        if call.id in self.waiting:
+            return None
+        result = await self._outcome(call)
+        if result.pending:
+            self.waiting.add(call.id)
+            return None
+        return self._result(result)
+
     async def _outcome(self, call: ToolCall) -> ToolResult:
+        if (delivered := self.delivered.get(call.id)) is not None:
+            return delivered
         job = self.jobs.pop(call.id, None)
         if job is None:
             return ToolResult(call.id, False, f"Denied by user: {self.reason}")

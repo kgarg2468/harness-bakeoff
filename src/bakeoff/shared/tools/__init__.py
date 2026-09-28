@@ -15,6 +15,10 @@ from bakeoff.shared.contract import ToolSpec
 from bakeoff.shared.engine.base import Engine
 
 
+def _quiet(message: str) -> None:
+    """Progress nobody listens to."""
+
+
 @dataclass(slots=True, frozen=True)
 class ToolContext:
     """What a running tool may use."""
@@ -22,6 +26,8 @@ class ToolContext:
     workdir: Path  # the working copy, already resolved
     engine: Engine
     unattended: bool = False  # no call can ask a person, so nobody can answer approval gates
+    # Reports how the call is getting on; the ToolHost sends it on as a `tool.progress` event.
+    progress: Callable[[str], None] = _quiet
 
 
 @dataclass(slots=True, frozen=True)
@@ -39,6 +45,12 @@ class Tool:
 
 class ToolError(Exception):
     """An expected tool failure. Its message is exactly what the model sees."""
+
+
+class ToolPending(Exception):
+    """Raised by a tool that started work which finishes later (a pipeline run, say). Its
+    message says what started. The call waits: its result comes with a later resume (contract
+    rule 9)."""
 
 
 class PathError(ToolError):

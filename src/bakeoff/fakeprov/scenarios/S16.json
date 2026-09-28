@@ -1,0 +1,70 @@
+{
+  "id": "S16",
+  "title": "Tools that run for minutes: two calls wait, one runs; both results delivered in a new process that is killed, then a crash resume",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "background_tools": ["validate_pipeline"],
+  "driver": [
+    {"user": "Validate chat.pipe and rag.pipe, and tell me what the chat component does."},
+    {"crash_after": "item", "call_id": "call_S16_1"},
+    {
+      "deliver": {
+        "call_S16_1": "chat.pipe: 0 errors, 0 warnings.",
+        "call_S16_3": "rag.pipe: 1 error: lane 'documents' has no source."
+      },
+      "new_process": true
+    },
+    {"resume": "crash"}
+  ],
+  "exchanges": [
+    {
+      "note": "Two validate_pipeline calls start work that finishes later; describe_component runs now. The turn ends waiting for the two, with no second request.",
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {"id": "call_S16_1", "name": "validate_pipeline", "arguments": {"path": "chat.pipe"}},
+              {"id": "call_S16_2", "name": "describe_component", "arguments": {"name": "chat"}},
+              {"id": "call_S16_3", "name": "validate_pipeline", "arguments": {"path": "rag.pipe"}}
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 60, "cost": 0.0036}}
+        ]
+      }
+    },
+    {
+      "note": "A new process delivered both results and died once call_S16_1's was saved; the crash resume delivered call_S16_3's again, from the turn it crashed in. Exactly one result per call, none run twice.",
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 6,
+        "tool_result_contains": {
+          "call_S16_1": "0 errors",
+          "call_S16_2": "questions",
+          "call_S16_3": "no source"
+        }
+      },
+      "respond": {
+        "stream": [
+          {
+            "text": "chat.pipe is valid; rag.pipe has one error. The chat component reads questions from a chat.",
+            "chunks": 3
+          },
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1100, "completion_tokens": 30, "cost": 0.0037}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["waiting", "end_turn"],
+    "requests": 2,
+    "commits": 1,
+    "tool_runs": {"call_S16_1": 1, "call_S16_2": 1, "call_S16_3": 1},
+    "text_contains": "rag.pipe has one error"
+  }
+}

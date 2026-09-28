@@ -65,8 +65,8 @@ cancel `asyncio.Event`. It yields `Event`s. The shared runner:
 4. on `turn.end` with stop `end_turn`, `max_steps`, `budget`, `cancelled` or `error`, saves the
    thread's workspace (`Workspace.save`), stores the version on the turn row together with the
    `turn.saved` event `{version, files}` (one transaction), then publishes `turn.saved` (always
-   the final event of a completed turn, right after the loop's `turn.end`). A `paused` turn is not
-   saved until the resumed turn finishes.
+   the final event of a completed turn, right after the loop's `turn.end`). A `paused` or
+   `waiting` turn is not saved until the turn that resumes it finishes.
 
 `Workspace` (`shared/workcopy.py`) is all the runner needs from a thread's files: `save`,
 `revert`, `head` and `recover` (plus `init_sync` when a thread is created). A version is an
@@ -150,12 +150,31 @@ the tools), and the runner builds each turn's ToolHost from the thread's rules.
   The loop runs the allowed ones, feeds `ToolResult(ok=False, content="Denied by user: <reason>")`
   for denied ones, and continues. Until then the runner refuses a new user message, a
   compaction and a revert: each would come between the pending calls and their results.
+- **Tool results**: a tool that runs for minutes (a pipeline run, say) returns
+  `ToolResult(pending=True)` from `run()`: its work goes on elsewhere, and its call gets no
+  result item yet (contract rule 9). The loop handles the step's other calls as usual and ends
+  the turn with stop `waiting` and the pending ids; the runner records it like a paused turn
+  (status `waiting`, not saved). When the work finishes, the runtime delivers the result, from
+  any process (`bakeoff deliver THREAD --ok CALL=TEXT`), as
+  `Resume(kind="tool_result", results={call_id: ToolResult})`: the loop appends one result item
+  per delivered result, never running its call, then sends the next request, or ends `waiting`
+  again without one if calls still wait. The runner refuses a delivery for a call that does not
+  wait, and one while a turn is paused (approve first). Until the last result comes it refuses
+  a new user message, a compaction and a revert. If a step also has a call that asks, the turn
+  pauses, and the approval resume ends `waiting`.
 - **Crash**: the worker process died mid-turn. The runner restarts the turn with
   `Resume(kind="crash")`. The loop continues from history. Calls that have no result are
   re-checked: `ask` pauses again, `allow` runs. A tool whose result item was already persisted
-  must not run again.
+  must not run again, nor may a call that waits.
 
-Approval and crash resume are the same code path: rebuild from history, then continue.
+On every resume the runner sets `Resume.waiting` to the calls that wait: a stored `tool.end` with
+`pending` (the runner stores it at once, as it does `tool.start`) and no result item. The loop
+never runs them. A crash resume of a tool_result turn also gets, in `Resume.results`, the results
+that turn delivered (its `turn.start` holds them) but did not save. A cancel gives a waiting call
+of the step a result like any other call, so the runtime should stop the work behind it.
+
+Approval, tool-result and crash resume are the same code path: rebuild from history, then
+continue.
 
 ## Tools
 
@@ -188,7 +207,14 @@ Permission rules (OpenCode style), per thread:
 ```
 
 A tool maps to a decision, or to `{glob-on-path: decision}` with the first match winning. Paths
-that escape the working copy are always denied. `ToolHost.check()` is async, so a runtime can
+that escape the working copy are always denied.
+
+`ToolSpec.timeout_s` limits a run: `ToolHost.run()` fails a call whose tool takes longer
+(`<tool> timed out after N s`); no shared tool sets one yet. A running tool may report how it is
+getting on (`ToolContext.progress`), which the ToolHost sends as `tool.progress`
+`{call_id, name, message}`. A tool that starts work which finishes later raises `ToolPending`,
+and `run()` returns a pending result (Resume, above). `build_toolhost(background=[...])` makes
+the named tools do only that, for the scenarios. `ToolHost.check()` is async, so a runtime can
 read its rules from a database; loop B awaits it on its early-start path and when it schedules a
 step's calls, loop A in a `before_tool_execute` hook (`A_CHECKLIST.md`, Approvals).
 
@@ -284,6 +310,7 @@ recordings and the session log, never from what a loop says about itself.
 | S13 | BYOK thinking: `openai_compat` endpoint, non-OpenAI model name, reasoning requested | the reasoning parameter reaches the wire |
 | S14 | BYOK strict endpoint: 400 if body has `reasoning`, `reasoning_effort` or `stream_options` (configured via compat flags) | the turn finishes |
 | S15 | compaction hand-off: runner appends a summary item; loop sends [system, summary, new user] | prefix resets only at the compaction boundary |
+| S16 | tools that run for minutes: two `validate_pipeline` calls start work for later (`background_tools`), `describe_component` runs; a new process delivers both results and is killed after the first is saved; crash resume | the turn ends `waiting`; the crash resume delivers the second result again and runs nothing; one result per call; each tool started once |
 | S17 | settings change between turns: a new system prompt and rules that make `write_file` ask | the new system prompt, the kept history, the runner's note, the new message; the write asks, then runs once |
 | S18 | a user message with a text part and two image parts (by URL, and inline with `detail: low`) | the parts reach the model as sent, in every request |
 | S19 | context nearly full: 8,200 then 8,600 input tokens of a 10,000-token window; the runtime compacts; the next turn is small | `context.near_limit` once (after step 1's usage); the request after the compaction is [system, summary, new user] |
@@ -293,10 +320,12 @@ recordings and the session log, never from what a loop says about itself.
 | R04 | 429 with `retry-after: 1`, then OK; next turn an `error` event mid-stream, then OK | waited per Retry-After; nothing of the failed attempt is replayed |
 | R05 | cancel while reasoning streams | stops within 200 ms; next turn passes `reject_unencrypted_reasoning` |
 | R06 | Responses API: the same user message with images | `input_text` and `input_image` parts (URL flat, `detail` `auto` unless given), in every request |
+| R07 | Responses API: two calls wait, one runs; one result is delivered (still waiting, no request), the other in a new process | one result per call in the next request; the reasoning item replayed as sent; each tool started once |
 
 The driver (`shared/scenario.py`) runs the steps with the real runner, session log, working copy
-and ToolHost on MockEngine. `approve` with `new_process` and the user turn after `crash_after` run
-as separate OS processes (`bakeoff approve`, `bakeoff turn`); the crash is a SIGKILL the child
+and ToolHost on MockEngine. `approve` and `deliver` with `new_process`, and the user or deliver
+step after `crash_after`, run as separate OS processes (`bakeoff approve`, `deliver`, `turn`);
+the crash is a SIGKILL the child
 sends itself from its runner's sink, so for `item`, `tool.start` and `turn.end` (stored before
 they are published) it comes right after the event is durable. Every key of the final `expect`
 and the invariants I1, I2, I3, I5 and I7 decide pass or fail. The timing criteria above are

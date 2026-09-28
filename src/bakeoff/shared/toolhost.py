@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,14 @@ from bakeoff.shared.contract import Decision, Event, ToolCall, ToolResult, ToolS
 from bakeoff.shared.contract import ToolError as ToolErrorKind
 from bakeoff.shared.engine.base import Engine
 from bakeoff.shared.engine.mock import MockEngine
-from bakeoff.shared.tools import PathError, Tool, ToolContext, ToolError, resolve_path
+from bakeoff.shared.tools import (
+    PathError,
+    Tool,
+    ToolContext,
+    ToolError,
+    ToolPending,
+    resolve_path,
+)
 from bakeoff.shared.tools.engine_tools import ENGINE_TOOLS
 from bakeoff.shared.tools.file_tools import FILE_TOOLS
 from bakeoff.shared.tools.skill_tools import SKILL_TOOLS
@@ -35,19 +44,30 @@ def build_toolhost(
     rules: dict,
     emit: Callable[[Event], None],
     engine: Engine | None = None,
+    background: Collection[str] = (),
 ) -> ToolHostImpl:
-    """A `ToolHost` over the working copy `workdir` (engine defaults to `MockEngine()`)."""
-    return ToolHostImpl(workdir, rules, emit, MockEngine() if engine is None else engine)
+    """A `ToolHost` over the working copy `workdir` (engine defaults to `MockEngine()`).
+    `background` names tools whose runs only start their work (see `ToolHostImpl`)."""
+    engine = MockEngine() if engine is None else engine
+    return ToolHostImpl(workdir, rules, emit, engine, background)
 
 
 class ToolHostImpl:
     """Implements `contract.ToolHost` for one thread's working copy and permission rules.
 
-    `run_counts` maps each call id to how many times its tool actually executed.
+    `run_counts` maps each call id to how many times its tool actually executed (or started
+    its work). A run of a tool in `background` starts the work and returns at once with a
+    pending result, as a tool that raises `ToolPending` does; its result comes later (contract
+    rule 9). The scenarios use it for tools that run for minutes.
     """
 
     def __init__(
-        self, workdir: Path, rules: dict, emit: Callable[[Event], None], engine: Engine
+        self,
+        workdir: Path,
+        rules: dict,
+        emit: Callable[[Event], None],
+        engine: Engine,
+        background: Collection[str] = (),
     ) -> None:
         permissions.validate_rules(rules)
         self._ctx = ToolContext(
@@ -55,6 +75,7 @@ class ToolHostImpl:
         )
         self._rules = rules
         self._emit = emit
+        self._background = frozenset(background)
         self.run_counts: dict[str, int] = {}
         self.emit_errors: list[Exception] = []
 
@@ -76,7 +97,9 @@ class ToolHostImpl:
         return self._decide(*prepared)[0]
 
     async def run(self, call: ToolCall) -> ToolResult:
-        """Validate, enforce deny, execute. Never raises, except `asyncio.CancelledError`."""
+        """Validate, enforce deny, execute within the tool's `timeout_s`. Never raises, except
+        `asyncio.CancelledError`. What the tool reports while it runs goes out as `tool.progress`;
+        a tool that only started its work gives a pending result, and its `tool.end` says so."""
         tool = _BY_NAME.get(call.name)
         read_only = tool is not None and tool.spec.read_only
         # read_only lets the I2 check tell a speculative early read (harmless) from a real
@@ -85,25 +108,24 @@ class ToolHostImpl:
             Event("tool.start", {"call_id": call.id, "name": call.name, "read_only": read_only})
         )
         start = time.perf_counter()
-        ok = False
+        ok = pending = False
         try:
             if not recorded:
                 # No durable record that this call started: running it could repeat a side
                 # effect after a crash, so refuse (the model sees why).
                 error, content = "failed", f"{call.name} not run: could not record that it started"
             else:
-                error, content = await self._execute(call)
+                error, content, pending = await self._execute(call)
             ok = error is None
             if len(content) > MAX_OUTPUT:
                 content = (
                     f"{content[:MAX_OUTPUT]}\n... [truncated {len(content) - MAX_OUTPUT} chars]"
                 )
-            return ToolResult(call_id=call.id, ok=ok, content=content, error=error)
+            return ToolResult(call.id, ok, content, error, pending)
         finally:
             ms = round((time.perf_counter() - start) * 1000, 3)
-            self._safe_emit(
-                Event("tool.end", {"call_id": call.id, "name": call.name, "ok": ok, "ms": ms})
-            )
+            end = {"call_id": call.id, "name": call.name, "ok": ok, "ms": ms}
+            self._safe_emit(Event("tool.end", {**end, "pending": True} if pending else end))
 
     def _safe_emit(self, event: Event) -> bool:
         """Emit without letting a failing callback break run()'s never-raises guarantee.
@@ -116,22 +138,35 @@ class ToolHostImpl:
             return False
         return True
 
-    async def _execute(self, call: ToolCall) -> tuple[ToolErrorKind | None, str]:
-        """(error kind or None on success, content for the model)."""
+    async def _execute(self, call: ToolCall) -> tuple[ToolErrorKind | None, str, bool]:
+        """(error kind or None on success, content for the model, whether the work goes on)."""
         prepared = self._prepare(call)
         if isinstance(prepared, str):
-            return "invalid_args", prepared
+            return "invalid_args", prepared, False
         tool, args = prepared
         decision, reason = self._decide(tool, args)
         if decision == "deny":
-            return "denied", reason
+            return "denied", reason, False
         self.run_counts[call.id] = self.run_counts.get(call.id, 0) + 1
+        ctx = replace(self._ctx, progress=lambda message: self._progress(call, message))
+        limit = asyncio.timeout(tool.spec.timeout_s)
         try:
-            return None, await tool.fn(args, self._ctx)
+            if tool.spec.name in self._background:
+                raise ToolPending(f"{call.name} started; its result comes when it finishes")
+            async with limit:
+                return None, await tool.fn(args, ctx), False
+        except ToolPending as e:
+            return None, str(e), True
         except ToolError as e:
-            return "failed", str(e)
+            return "failed", str(e), False
         except Exception as e:  # run() never raises; the model gets a short message instead
-            return "failed", f"{call.name} failed: {type(e).__name__}: {e}"[:MAX_ERROR]
+            if isinstance(e, TimeoutError) and limit.expired():
+                return "failed", f"{call.name} timed out after {tool.spec.timeout_s:g} s", False
+            return "failed", f"{call.name} failed: {type(e).__name__}: {e}"[:MAX_ERROR], False
+
+    def _progress(self, call: ToolCall, message: str) -> None:
+        event = {"call_id": call.id, "name": call.name, "message": str(message)}
+        self._safe_emit(Event("tool.progress", event))
 
     def _prepare(self, call: ToolCall) -> tuple[Tool, dict[str, Any]] | str:
         """The tool and parsed arguments, or the error message for the model."""

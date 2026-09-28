@@ -68,6 +68,18 @@ If you'd do something differently, edit this file in a PR, and A will be changed
       own "interrupted" result, saved as items: their response was cut short by a cancel, or the
       user sent a new message instead of answering. This is decided from the history, so a crash
       right after a cancel cannot run the cancelled call.*
+- [x] **Tools that run for minutes**: deferred tools of the external kind: the tool raises
+      `CallDeferred`, the run ends with `DeferredToolRequests.calls`, and a later run gets the
+      finished results in `DeferredToolResults.calls`. ([deferred-tools, "External tool execution"](https://ai.pydantic.dev/deferred-tools/))
+      *A tool whose `ToolHost.run()` result is pending raises `CallDeferred` (contract rule 9); a
+      run whose `DeferredToolRequests` has calls and no approvals ends `waiting` (with approvals
+      it pauses, and the calls wait on). A delivered result (`Resume.results`) goes back as the
+      call's `DeferredToolResults.calls` entry: its content, `ModelRetry` for bad arguments,
+      else `ToolFailed`. The library needs an answer for every open call and has none for "still
+      running", so a call that still waits (`Resume.waiting`) is passed as approved and deferred
+      again with `CallDeferred` in the same `before_tool_execute` hook, before it can run. A
+      partial delivery, or a crash resume while calls wait, then ends `waiting` again without a
+      request: the library ends a run whose calls are all deferred without one.*
 - [x] **History**: native `ModelMessagesTypeAdapter` JSON, persisted after every model response
       and tool batch (node boundaries in `iter()`), so a crash loses nothing.
       *Every item carries the native of exactly what it shows: a response, or one part of a request
@@ -229,7 +241,7 @@ The library has no mechanism for these, so A has its own code (counted like ever
   A's `ProcessHistory` drops such an item.
 - **Worked around**: a `cost_limit` drops the response that crosses it from history (above).
 - **Worked around**: `DeferredToolResults` needs an answer for every open call, so there is no
-  partial approval (above).
+  partial approval, nor a way to say that an external call is still running (above).
 - **Recorded**: `Agent.parallel_tool_call_execution_mode("parallel_ordered_events")` would give
   results in call order, but on 2.31.1 it holds every result event until the whole batch is
   done, so A keeps the default mode and orders the early-saved results itself.

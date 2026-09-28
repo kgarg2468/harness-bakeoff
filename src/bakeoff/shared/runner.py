@@ -16,7 +16,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import aclosing, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,7 @@ from bakeoff.shared.contract import (
     ModelConfig,
     Resume,
     ToolHost,
+    ToolResult,
     TurnInput,
     UserContent,
 )
@@ -49,12 +50,17 @@ _THREAD_ID = re.compile(r"[\w-]+")
 # While the last workspace turn is paused, its pending calls must be answered first: a new user
 # message or a summary between a call and its result breaks the history (see `Runner.turn`).
 _PAUSED = {"paused": "is paused: resolve the pending approval first"}
+# The same holds while calls wait for their results (contract rule 9): `_refuse_while` then also
+# refuses while any call of the thread waits, whatever turn started it.
+_OPEN = {**_PAUSED, "waiting": "is waiting for tool results: deliver them first"}
 # A revert also waits while the last turn has changes that no saved version holds (see
 # `Runner.revert`).
 _REVERT_WAITS = {
-    **_PAUSED,
+    **_OPEN,
     "error": "failed to save its changes: run a turn first, its saved version includes them",
 }
+# The stops after which a turn is not saved: its calls are still open (answered by a resume).
+_OPEN_STOPS = ("paused", "waiting")
 logger = logging.getLogger(__name__)
 
 # Starts the content of a compaction item; see contract rule 8.
@@ -234,7 +240,8 @@ class _Publisher:
                 self._thread, data["item"], [*self._batch, row], settings=settings
             )
             self._batch.clear()
-        elif type_ == "tool.start":
+        elif type_ == "tool.start" or (type_ == "tool.end" and data.get("pending")):
+            # A pending tool.end is stored at once too: a crash resume must know the call waits.
             self._log.append_events([*self._batch, row])
             self._batch.clear()
         else:
@@ -407,7 +414,7 @@ class Runner:
         system: str | None = None,
         rules: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run one turn: a new user message, or a resume (approval or crash).
+        """Run one turn: a new user message, or a resume (approval, tool results or crash).
 
         `user_text` is the message's content, text or content parts (`contract.UserContent`),
         stored as given. One whose JSON is larger than `MAX_USER_BYTES`, or with a part that is
@@ -415,7 +422,13 @@ class Runner:
 
         While the last turn is paused, a new user message is refused: the pending calls need an
         approval resume first (it may deny them, with a reason), since a user message between a
-        call and its result breaks the history.
+        call and its result breaks the history. The same goes while calls wait for results
+        (contract rule 9): a turn that ends "waiting" is recorded like a paused one, not saved,
+        and `Resume(kind="tool_result", results={call_id: ToolResult})` delivers them, in any
+        process and as they come. Each must be a waiting call's (ValueError otherwise), and a
+        delivery waits for a pending approval. On every resume the runner sets `Resume.waiting`
+        to the calls still waiting, which the loop never runs, and a crash resume of a
+        tool_result turn delivers again the results that turn had not saved.
 
         `system` and `rules` are the thread's system prompt and permission rules from this turn
         on. If they differ from the thread's, the runner stores them and appends a runner item
@@ -482,7 +495,9 @@ class Runner:
         kind = resume.kind if resume else "user"
         self._retire_dead(thread_id, lock_fd)
         if resume is None:
-            self._refuse_while(thread_id, "start a user turn", _PAUSED)
+            self._refuse_while(thread_id, "start a user turn", _OPEN)
+        else:
+            resume = self._resume(thread_id, resume)
         row = self.log.start_turn(thread_id, kind)  # raises if a turn is running (unless crash)
         turn_id = row["id"]
         ws = self.make_workspace(self.workdir(thread_id), lock_fd)
@@ -518,9 +533,9 @@ class Runner:
             )
             end = await self._drive(loop, turn_input, cancel, pub, thread["meta"]["rules"])
             stop = end.get("stop", "error")
-            if stop == "paused":
+            if stop in _OPEN_STOPS:
                 pending = list(end.get("pending") or [])
-                pub.finish("paused", stop=stop, pending=pending)
+                pub.finish(stop, stop=stop, pending=pending)
                 return {"turn_id": turn_id, "stop": stop, "pending": pending, "version": None}
             saved = await ws.save(f"turn {row['idx'] + 1}: {stop}")
             # The row's status and version with `turn.saved`, which is published after it.
@@ -628,7 +643,7 @@ class Runner:
         thread = self._thread(thread_id)
         with _exclusive(self._lock_path(thread_id)) as lock_fd:
             self._retire_dead(thread_id, lock_fd)
-            self._refuse_while(thread_id, "compact", _PAUSED)
+            self._refuse_while(thread_id, "compact", _OPEN)
             row = self.log.start_turn(thread_id, "compact")
             item = Item(
                 id=f"{row['id']}:compact",
@@ -658,7 +673,8 @@ class Runner:
         """Record the end of a turn that failed before its saved version was recorded, with its
         buffered events (e.g. a turn.end whose flush failed).
 
-        A paused turn stays "paused" with its pending calls: the next turn must answer them.
+        A paused (or waiting) turn stays so with its pending calls: the next turn must answer
+        them.
         Any other turn becomes "error" without a version, so it does not block the thread; the
         next turn repairs the workspace and its version includes the changes. Best effort: if
         the log fails again (e.g. it is still locked), that is only logged, so the caller raises
@@ -667,8 +683,8 @@ class Runner:
         end = pub.end or {}
         stop = end.get("stop", "error")
         with _logged_failure(f"recording the end of turn {pub.turn_id}"):
-            if stop == "paused":
-                pub.finish("paused", stop=stop, pending=list(end.get("pending") or []))
+            if stop in _OPEN_STOPS:
+                pub.finish(stop, stop=stop, pending=list(end.get("pending") or []))
             else:
                 pub.finish("error", stop=stop)
 
@@ -703,7 +719,11 @@ class Runner:
 
     def _refuse_while(self, thread_id: str, what: str, waits: dict[str, str]) -> None:
         """Raise if the thread's last workspace turn has no saved version and a status in
-        `waits`: it left something that must be resolved before `what`."""
+        `waits`: it left something that must be resolved before `what`. With "waiting" in
+        `waits`, also while any call of the thread waits for its result (say, one whose turn
+        then failed)."""
+        if "waiting" in waits and (waiting := self._waiting(thread_id)):
+            raise RuntimeError(f"cannot {what}: calls {waiting} wait for their results")
         turns = self._ws_turns(thread_id)
         last = turns[-1] if turns else None
         # A revert without a version recorded nothing, and `_reconcile` undoes its changes.
@@ -711,6 +731,45 @@ class Runner:
             return
         if last["status"] in waits:
             raise RuntimeError(f"cannot {what}: turn {last['id']} {waits[last['status']]}")
+
+    def _waiting(self, thread_id: str) -> list[str]:
+        """The calls of the thread that wait for their results (contract rule 9): a stored
+        `tool.end` says `pending`, and no result item answers the call yet."""
+        answered = {item.message.get("tool_call_id") for item in self.log.items(thread_id)}
+        ends = self.log.events(thread_id, types=("tool.end",))
+        started = [e["data"].get("call_id") for e in ends if e["data"].get("pending")]
+        return [call_id for call_id in dict.fromkeys(started) if call_id not in answered]
+
+    def _resume(self, thread_id: str, resume: Resume) -> Resume:
+        """`resume` as the loop gets it: with the calls still waiting in `waiting` and, for the
+        crash resume of a tool_result turn, the results that turn delivered but did not save.
+        Raises ValueError for a delivery of a call that does not wait."""
+        waiting = self._waiting(thread_id)
+        results = dict(resume.results)
+        if resume.kind == "tool_result":
+            self._refuse_while(thread_id, "deliver tool results", _PAUSED)
+            wrong = [
+                c for c, r in results.items() if c not in waiting or r.call_id != c or r.pending
+            ]
+            if wrong or not results:
+                raise ValueError(f"cannot deliver results for {wrong}: waiting for {waiting}")
+        elif resume.kind == "crash":
+            last = self.log.last_turn(thread_id)
+            died = last["id"] if last is not None and last["status"] == "running" else None
+            delivered = self._delivered(thread_id, died) if died else {}
+            results = {c: r for c, r in delivered.items() if c in waiting}
+        return replace(
+            resume, results=results, waiting=tuple(c for c in waiting if c not in results)
+        )
+
+    def _delivered(self, thread_id: str, turn_id: str) -> dict[str, ToolResult]:
+        """The results the `turn.start` of turn `turn_id` delivered, if it was a resume."""
+        start = next(
+            (e for e in self.log.events(thread_id, types=("turn.start",)) if e["turn"] == turn_id),
+            None,
+        )
+        resume = (start or {}).get("data", {}).get("resume") or {}
+        return {c: ToolResult(**r) for c, r in (resume.get("results") or {}).items()}
 
     def _ws_turns(self, thread_id: str) -> list[dict[str, Any]]:
         """The thread's turns that use the workspace (all but compactions), in order."""

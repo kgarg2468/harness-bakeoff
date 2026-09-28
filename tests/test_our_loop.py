@@ -427,6 +427,129 @@ async def test_awaited_permission_rules_decide_as_before() -> None:
     assert resumed[-1].data == {"stop": "end_turn", "steps": 2}
 
 
+class Background(StubTools):
+    """StubTools whose `background` tools only start their work: the result is pending."""
+
+    def __init__(self, background: set[str], **kwargs: Any):
+        super().__init__(**kwargs)
+        self.background = background
+        self.running: dict[str, asyncio.Event] = {}  # set when a call's tool starts
+
+    async def run(self, call: ToolCall) -> ToolResult:
+        self.running.setdefault(call.id, asyncio.Event()).set()
+        if call.name not in self.background:
+            return await super().run(call)
+        self.run_counts[call.id] += 1
+        return ToolResult(call.id, True, f"{call.name} started", pending=True)
+
+
+def waiting_batch() -> httpx.Response:
+    return sse(
+        call(0, '{"pipeline": {}}', "c0", "validate_pipeline"),  # starts work for later
+        call(1, '{"name": "a"}', "c1", "describe_component"),
+        call(2, '{"path": "a.pipe", "content": "x"}', "c2", "write_file"),
+        call(3, '{"pipeline": {}}', "c3", "validate_pipeline"),  # starts work for later
+        finish("tool_calls"),
+    )
+
+
+def delivered(call_id: str, text: str = "valid") -> ToolResult:
+    return ToolResult(call_id, True, f"{call_id}: {text}")
+
+
+async def test_a_tool_that_runs_for_minutes_makes_the_turn_wait() -> None:
+    """Rule 9: the step's other calls run as usual; the pending ones get no result yet, and the
+    turn ends waiting for them, without another request."""
+    tools = Background({"validate_pipeline"})
+    history = [user("check it")]
+    first = Server(waiting_batch())
+    events = await run(first.loop(), history, tools)
+    assert events[-1].data == {"stop": "waiting", "steps": 1, "pending": ["c0", "c3"]}
+    assert [it.message.get("tool_call_id") for it in items(events)] == [None, "c1", "c2"]
+    assert tools.run_counts == {"c0": 1, "c1": 1, "c2": 1, "c3": 1}
+    history += [persisted(it) for it in items(events)]
+
+    # One result comes: still waiting for the other, and no request.
+    part = Resume("tool_result", results={"c0": delivered("c0")}, waiting=("c3",))
+    events = await run(Server().loop(), history, tools, resume=part)
+    assert events[-1].data == {"stop": "waiting", "steps": 1, "pending": ["c3"]}
+    assert [it.message for it in items(events)] == [
+        {"role": "tool", "tool_call_id": "c0", "content": "c0: valid"}
+    ]
+    history += [persisted(it) for it in items(events)]
+
+    # A crash resume while it waits never runs the waiting call and sends nothing either.
+    crash = Resume("crash", waiting=("c3",))
+    events = await run(Server().loop(), history, tools, resume=crash)
+    assert events[-1].data == {"stop": "waiting", "steps": 1, "pending": ["c3"]} and not items(
+        events
+    )
+
+    # The last result: the next request has exactly one result per call, none run twice.
+    rest = Resume("tool_result", results={"c3": delivered("c3", "1 error")})
+    last = Server(reply("c0 is valid, c3 has an error."))
+    events = await run(last.loop(), history, tools, resume=rest)
+    assert events[-1].data == {"stop": "end_turn", "steps": 2}
+    history += [persisted(it) for it in items(events)]
+    assert_no_orphans(history)
+    sent = [m.get("tool_call_id") for m in last.messages(0) if m["role"] == "tool"]
+    assert sorted(sent) == ["c0", "c1", "c2", "c3"]
+    assert tools.run_counts == {"c0": 1, "c1": 1, "c2": 1, "c3": 1}
+    assert last.bodies[0].startswith(first.bodies[0][:-2])  # the prefix held throughout
+
+
+async def test_a_delivered_failure_is_the_calls_result() -> None:
+    tools = Background({"validate_pipeline"})
+    history = [user("check it")]
+    history += [
+        persisted(it) for it in items(await run(Server(waiting_batch()).loop(), history, tools))
+    ]
+    failed = {c: ToolResult(c, False, f"{c}: engine down", "failed") for c in ("c0", "c3")}
+    server = Server(reply("Both failed."))
+    events = await run(server.loop(), history, tools, resume=Resume("tool_result", results=failed))
+    assert events[-1].data == {"stop": "end_turn", "steps": 2}
+    sent = {m["tool_call_id"]: m["content"] for m in server.messages(0) if m["role"] == "tool"}
+    assert (sent["c0"], sent["c3"]) == ("c0: engine down", "c3: engine down")
+
+
+async def test_an_ask_pauses_and_the_waiting_calls_wait_on() -> None:
+    tools = Background({"validate_pipeline"}, rules={"write_file": "ask"})
+    history = [user("check it")]
+    events = await run(Server(waiting_batch()).loop(), history, tools)
+    assert events[-1].data == {"stop": "paused", "steps": 1, "pending": ["c2"]}
+    assert tools.run_counts == {"c0": 1, "c1": 1}  # c3 comes after the ask: not yet
+    history += [persisted(it) for it in items(events)]
+    approve = Resume("approval", {"c2": "allow"}, waiting=("c0",))
+    events = await run(Server().loop(), history, tools, resume=approve)
+    assert events[-1].data == {"stop": "waiting", "steps": 1, "pending": ["c0", "c3"]}
+    assert [it.message["tool_call_id"] for it in items(events)] == ["c2"]
+    assert tools.run_counts == {"c0": 1, "c1": 1, "c2": 1, "c3": 1}
+
+
+async def test_a_cancel_gives_a_waiting_call_a_result() -> None:
+    tools = Background({"validate_pipeline"}, delays={"write_file": 10})
+    cancel = asyncio.Event()
+
+    async def cancel_when_writing() -> None:
+        await tools.running.setdefault("c2", asyncio.Event()).wait()
+        cancel.set()
+
+    canceller = asyncio.ensure_future(cancel_when_writing())
+    history = [user("check it")]
+    async with asyncio.timeout(2):
+        events = await run(Server(waiting_batch()).loop(), history, tools, cancel)
+    await canceller
+    assert events[-1].data == {"stop": "cancelled", "steps": 1}
+    results = {it.message["tool_call_id"]: it.message["content"] for it in items(events)[1:]}
+    assert results == {
+        "c0": "Cancelled by user",  # its work started, but the turn was cancelled
+        "c1": "describe_component ok",
+        "c2": "Cancelled by user",
+        "c3": "Cancelled by user",
+    }
+    assert_no_orphans(history + items(events))
+
+
 def approval_batch() -> httpx.Response:
     return sse(
         call(0, '{"pipeline": {}}', "c0", "validate_pipeline"),
