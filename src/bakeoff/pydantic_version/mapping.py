@@ -10,6 +10,7 @@ Responses API, the chat-shaped view of it, without the reasoning items).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from decimal import Decimal
 from typing import Any
@@ -31,7 +32,7 @@ from pydantic_ai.messages import INTERRUPTED_TOOL_RETURN_CONTENT
 from pydantic_ai.profiles import DEFAULT_THINKING_TAGS
 from pydantic_ai.usage import RunUsage
 
-from bakeoff.shared.contract import Item, UserContent
+from bakeoff.shared.contract import Item, ToolResult, UserContent
 
 
 def dump(message: ModelMessage) -> dict[str, Any]:
@@ -159,12 +160,18 @@ def pending_calls(history: list[ModelMessage]) -> list[ToolCallPart]:
     return []
 
 
-def close_pending(history: list[ModelMessage]) -> list[ModelMessage]:
+def close_pending(
+    history: list[ModelMessage], delivered: Mapping[str, ToolResult] | None = None
+) -> list[ModelMessage]:
     """Results for calls a cancel, an error or an abandoned pause left open, exactly as
-    pydantic-ai's own history repair would synthesize them before the next request. Persisting
-    them keeps rule 4 in the log."""
+    pydantic-ai's own history repair would synthesize them before the next request. A call whose
+    result was delivered for the run (contract rule 9) gets that result instead: it cannot come
+    again. Persisting them keeps rule 4 in the log."""
+    delivered = delivered or {}
     parts = [
-        ToolReturnPart(
+        _returned(call, delivered[call.tool_call_id])
+        if call.tool_call_id in delivered
+        else ToolReturnPart(
             tool_name=call.tool_name,
             content=INTERRUPTED_TOOL_RETURN_CONTENT,
             tool_call_id=call.tool_call_id,
@@ -173,6 +180,17 @@ def close_pending(history: list[ModelMessage]) -> list[ModelMessage]:
         for call in pending_calls(history)
     ]
     return [ModelRequest(parts=parts)] if parts else []
+
+
+def _returned(call: ToolCallPart, result: ToolResult) -> ToolReturnPart | RetryPromptPart:
+    """A delivered result as the library makes it from an external call's answer: a retry
+    prompt for bad arguments, else a return, failed if the work failed."""
+    if result.error == "invalid_args":
+        return RetryPromptPart(
+            result.content, tool_name=call.tool_name, tool_call_id=call.tool_call_id
+        )
+    outcome = "success" if result.ok else "failed"
+    return ToolReturnPart(call.tool_name, result.content, call.tool_call_id, outcome=outcome)
 
 
 def close_abandoned(history: list[ModelMessage]) -> list[ModelMessage]:

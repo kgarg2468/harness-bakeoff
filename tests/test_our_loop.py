@@ -550,6 +550,52 @@ async def test_a_cancel_gives_a_waiting_call_a_result() -> None:
     assert_no_orphans(history + items(events))
 
 
+async def test_a_cancel_keeps_a_delivered_result() -> None:
+    tools = Background({"validate_pipeline"})
+    history = [user("check it")]
+    history += [
+        persisted(it) for it in items(await run(Server(waiting_batch()).loop(), history, tools))
+    ]
+    cancel = asyncio.Event()
+    cancel.set()
+    deliver = Resume("tool_result", results={"c0": delivered("c0")}, waiting=("c3",))
+    events = await run(Server().loop(), history, tools, cancel, resume=deliver)
+    assert events[-1].data == {"stop": "cancelled", "steps": 1}
+    results = {it.message["tool_call_id"]: it.message["content"] for it in items(events)}
+    assert results == {"c0": "c0: valid", "c3": "Cancelled by user"}
+
+
+class SlowRules(StubTools):
+    """Permission rules that take a second to read (a slow database)."""
+
+    async def check(self, call: ToolCall) -> Any:
+        await asyncio.sleep(1)
+        return await super().check(call)
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [("describe_component", '{"name": "a"}'), ("write_file", WRITE)],
+    ids=["early-start", "scheduling"],
+)
+async def test_a_cancel_does_not_wait_for_a_slow_permission_check(
+    name: str, arguments: str
+) -> None:
+    """`check()` runs where the cancel watcher can stop it: while a read-only call is checked
+    for an early start mid-stream, and while the step's calls are checked after it."""
+    server = Server(sse(call(0, arguments, "c0", name), finish("tool_calls")))
+    cancel = asyncio.Event()
+    turn_task = asyncio.ensure_future(run(server.loop(), [user("go")], SlowRules(), cancel))
+    await asyncio.sleep(0.1)  # the check is under way
+    cancelled_at = time.perf_counter()
+    cancel.set()
+    async with asyncio.timeout(2):
+        events = await turn_task
+    assert time.perf_counter() - cancelled_at < 0.2
+    assert events[-1].data["stop"] == "cancelled"
+    assert_no_orphans([user("go"), *items(events)])
+
+
 def approval_batch() -> httpx.Response:
     return sse(
         call(0, '{"pipeline": {}}', "c0", "validate_pipeline"),

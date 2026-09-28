@@ -173,6 +173,11 @@ The library has no mechanism for these, so A has its own code (counted like ever
   only when the whole batch is done.
 - **Waiting for the runner before each request** (`await out.join()`, 1 line; the same wait
   orders `tool.start`).
+- **Keeping a delivered result when a cancel comes first** (`mapping._returned` and 5 lines in
+  `mapping.close_pending`, 2 in `_run`). A cancel that lands before the library has applied
+  `DeferredToolResults.calls` leaves those calls open, and closing them as interrupted would
+  lose a result that cannot come again (contract rule 9), so each gets the part the library
+  would have made from it.
 - **Retrying a Responses stream that failed** (5 lines in `_run`, `_note_events` and 4 lines in
   `_on_response`: about 25 lines, and the warning filter). The library ends the stream as if it were
   done after an `error` event (it has no handler for it) or a `response.failed`, so the partial

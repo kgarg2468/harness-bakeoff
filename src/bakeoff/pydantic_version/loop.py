@@ -418,7 +418,9 @@ class PydanticLoop:
                         message.finish_reason = "error"
                 state.flush(messages)
                 saved = mapping.to_history([*turn.history, *state.items])
-                state.flush(mapping.close_pending(saved))
+                # A result delivered for the run that the library had not applied yet is kept.
+                delivered = turn.resume.results if turn.resume else None
+                state.flush(mapping.close_pending(saved, delivered))
             raise
         if result is not None and isinstance(result.output, DeferredToolRequests):
             return _defer(state, result.output)

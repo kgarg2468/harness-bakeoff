@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from bakeoff.shared.contract import Item
+from bakeoff.shared.runner import CONFIG_PREFIX, NEW_SYSTEM_PROMPT
 from bakeoff.shared.sessionlog import SessionLog
 from bakeoff.shared.workcopy import GIT_CONFIG, git_env
 
@@ -63,8 +64,9 @@ def check_prefix(
     that the previous one lacks holds a configuration-change note, and the history before it is
     still the previous request's (unless a new compaction summary starts it over as well).
     Only the runner's items count (`turns`, as `SessionLog.turns` returns them): the compaction
-    `items` of "compact" turns as summaries, and the `<turn>:config` items of "user" turns as
-    notes, so neither a look-alike message nor a loop's own item can fake a reset. Summaries are
+    `items` of "compact" turns as summaries, and as notes the `<turn>:config` items of "user"
+    turns that name a new system prompt (a note of new rules alone changes no request), so
+    neither a look-alike message nor a loop's own item can fake a reset. Summaries are
     matched in log order: a reset moves to a compaction item after the one the prefix starts
     from, never back to an older one, and two compactions may share a summary text.
     """
@@ -75,7 +77,9 @@ def check_prefix(
     config_messages = [
         item.message
         for item in items
-        if item.id == f"{item.turn_id}:config" and kinds.get(item.turn_id) == "user"
+        if item.id == f"{item.turn_id}:config"
+        and kinds.get(item.turn_id) == "user"
+        and _names_a_new_system_prompt(item.message)
     ]
     # Both are user messages: in the Responses API the same shape is an input message.
     summaries = {
@@ -176,6 +180,12 @@ def _conversation(body: bytes) -> _Conversation:
     return _Conversation(
         "responses", [system, *semantic], [*_raw_elements(body, b'"instructions"'), *raw], True
     )
+
+
+def _names_a_new_system_prompt(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    changes = content.removeprefix(CONFIG_PREFIX) if isinstance(content, str) else ""
+    return content != changes and NEW_SYSTEM_PROMPT in changes
 
 
 def _semantic(msg: dict[str, Any]) -> dict[str, Any]:

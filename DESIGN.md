@@ -134,7 +134,9 @@ and at most once per turn. The runtime decides whether to compact before the nex
 (`Runner.compact`).
 
 The system prompt and the permission rules can change between turns. `Runner.turn(system=...,
-rules=...)` compares them with the thread's; if they differ, it stores them on the thread and,
+rules=...)` checks new rules, reads the thread's settings once it holds the thread's lock (a
+resume may have waited for a turn that changed them) and compares; if they differ, it stores
+them on the thread and,
 in the same transaction, appends a runner item `<turn>:config` before the user's message: a user
 message that starts with `[harness] Configuration changed:` and names what changed (new rules are
 quoted, since the model cannot see them otherwise). So the history says why the request prefix
@@ -168,11 +170,18 @@ the tools), and the runner builds each turn's ToolHost from the thread's rules.
   re-checked: `ask` pauses again, `allow` runs. A tool whose result item was already persisted
   must not run again, nor may a call that waits.
 
-On every resume the runner sets `Resume.waiting` to the calls that wait: a stored `tool.end` with
-`pending` (the runner stores it at once, as it does `tool.start`) and no result item. The loop
-never runs them. A crash resume of a tool_result turn also gets, in `Resume.results`, the results
-that turn delivered (its `turn.start` holds them) but did not save. A cancel gives a waiting call
-of the step a result like any other call, so the runtime should stop the work behind it.
+On every resume the runner sets `Resume.waiting` to the calls that wait: calls of the last
+complete assistant item that no result item answers, whose run stored a `tool.end` with
+`pending` in that item's turn or later (the runner stores it at once, as it does `tool.start`).
+A pending run whose call never reached history (a read-only call started early, before its
+response failed) waits for nothing. If that `tool.end` cannot be stored, `ToolHost.run()` answers
+the call with a failure instead, as it does when it cannot record a start: nothing durable would
+say that the call waits, and a resume could run it again. The loop never runs a waiting call. A
+crash resume of a tool_result turn also gets, in `Resume.results`, the results that turn
+delivered (its `turn.start` holds them) but did not save. The runner refuses decisions on
+anything but an approval resume and for waiting calls, and results on an approval resume. A
+cancel gives a waiting call of the step a result like any other call (a delivered result stays
+the call's own), so the runtime should stop the work behind it.
 
 Approval, tool-result and crash resume are the same code path: rebuild from history, then
 continue.

@@ -1504,6 +1504,92 @@ async def test_a_crash_resume_delivers_again_what_its_turn_did_not_save(runner, 
     assert check_tool_results(log.items(tid), log.events(tid), log.turns(tid)).ok
 
 
+async def test_a_pending_run_whose_call_never_reached_history_waits_for_nothing(runner, log, tid):
+    """A loop may start a read-only call early, and the call's work may be pending, before the
+    response fails or is cut off: the call never reaches history, so nothing waits for it, and
+    the thread goes on (I2 counts the run as speculative)."""
+
+    async def fails_after_an_early_start(turn, tools, cancel):
+        tools.emit(Event("tool.start", {"call_id": "c0", "name": "validate_pipeline"}))
+        end = {"call_id": "c0", "name": "validate_pipeline", "ok": True, "ms": 1, "pending": True}
+        tools.emit(Event("tool.end", end))
+        yield Event("turn.end", {"stop": "error", "steps": 1, "error": "stream failed"})
+
+    await runner.turn(FakeLoop(fails_after_an_early_start), tid, model=MODEL, user_text="go")
+    assert runner._waiting(tid) == []
+    summary = await runner.turn(FakeLoop(writes("a.pipe")), tid, model=MODEL, user_text="again")
+    assert summary["stop"] == "end_turn"
+    runner.compact(tid, "wrote a.pipe")
+
+
+async def test_a_call_id_used_again_is_judged_by_its_latest_call(runner, log, tid):
+    """Models reuse call ids across turns: an old result for `c` says nothing about a later
+    call `c` whose work is still pending."""
+
+    async def answered_c(turn, tools, cancel):
+        call = ToolCall("c", "write_file", json.dumps({"path": "a.pipe", "content": "{}"}))
+        yield item(turn, "a", assistant(call))
+        yield tool_item(turn, await tools.run(call))
+        yield Event("turn.end", {"stop": "end_turn", "steps": 1})
+
+    async def c_waits(turn, tools, cancel):
+        yield item(turn, "a", assistant(ToolCall("c", "validate_pipeline", "{}")))
+        tools.emit(Event("tool.start", {"call_id": "c", "name": "validate_pipeline"}))
+        end = {"call_id": "c", "name": "validate_pipeline", "ok": True, "ms": 1, "pending": True}
+        tools.emit(Event("tool.end", end))
+        yield Event("turn.end", {"stop": "waiting", "steps": 1, "pending": ["c"]})
+
+    await runner.turn(FakeLoop(answered_c), tid, model=MODEL, user_text="one")
+    await runner.turn(FakeLoop(c_waits), tid, model=MODEL, user_text="two")
+    assert runner._waiting(tid) == ["c"]
+    loop = FakeLoop(appends_results)
+    await runner.turn(loop, tid, model=MODEL, resume=Resume("crash"))
+    assert loop.inputs[0].resume.waiting == ("c",)
+
+
+async def test_a_resume_reads_the_settings_after_it_gets_the_lock(runner, log, tid):
+    """A resume waits for the thread's lock; settings changed meanwhile (by the turn that held
+    it) are the ones it runs with."""
+    loop = FakeLoop(only(Event("turn.end", {"stop": "end_turn", "steps": 0})))
+    with _exclusive(runner._lock_path(tid)):
+        task = asyncio.create_task(runner.turn(loop, tid, model=MODEL, resume=Resume("crash")))
+        await asyncio.sleep(0.1)  # it read nothing yet that it will keep
+        other = SessionLog(runner.wc_root.parent / "log.sqlite")
+        note = Item("x:config", "x", {"role": "user", "content": "note"})
+        meta = {**log.get_thread(tid)["meta"], "rules": {"*": "ask"}}
+        other.append_item(tid, note, settings={"system": "You fix pipelines.", "meta": meta})
+        other.close()
+    await task
+    assert loop.inputs[0].system == "You fix pipelines."
+
+
+async def test_new_rules_are_checked_before_they_are_stored(runner, log, tid):
+    loop = FakeLoop(only(Event("turn.end", {"stop": "end_turn", "steps": 0})))
+    with pytest.raises(ValueError, match="maybe"):
+        await runner.turn(loop, tid, model=MODEL, user_text="go", rules={"*": "maybe"})
+    assert log.get_thread(tid)["meta"]["rules"] == RULES and log.turns(tid) == []
+
+
+async def test_a_user_message_with_a_lone_surrogate_is_measured_not_refused(runner, log, tid):
+    loop = FakeLoop(only(Event("turn.end", {"stop": "end_turn", "steps": 0})))
+    await runner.turn(loop, tid, model=MODEL, user_text="half a pair: \ud83d")
+    assert log.items(tid)[-1].message["content"] == "half a pair: \ud83d"
+
+
+async def test_a_resume_carries_only_what_its_kind_may(runner, log, tid):
+    await runner.turn(FakeLoop(waits_for("v")), tid, model=MODEL, user_text="check")
+    waiting = f"{tid}.0:v"
+    loop = FakeLoop(appends_results)
+    for resume, problem in [
+        (Resume("approval", {waiting: "deny"}), "wait for their results"),
+        (Resume("crash", {waiting: "allow"}), "only an approval resume"),
+        (Resume("approval", results={waiting: ToolResult(waiting, True, "x")}), "tool_result"),
+    ]:
+        with pytest.raises(ValueError, match=problem):
+            await runner.turn(loop, tid, model=MODEL, resume=resume)
+    assert [t["kind"] for t in log.turns(tid)] == ["user"] and loop.inputs == []
+
+
 def test_an_older_log_gets_the_waiting_turns_it_lacks(tmp_path):
     db = tmp_path / "old.sqlite"
     raw = sqlite3.connect(db)

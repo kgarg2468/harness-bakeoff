@@ -32,7 +32,7 @@
 
 | | **A** · pydantic-ai | **B** · our loop |
 | --- | --- | --- |
-| Lines of its own code | 824 | 932 (470 ported from Pi) |
+| Lines of its own code | 838 | 936 (470 ported from Pi) |
 | Packages it installs | 35 · 35.4 MB | 12 · 3.9 MB |
 | Cold import | 1.19 s | 71.4 ms |
 | Harness overhead per turn (p50) | 369.8 ms (184.1 µs per chunk) | 12.8 ms (6.4 µs per chunk) |
@@ -221,7 +221,7 @@ Only what the measurements show, plus a few design properties labelled as such. 
 
 **A, pydantic-ai:**
 
-- **Less of its own code:** 824 lines against 932.
+- **Less of its own code:** 838 lines against 936.
 - **New provider APIs are mostly settings:** Responses API support took +97 lines against +156 for B, 136 of those ported from Pi ([#14](https://github.com/kgarg2468/harness-bakeoff/pull/14) and [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13)). The first cuts were +46 against +140.
 - **Features come with the library (by design):** retries, usage limits, approvals and tools that run for minutes (deferred tools), cancellation and the message history format are pydantic-ai's, so fixes and new features arrive with upgrades.
 - **Many providers behind one interface (by design):** OpenAI, Anthropic, Gemini and more, should the engine ever need more than OpenAI-compatible endpoints.

@@ -121,11 +121,17 @@ class ToolHostImpl:
                 content = (
                     f"{content[:MAX_OUTPUT]}\n... [truncated {len(content) - MAX_OUTPUT} chars]"
                 )
-            return ToolResult(call.id, ok, content, error, pending)
+            result = ToolResult(call.id, ok, content, error, pending)
         finally:
             ms = round((time.perf_counter() - start) * 1000, 3)
             end = {"call_id": call.id, "name": call.name, "ok": ok, "ms": ms}
-            self._safe_emit(Event("tool.end", {**end, "pending": True} if pending else end))
+            ended = self._safe_emit(Event("tool.end", {**end, "pending": True} if pending else end))
+        if pending and not ended:
+            # No durable record that the call waits: a resume could run it again. As for an
+            # unrecorded start, it is answered now (the model sees why).
+            content = f"{call.name} started, but it is not recorded as waiting for its result"
+            return ToolResult(call.id, False, content, "failed")
+        return result
 
     def _safe_emit(self, event: Event) -> bool:
         """Emit without letting a failing callback break run()'s never-raises guarantee.

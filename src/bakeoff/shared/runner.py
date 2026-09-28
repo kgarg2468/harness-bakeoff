@@ -20,6 +20,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+from bakeoff.shared import permissions
 from bakeoff.shared.contract import (
     Event,
     Item,
@@ -67,6 +68,8 @@ logger = logging.getLogger(__name__)
 SUMMARY_PREFIX = "[harness] Conversation summary:"
 # Starts the content of the item that notes a change of the thread's settings (`Runner.turn`).
 CONFIG_PREFIX = "[harness] Configuration changed:"
+# How that note names a new system prompt: I1 lets the system messages change only at such a note.
+NEW_SYSTEM_PROMPT = "a new system prompt"
 # The most a user message's content may take as JSON (UTF-8). Inline data (an image as a data URL)
 # counts; a large file goes by reference (a URL) instead.
 MAX_USER_BYTES = 256 * 1024
@@ -160,13 +163,18 @@ def _content_problem(content: Any) -> str | None:
                 return f"part {n} is not a text part or an image_url part with a url"
     elif not isinstance(content, str):
         return "the content must be text or a list of content parts"
-    size = len(json.dumps(content, ensure_ascii=False).encode())
+    # A lone surrogate (half an emoji, say) is valid JSON text: it counts, it is not an error.
+    size = len(json.dumps(content, ensure_ascii=False).encode(errors="surrogatepass"))
     if size > MAX_USER_BYTES:
         return (
             f"its content takes {size} bytes as JSON, more than {MAX_USER_BYTES}:"
             " pass large files by URL"
         )
     return None
+
+
+def _complete_answer(item: Item) -> bool:
+    return item.message.get("role") == "assistant" and item.status == "complete"
 
 
 def _new_settings(
@@ -176,7 +184,7 @@ def _new_settings(
     the note that says what changed; None if nothing changes."""
     changes, settings = [], {"system": thread["system"], "meta": thread["meta"]}
     if system is not None and system != thread["system"]:
-        changes.append("a new system prompt")
+        changes.append(NEW_SYSTEM_PROMPT)
         settings["system"] = system
     if rules is not None and rules != thread["meta"]["rules"]:
         changes.append(f"new permission rules {json.dumps(rules)}")
@@ -431,7 +439,8 @@ class Runner:
         tool_result turn delivers again the results that turn had not saved.
 
         `system` and `rules` are the thread's system prompt and permission rules from this turn
-        on. If they differ from the thread's, the runner stores them and appends a runner item
+        on (rules that are not valid raise ValueError at once). If they differ from the thread's
+        (read once the lock is held), the runner stores them and appends a runner item
         before the user's message, a user message that starts with `CONFIG_PREFIX` and names
         what changed, so the history explains why the request prefix changed (I1 lets it reset
         there). Only a new user message changes them: on a resume they must be None or unchanged,
@@ -452,17 +461,15 @@ class Runner:
             raise ValueError("pass exactly one of user_text and resume")
         if user_text is not None and (problem := _content_problem(user_text)):
             raise ValueError(f"cannot send this user message: {problem}")
-        thread = self._thread(thread_id)
-        if loop.name != thread["impl"]:
-            raise ValueError(f"thread {thread_id} belongs to {thread['impl']!r}, not {loop.name!r}")
-        if resume is not None and _new_settings(thread, system, rules):
-            raise ValueError("the system prompt and the rules change with a user message only")
+        if rules is not None:
+            permissions.validate_rules(rules)  # before they are stored: else no turn could run
+        if loop.name != (impl := self._thread(thread_id)["impl"]):
+            raise ValueError(f"thread {thread_id} belongs to {impl!r}, not {loop.name!r}")
         wait_s = self.lock_wait_s if resume is not None else 0.0
         lock_fd = await _wait_lock(self._lock_path(thread_id), wait_s)
         try:
             return await self._turn(
                 loop,
-                thread,
                 thread_id,
                 model,
                 user_text,
@@ -480,7 +487,6 @@ class Runner:
     async def _turn(
         self,
         loop: Loop,
-        thread: dict[str, Any],
         thread_id: str,
         model: ModelConfig,
         user_text: UserContent | None,
@@ -493,6 +499,10 @@ class Runner:
         rules: dict[str, Any] | None,
     ) -> dict[str, Any]:
         kind = resume.kind if resume else "user"
+        # Read with the lock held: a resume may have waited for a turn that changed the settings.
+        thread = self._thread(thread_id)
+        if resume is not None and _new_settings(thread, system, rules):
+            raise ValueError("the system prompt and the rules change with a user message only")
         self._retire_dead(thread_id, lock_fd)
         if resume is None:
             self._refuse_while(thread_id, "start a user turn", _OPEN)
@@ -733,12 +743,26 @@ class Runner:
             raise RuntimeError(f"cannot {what}: turn {last['id']} {waits[last['status']]}")
 
     def _waiting(self, thread_id: str) -> list[str]:
-        """The calls of the thread that wait for their results (contract rule 9): a stored
-        `tool.end` says `pending`, and no result item answers the call yet."""
-        answered = {item.message.get("tool_call_id") for item in self.log.items(thread_id)}
+        """The calls that wait for their results (contract rule 9): calls of the last complete
+        assistant item that no result item after it answers, whose run said `pending` (a stored
+        `tool.end`) in that item's turn or a later one. A pending run whose call never reached
+        history (a read-only call started early, before its response failed or was cut off)
+        waits for nothing, and neither does an older call with the same id."""
+        items = self.log.items(thread_id)
+        last = next((n for n in reversed(range(len(items))) if _complete_answer(items[n])), None)
+        if last is None:
+            return []
+        order = {t["id"]: t["idx"] for t in self.log.turns(thread_id)}
+        since = order.get(items[last].turn_id, 0)
         ends = self.log.events(thread_id, types=("tool.end",))
-        started = [e["data"].get("call_id") for e in ends if e["data"].get("pending")]
-        return [call_id for call_id in dict.fromkeys(started) if call_id not in answered]
+        pending = {
+            e["data"].get("call_id")
+            for e in ends
+            if e["data"].get("pending") and order.get(e["turn"], -1) >= since
+        }
+        answered = {item.message.get("tool_call_id") for item in items[last + 1 :]}
+        calls = [call.get("id") for call in items[last].message.get("tool_calls") or ()]
+        return [c for c in calls if c in pending and c not in answered]
 
     def _resume(self, thread_id: str, resume: Resume) -> Resume:
         """`resume` as the loop gets it: with the calls still waiting in `waiting` and, for the
@@ -746,6 +770,12 @@ class Runner:
         Raises ValueError for a delivery of a call that does not wait."""
         waiting = self._waiting(thread_id)
         results = dict(resume.results)
+        if resume.decisions and resume.kind != "approval":
+            raise ValueError("only an approval resume carries decisions")
+        if asked := [c for c in resume.decisions if c in waiting]:
+            raise ValueError(f"calls {asked} wait for their results: nobody asked about them")
+        if results and resume.kind == "approval":
+            raise ValueError("results come with a tool_result resume")
         if resume.kind == "tool_result":
             self._refuse_while(thread_id, "deliver tool results", _PAUSED)
             wrong = [

@@ -672,6 +672,28 @@ async def test_a_cancel_gives_a_waiting_call_a_result(loop):
     assert answered == ["c1", "c2", "c3", "c4"]  # the waiting calls too
 
 
+@pytest.mark.parametrize("delay", [0, 0.001])
+async def test_a_cancel_keeps_a_delivered_result(loop, delay):
+    """A cancel before the library applied a delivered result still saves that result as its
+    call's: it cannot come again (rule 9). The call that still waits is closed like any other."""
+    tools = Background()
+    history = [user("check it")]
+    with SSEServer(_waiting_batch()) as srv:
+        history += items(await run(loop, turn(history, config(srv)), tools))
+        cancel = asyncio.Event()
+        asyncio.get_running_loop().call_later(delay, cancel.set)
+        if not delay:
+            cancel.set()
+        deliver = Resume("tool_result", results={"c1": _delivered("c1")}, waiting=("c4",))
+        events = await run(loop, turn(history, config(srv), resume=deliver), tools, cancel)
+    assert of(events, "turn.end") == [{"stop": "cancelled", "steps": 1}]
+    results = {i.message["tool_call_id"]: i.message["content"] for i in items(events)}
+    assert results == {
+        "c1": "c1: valid",
+        "c4": "The tool call was interrupted before a result was produced.",
+    }
+
+
 async def test_max_steps_stops_after_exactly_that_many_requests(loop):
     looping = [
         Reply([*tool_call(0, f"c{i}", "read_file", '{"path": "a"}'), done("tool_calls")])

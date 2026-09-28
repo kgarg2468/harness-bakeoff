@@ -363,3 +363,19 @@ async def test_a_background_tool_only_starts_its_work(tmp_path, events):
         background=["validate_pipeline"],
     )
     assert (await denied.run(call("validate_pipeline", {"path": "a.pipe"}, "c3"))).error == "denied"
+
+
+async def test_a_pending_run_that_cannot_be_recorded_as_waiting_is_answered_now(tmp_path):
+    """Without a stored pending tool.end nothing says the call waits, and a resume could run it
+    again: like an unrecorded start, it fails now (the model sees why)."""
+
+    def loses_pending_ends(event):
+        if event.type == "tool.end" and event.data.get("pending"):
+            raise RuntimeError("log locked")
+
+    host = build_toolhost(
+        tmp_path, {"*": "allow"}, loses_pending_ends, background=["validate_pipeline"]
+    )
+    result = await host.run(call("validate_pipeline", {"path": "a.pipe"}))
+    assert (result.ok, result.error, result.pending) == (False, "failed", False)
+    assert "not recorded as waiting" in result.content

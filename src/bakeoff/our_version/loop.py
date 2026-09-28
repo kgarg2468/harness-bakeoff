@@ -18,6 +18,7 @@ import httpx
 
 from bakeoff.shared.contract import (
     CONTEXT_NEAR_LIMIT,
+    Decision,
     Event,
     Item,
     ToolCall,
@@ -374,7 +375,7 @@ class _Turn:
             if not streamed.ready or streamed.name not in self.read_only:
                 return
             call = streamed.call()
-            if await self.tools.check(call) != "allow":
+            if await self._check(call) != "allow":
                 return
             self._start(call)
 
@@ -416,7 +417,7 @@ class _Turn:
         the call's own, without running it.
         """
         settled = self.jobs.keys() | self.user.keys() | self.delivered.keys() | self.waiting
-        asked = [c for c in calls if c.id not in settled and await self.tools.check(c) == "ask"]
+        asked = [c for c in calls if c.id not in settled and await self._check(c) == "ask"]
         for call in asked:
             yield Event(
                 "permission.asked",
@@ -454,6 +455,12 @@ class _Turn:
 
     def _start(self, call: ToolCall) -> None:
         self.jobs[call.id] = self._spawn(self.tools.run(call))
+
+    async def _check(self, call: ToolCall) -> Decision | None:
+        """`check()` as a task the cancel watcher can stop (the rules may come from a slow
+        database); None if the cancel stopped it."""
+        task = await self._settle(self.tools.check(call))
+        return None if task.cancelled() else task.result()
 
     async def _answer(self, call: ToolCall) -> Event | None:
         """The result item of a call once its outcome is known, or None if the call waits: its

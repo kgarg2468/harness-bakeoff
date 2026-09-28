@@ -272,6 +272,20 @@ def test_the_system_prompt_may_change_at_a_configuration_note():
     assert not check_prefix([before, after], CONFIG).ok
 
 
+def test_a_note_of_new_rules_alone_does_not_allow_a_new_system_prompt():
+    rules_only = {
+        "role": "user",
+        "content": '[harness] Configuration changed: new permission rules {"*": "ask"}.',
+    }
+    before = encode(SYSTEM, USER, ANSWER)
+    after = encode(NEW_SYSTEM, USER, ANSWER, rules_only, user("next"))
+    notes = [Item("t.1:config", "t.1", rules_only)]
+    assert not check_prefix([before, after], notes, CONFIG_TURNS).ok
+    # With the system prompt kept, such a note is only appended: no reset needed.
+    kept = encode(SYSTEM, USER, ANSWER, rules_only, user("next"))
+    assert check_prefix([before, kept], notes, CONFIG_TURNS).info["resets"] == []
+
+
 def test_a_configuration_change_may_come_with_a_compaction():
     log_items = [*COMPACTION, Item("t.2:config", "t.2", NOTE)]
     turns = [*TURNS, {"id": "t.2", "kind": "user"}]
