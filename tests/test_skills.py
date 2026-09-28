@@ -348,7 +348,7 @@ async def test_largest_file_is_not_truncated(host):
 
 async def test_unknown_skill_lists_the_valid_names(host):
     bad = call({"name": "rocketride-flying-pipelines"})
-    assert host.check(bad) == "allow"  # run() rejects it without executing; the model retries
+    assert await host.check(bad) == "allow"  # run() rejects it without executing; the model retries
     result = await host.run(bad)
     assert (result.ok, result.error) == (False, "invalid_args")
     assert result.content == (

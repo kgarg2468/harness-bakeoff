@@ -368,8 +368,8 @@ class _Tools:
     def specs(self):  # type: ignore[no-untyped-def]
         return self.inner.specs()
 
-    def check(self, call):  # type: ignore[no-untyped-def]
-        return self.inner.check(call)
+    async def check(self, call):  # type: ignore[no-untyped-def]
+        return await self.inner.check(call)
 
     async def run(self, call):  # type: ignore[no-untyped-def]
         return await self.inner.run(call)

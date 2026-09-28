@@ -55,12 +55,16 @@ If you'd do something differently, edit this file in a PR, and A will be changed
 - [x] **Approvals**: `ApprovalRequiredToolset(approval_required_func=...)` backed by the shared
       permission rules. `output_type=[str, DeferredToolRequests]`. Resume with `message_history` +
       `DeferredToolResults` (`ToolDenied(message)` for a denial). ([deferred-tools](https://ai.pydantic.dev/deferred-tools/))
-      *A crash resume, or an approval that answers only some calls, uses the same
+      *Changed: the contract's `check()` is async (the rules may come from a database), and
+      `ApprovalRequiredToolset` calls `approval_required_func` without awaiting it (2.31.1). So A
+      raises `ApprovalRequired` from an async `Hooks(before_tool_execute=...)` instead: the hook
+      runs before every tool call, awaits `check()` and defers the call if it says "ask". The docs
+      name `before_tool_execute` as a place to raise it from, and it is what A already used for
+      resumed calls. A crash resume, or an approval that answers only some calls, uses the same
       `DeferredToolResults`. The library needs an answer for every open call, so a call the user
-      did not answer is passed as approved and re-checked in `Hooks(before_tool_execute=...)`,
-      which the docs name as the hook to defer from: `check()` == "ask" raises `ApprovalRequired`
-      again. So the decided calls run now and only the others pause (before, a partial answer was
-      lost and the thread could never finish). Open calls that must never run get the library's
+      did not answer is passed as approved, and the same hook checks it again: every call the user
+      did not decide in this resume goes through `check()`. So the decided calls run now and only
+      the others pause (before, a partial answer was lost and the thread could never finish). Open calls that must never run get the library's
       own "interrupted" result, saved as items: their response was cut short by a cancel, or the
       user sent a new message instead of answering. This is decided from the history, so a crash
       right after a cancel cannot run the cancelled call.*

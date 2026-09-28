@@ -79,13 +79,13 @@ async def test_default_engine_is_the_mock(make):
     assert result.ok and json.loads(result.content)["lanes"] == {"_source": ["questions"]}
 
 
-def test_check_uses_rules_and_paths(make):
+async def test_check_uses_rules_and_paths(make):
     host = make({"*": "allow", "write_file": {"*.pipe": "allow", "*": "ask"}, "edit_file": "deny"})
-    assert host.check(call("write_file", {"path": "dir/../a.pipe", "content": ""})) == "allow"
-    assert host.check(call("write_file", {"path": "a.txt", "content": ""})) == "ask"
+    assert await host.check(call("write_file", {"path": "dir/../a.pipe", "content": ""})) == "allow"
+    assert await host.check(call("write_file", {"path": "a.txt", "content": ""})) == "ask"
     edit = {"path": "a.pipe", "old_string": "a", "new_string": "b"}
-    assert host.check(call("edit_file", edit)) == "deny"
-    assert host.check(call("list_components")) == "allow"
+    assert await host.check(call("edit_file", edit)) == "deny"
+    assert await host.check(call("list_components")) == "allow"
 
 
 @pytest.mark.parametrize(
@@ -103,7 +103,7 @@ def test_check_uses_rules_and_paths(make):
 )
 async def test_path_escape_is_always_denied(make, events, name, args):
     host = make({"*": "allow"})
-    assert host.check(call(name, args)) == "deny"
+    assert await host.check(call(name, args)) == "deny"
     result = await host.run(call(name, args))
     assert not result.ok and result.content.startswith("Denied: ")
     assert host.run_counts == {}
@@ -121,7 +121,7 @@ async def test_deny_is_enforced_by_run(make, tmp_path):
 async def test_ask_is_the_loops_job(make, tmp_path):
     host = make({"*": "ask"})
     args = {"path": "a.pipe", "content": "{}"}
-    assert host.check(call("write_file", args)) == "ask"
+    assert await host.check(call("write_file", args)) == "ask"
     assert (await host.run(call("write_file", args))).ok  # run() only enforces deny
     assert (tmp_path / "a.pipe").exists()
 
@@ -160,7 +160,7 @@ async def test_bad_calls_are_reported_not_raised(make, name, arguments, message)
     host = make({"*": "ask"})
     bad = ToolCall(id="c1", name=name, arguments=arguments)
     # run() rejects these without executing, so the loop need not ask first.
-    assert host.check(bad) == "allow"
+    assert await host.check(bad) == "allow"
     result = await host.run(bad)
     assert not result.ok
     assert result.content.startswith(message)

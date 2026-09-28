@@ -64,7 +64,7 @@ from pydantic_ai import (
 )
 from pydantic_ai.capabilities import Hooks, ProcessHistory
 from pydantic_ai.models import Model
-from pydantic_ai.toolsets import ApprovalRequiredToolset, FunctionToolset
+from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.usage import RunUsage
 
 from bakeoff.pydantic_version import mapping
@@ -236,7 +236,7 @@ class PydanticLoop:
         self, turn: TurnInput, tools: ToolHost, cancel: asyncio.Event
     ) -> AsyncIterator[Event]:
         # Only an explicit allow/deny counts as the user's answer; anything else is treated as
-        # unanswered, so the ask rule is checked again before the call can run.
+        # unanswered, so the permission rules are checked again before the call can run.
         decisions = turn.resume.decisions if turn.resume else {}
         decided = {cid for cid, d in decisions.items() if d in ("allow", "deny")}
         read_only = {spec.name for spec in tools.specs() if spec.read_only}
@@ -321,8 +321,8 @@ class PydanticLoop:
                 return {"stop": stop}
         deferred = None
         if pending := mapping.pending_calls(history):
-            # The library needs an answer for every open call; `_before_execute` asks again for
-            # those the user did not decide, once `check()` says "ask" (rule 5).
+            # The library needs an answer for every open call; `_before_execute` checks again
+            # those the user did not decide, and asks again if `check()` says "ask" (rule 5).
             deferred = DeferredToolResults(approvals=_approvals(turn.resume, pending))
         limits = turn.limits
         cost_limit = None if limits.max_cost_usd is None else Decimal(str(limits.max_cost_usd))
@@ -413,14 +413,10 @@ class PydanticLoop:
     def _agent(self, specs: list[ToolSpec]) -> Agent[_Turn, str | DeferredToolRequests]:
         key = json.dumps([asdict(spec) for spec in specs], sort_keys=True)
         if (agent := self._agents.get(key)) is None:
-            toolset = ApprovalRequiredToolset(
-                FunctionToolset([_tool(spec) for spec in specs]),
-                approval_required_func=_needs_approval,
-            )
             agent = self._agents[key] = Agent(
                 deps_type=_Turn,
                 output_type=[str, DeferredToolRequests],
-                toolsets=[toolset],
+                toolsets=[FunctionToolset([_tool(spec) for spec in specs])],
                 capabilities=[
                     Hooks(
                         after_model_request=_on_model_response,
@@ -477,10 +473,6 @@ def _replayable(ctx: RunContext[_Turn], messages: list[ModelMessage]) -> list[Mo
     return mapping.replayable(messages, ctx.deps.responses_api)
 
 
-def _needs_approval(ctx: RunContext[_Turn], tool_def: ToolDefinition, args: dict[str, Any]) -> bool:
-    return ctx.deps.tools.check(_running_call(ctx)) == "ask"
-
-
 def _unparsed_args(
     ctx: RunContext[_Turn],
     /,
@@ -495,18 +487,19 @@ def _unparsed_args(
     return {}
 
 
-def _before_execute(
+async def _before_execute(
     ctx: RunContext[_Turn], /, *, call: ToolCallPart, tool_def: ToolDefinition, args: Any
 ) -> Any:
-    """The step cap is checked before the next request, so the calls of the last allowed response
-    would run although their results can never be sent: skip them (each still gets a result).
-    A call resumed without the user's decision (a crash resume, or one the user left out) is
-    re-checked, and deferred again if it must be asked."""
+    """Decides, before a call runs, whether it may. The step cap is checked before the next
+    request, so the calls of the last allowed response would run although their results can
+    never be sent: skip them (each still gets a result). Every call the user did not decide in
+    this resume (a new one, a crash resume's, or one the user left out) awaits `check()` here and
+    is deferred for approval if it must be asked (rule 5). `ApprovalRequiredToolset` cannot await
+    its function, and the rules may live in a database (A_CHECKLIST)."""
     turn = ctx.deps
     if ctx.usage.requests >= turn.max_steps:
         raise SkipToolExecution(_STEP_CAP_RESULT)
-    resumed = ctx.tool_call_approved and call.tool_call_id not in turn.decided
-    if resumed and turn.tools.check(_to_call(call)) == "ask":
+    if call.tool_call_id not in turn.decided and await turn.tools.check(_to_call(call)) == "ask":
         raise ApprovalRequired
     return args
 

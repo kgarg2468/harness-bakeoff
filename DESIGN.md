@@ -144,7 +144,9 @@ Permission rules (OpenCode style), per thread:
 ```
 
 A tool maps to a decision, or to `{glob-on-path: decision}` with the first match winning. Paths
-that escape the working copy are always denied.
+that escape the working copy are always denied. `ToolHost.check()` is async, so a runtime can
+read its rules from a database; loop B awaits it on its early-start path and when it schedules a
+step's calls, loop A in a `before_tool_execute` hook (`A_CHECKLIST.md`, Approvals).
 
 ## Skills
 

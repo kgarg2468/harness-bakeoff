@@ -55,11 +55,11 @@ class StubTools:
     def specs(self) -> list[ToolSpec]:
         return SPECS
 
-    def check(self, call: ToolCall) -> Any:
+    async def check(self, call: ToolCall) -> Any:
         return self.rules.get(call.name, "allow")
 
     async def run(self, call: ToolCall) -> ToolResult:
-        if self.check(call) == "deny":
+        if await self.check(call) == "deny":
             return ToolResult(call.id, False, "denied by rule")
         self.run_counts[call.id] += 1
         self.started.set()
@@ -394,6 +394,37 @@ async def test_calls_after_an_ask_wait_for_the_answer() -> None:
         ("c0", "write_file ok"),
         ("c1", "validated v2"),
     ]
+
+
+class AwaitedRules(StubTools):
+    """Permission rules that take a moment to read, as from a database."""
+
+    async def check(self, call: ToolCall) -> Any:
+        await asyncio.sleep(0.01)
+        return await super().check(call)
+
+
+async def test_awaited_permission_rules_decide_as_before() -> None:
+    """`check()` is awaited on the early-start path and when the step's calls are scheduled."""
+    tools = AwaitedRules(rules={"write_file": "ask"})
+    seen: list[dict[str, int]] = []
+
+    async def body() -> AsyncIterator[bytes]:
+        yield sse_bytes(call(0, '{"name": "a"}', "c0", "describe_component"))
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(tools.started.wait(), 1)
+        seen.append(dict(tools.run_counts))
+        yield sse_bytes(call(1, WRITE, "c1", "write_file"), finish("tool_calls"))
+
+    history = [user("go")]
+    paused = await run(Server(lambda: httpx.Response(200, content=body())).loop(), history, tools)
+    assert seen == [{"c0": 1}]  # the read started while the model was still streaming
+    assert paused[-1].data == {"stop": "paused", "steps": 1, "pending": ["c1"]}
+    history += [persisted(it) for it in items(paused)]
+    resume = Resume("approval", {"c1": "allow"})
+    resumed = await run(Server(reply("ok")).loop(), history, tools, resume=resume)
+    assert tools.run_counts == {"c0": 1, "c1": 1}
+    assert resumed[-1].data == {"stop": "end_turn", "steps": 2}
 
 
 def approval_batch() -> httpx.Response:

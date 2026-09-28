@@ -65,7 +65,7 @@ class StubTools:
     def specs(self):
         return []
 
-    def check(self, call):
+    async def check(self, call):
         return "allow"
 
     async def run(self, call):

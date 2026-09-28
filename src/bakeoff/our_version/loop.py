@@ -192,9 +192,9 @@ class _Turn:
                             chunk = json.loads(data)
                             if feed is not None:  # Responses API: one named event per chunk
                                 if (out := feed(chunk)) is not None:
-                                    yield (
-                                        out if isinstance(out, Event) else self._ready(out, stream)
-                                    )
+                                    if not isinstance(out, Event):
+                                        out = await self._ready(out, stream)
+                                    yield out
                                 if stream.done:
                                     break
                                 continue
@@ -215,7 +215,7 @@ class _Turn:
                                 merge_detail(stream.details, fragment)
                             for tool_delta in delta.get("tool_calls") or ():
                                 if done := stream.tool_delta(tool_delta, self.read_only):
-                                    yield self._ready(done, stream)
+                                    yield await self._ready(done, stream)
                             if usage := chunk.get("usage"):
                                 stream.usage = usage  # replaced, never added: counted once
                                 if stream.finish:  # finish_reason and usage: nothing else is due
@@ -261,7 +261,7 @@ class _Turn:
                     return
                 for call in stream.calls.values():
                     if not call.ready:
-                        yield self._ready(call)
+                        yield await self._ready(call)
                 yield self._item(stream.message(), usage=usage, native=stream.native)
                 yield Event("usage", usage)
                 if calls := stream.tool_calls():
@@ -338,16 +338,16 @@ class _Turn:
         }
         return [Event("retry", retry)], wait
 
-    def _ready(self, streamed: StreamedCall, stream: Stream | None = None) -> Event:
+    async def _ready(self, streamed: StreamedCall, stream: Stream | None = None) -> Event:
         """A call's arguments are complete. Mid-stream (`stream` given), start what may start early."""
         call = streamed.finish()
         if stream is not None:
-            self._start_early(stream)
+            await self._start_early(stream)
         return Event(
             "tool_call.ready", {"call_id": call.id, "name": call.name, "arguments": call.arguments}
         )
 
-    def _start_early(self, stream: Stream) -> None:
+    async def _start_early(self, stream: Stream) -> None:
         """Start complete, allowed read-only calls while the model is still streaming, in call
         order: a call starts early only if every call before it did, so none can run ahead of
         an earlier write. Nothing starts on the last allowed step (see `_STEP_CAP`)."""
@@ -359,7 +359,7 @@ class _Turn:
             if not streamed.ready or streamed.name not in self.read_only:
                 return
             call = streamed.call()
-            if self.tools.check(call) != "allow":
+            if await self.tools.check(call) != "allow":
                 return
             self._start(call)
 
@@ -389,7 +389,9 @@ class _Turn:
         asked = [
             c
             for c in calls
-            if c.id not in self.jobs and c.id not in self.user and self.tools.check(c) == "ask"
+            if c.id not in self.jobs
+            and c.id not in self.user
+            and await self.tools.check(c) == "ask"
         ]
         for call in asked:
             yield Event(

@@ -62,8 +62,9 @@ class ToolHostImpl:
         """All tools, always in the same order."""
         return [tool.spec for tool in TOOLS]
 
-    def check(self, call: ToolCall) -> Decision:
-        """allow / ask / deny for a call. Never raises.
+    async def check(self, call: ToolCall) -> Decision:
+        """allow / ask / deny for a call. Never raises. (The rules are in memory here; the
+        contract makes it async for rules that live in a database.)
 
         Calls that `run()` will reject without executing (unknown tool, bad arguments) are
         "allow", so the loop runs them and the model sees the error. A path outside the

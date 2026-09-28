@@ -86,7 +86,7 @@ class StubTools:
     def specs(self) -> list[ToolSpec]:
         return SPECS
 
-    def check(self, call: ToolCall) -> Decision:
+    async def check(self, call: ToolCall) -> Decision:
         self.checked.append(call.id)
         return self.rules.get(call.name, "allow")
 
@@ -108,7 +108,7 @@ class StubTools:
         if "path" not in args:
             invalid = "invalid arguments: 'path' is a required property"
             return ToolResult(call.id, False, invalid, error="invalid_args")
-        if self.check(call) == "deny":
+        if await self.check(call) == "deny":
             return ToolResult(call.id, False, f"Denied by permission rules: {call.name}", "denied")
         if args["path"] == "missing":
             return ToolResult(call.id, False, "No such file: missing", error="failed")
@@ -347,6 +347,30 @@ async def test_approval_pauses_then_resumes_in_a_fresh_loop(loop):
     assert [i.message["role"] for i in items(events)] == ["tool", "assistant"]
     # The resume continues the turn: its request is the turn's second step.
     assert of(events, "request.start") == [{"step": 2, "attempt": 1}]
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+
+
+class AwaitedRules(StubTools):
+    """Permission rules that take a moment to read, as from a database."""
+
+    async def check(self, call: ToolCall) -> Decision:
+        await asyncio.sleep(0.01)
+        return await super().check(call)
+
+
+async def test_awaited_permission_rules_pause_and_resume_as_before(loop):
+    """`check()` is awaited in the `before_tool_execute` hook, for new calls and for the calls a
+    crash resume finds open."""
+    tools = AwaitedRules({"write_file": "ask"})
+    with SSEServer(_batch(), Reply([*text("written"), done()])) as srv:
+        history = await _pause_for_write(loop, srv, tools)
+        crash = await run(loop, turn(history, config(srv), resume=Resume("crash")), tools)
+        assert of(crash, "turn.end") == [{"stop": "paused", "steps": 1, "pending": ["c2"]}]
+        history += items(crash)
+        resume = Resume("approval", {"c2": "allow"})
+        events = await run(loop, turn(history, config(srv), resume=resume), tools)
+
+    assert [c.id for c in tools.runs] == ["c1", "c2"]
     assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
 
 

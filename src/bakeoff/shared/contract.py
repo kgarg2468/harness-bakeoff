@@ -15,7 +15,7 @@ Rules every Loop must follow (tests enforce them, see DESIGN.md):
    previous request's messages plus new items only: history is append-only.
 4. Every tool call gets exactly one tool-result item, including on deny and
    cancel. A tool never runs twice for the same call id.
-5. Tools are called through `ToolHost`. For a new call, call `check()` first:
+5. Tools are called through `ToolHost`. For a new call, await `check()` first:
    "ask" means pause (emit `permission.asked` per call, then `turn.end` with
    stop="paused" and the pending ids); "deny" and "allow" both go to `run()`,
    which enforces deny. On an approval resume, the user's answer replaces
@@ -171,7 +171,9 @@ class ToolHost(Protocol):
         """All tools, always in the same order (keeps the prompt prefix stable)."""
         ...
 
-    def check(self, call: ToolCall) -> Decision: ...
+    async def check(self, call: ToolCall) -> Decision:
+        """allow / ask / deny. Async, so a runtime may read its rules from a database."""
+        ...
 
     async def run(self, call: ToolCall) -> ToolResult:
         """Validate args, enforce deny, execute. Never raises."""
