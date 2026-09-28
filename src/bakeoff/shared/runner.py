@@ -29,6 +29,7 @@ from bakeoff.shared.contract import (
     Resume,
     ToolHost,
     TurnInput,
+    UserContent,
 )
 from bakeoff.shared.sessionlog import EventRow, SessionLog, event_row, item_to_json
 from bakeoff.shared.workcopy import WorkCopy, Workspace
@@ -60,6 +61,9 @@ logger = logging.getLogger(__name__)
 SUMMARY_PREFIX = "[harness] Conversation summary:"
 # Starts the content of the item that notes a change of the thread's settings (`Runner.turn`).
 CONFIG_PREFIX = "[harness] Configuration changed:"
+# The most a user message's content may take as JSON (UTF-8). Inline data (an image as a data URL)
+# counts; a large file goes by reference (a URL) instead.
+MAX_USER_BYTES = 256 * 1024
 
 try:
     import fcntl
@@ -133,6 +137,30 @@ def _check_loop_item(item: Any, turn_id: str) -> None:
         raise ValueError(f"item {item.id!r} has the id of a runner item")
     if getattr(item, "turn_id", turn_id) != turn_id:
         raise ValueError(f"item {item.id!r} belongs to turn {item.turn_id!r}, not {turn_id!r}")
+
+
+def _content_problem(content: Any) -> str | None:
+    """What is wrong with a user message's content (`contract.UserContent`), or None."""
+    if isinstance(content, list):
+        if not content:
+            return "it has no content parts"
+        for n, part in enumerate(content):
+            kind = part.get("type") if isinstance(part, dict) else None
+            image = part.get("image_url") if kind == "image_url" else None
+            if not (
+                (kind == "text" and isinstance(part.get("text"), str))
+                or (isinstance(image, dict) and isinstance(image.get("url"), str))
+            ):
+                return f"part {n} is not a text part or an image_url part with a url"
+    elif not isinstance(content, str):
+        return "the content must be text or a list of content parts"
+    size = len(json.dumps(content, ensure_ascii=False).encode())
+    if size > MAX_USER_BYTES:
+        return (
+            f"its content takes {size} bytes as JSON, more than {MAX_USER_BYTES}:"
+            " pass large files by URL"
+        )
+    return None
 
 
 def _new_settings(
@@ -371,7 +399,7 @@ class Runner:
         thread_id: str,
         *,
         model: ModelConfig,
-        user_text: str | None = None,
+        user_text: UserContent | None = None,
         resume: Resume | None = None,
         limits: Limits = _DEFAULT_LIMITS,
         cancel: asyncio.Event | None = None,
@@ -380,6 +408,10 @@ class Runner:
         rules: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run one turn: a new user message, or a resume (approval or crash).
+
+        `user_text` is the message's content, text or content parts (`contract.UserContent`),
+        stored as given. One whose JSON is larger than `MAX_USER_BYTES`, or with a part that is
+        not text or an image URL, is refused (ValueError) before anything is recorded.
 
         While the last turn is paused, a new user message is refused: the pending calls need an
         approval resume first (it may deny them, with a reason), since a user message between a
@@ -405,6 +437,8 @@ class Runner:
         """
         if (user_text is None) == (resume is None):
             raise ValueError("pass exactly one of user_text and resume")
+        if user_text is not None and (problem := _content_problem(user_text)):
+            raise ValueError(f"cannot send this user message: {problem}")
         thread = self._thread(thread_id)
         if loop.name != thread["impl"]:
             raise ValueError(f"thread {thread_id} belongs to {thread['impl']!r}, not {loop.name!r}")
@@ -436,7 +470,7 @@ class Runner:
         thread: dict[str, Any],
         thread_id: str,
         model: ModelConfig,
-        user_text: str | None,
+        user_text: UserContent | None,
         resume: Resume | None,
         limits: Limits,
         cancel: asyncio.Event | None,

@@ -469,6 +469,12 @@ OUTPUT_OK = {"type": "function_call_output", "call_id": "call_1", "output": "ok"
             "missing_required_parameter",
         ),
         (
+            {"role": "user", "content": [{"type": "input_image", "detail": "auto"}]},
+            "Missing required parameter: 'input[1].content[0].image_url'.",
+            "input[1].content[0].image_url",
+            "missing_required_parameter",
+        ),
+        (
             {k: v for k, v in DONE_REASONING.items() if k != "id"},
             "Missing required parameter: 'input[1].id'.",
             "input[1].id",

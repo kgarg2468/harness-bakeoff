@@ -967,3 +967,12 @@ def test_older_live_results_without_a_template_still_group_their_loops(
             write_json(path, data)
     text = re.sub(r"<[^>]+>", "", make(out, live=live))
     assert "over 2 live runs of one prompt and setup" in text
+
+
+def test_an_image_part_shows_in_a_user_card():
+    parts = [
+        {"type": "text", "text": "Like this: "},
+        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+    ]
+    card = data._item_card({"message": {"role": "user", "content": parts}}, data._Calls.scan([]))
+    assert card == {"k": "user", "text": "Like this: [image]"}

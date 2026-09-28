@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import Any
 
 from pydantic_ai import (
+    ImageUrl,
     ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
@@ -30,7 +31,7 @@ from pydantic_ai.messages import INTERRUPTED_TOOL_RETURN_CONTENT
 from pydantic_ai.profiles import DEFAULT_THINKING_TAGS
 from pydantic_ai.usage import RunUsage
 
-from bakeoff.shared.contract import Item
+from bakeoff.shared.contract import Item, UserContent
 
 
 def dump(message: ModelMessage) -> dict[str, Any]:
@@ -48,8 +49,8 @@ def split(message: ModelMessage) -> list[ModelMessage]:
 def to_history(items: list[Item]) -> list[ModelMessage]:
     """Rebuild the native history from the last compaction item onward (contract rule 8).
 
-    Items the runner wrote (user messages, revert notes, summaries) have no native and become
-    user prompts.
+    Items the runner wrote (user messages, notes, summaries) have no native and become user
+    prompts.
     """
     start = max((i for i, item in enumerate(items) if item.compaction), default=0)
     history: list[ModelMessage] = []
@@ -57,8 +58,39 @@ def to_history(items: list[Item]) -> list[ModelMessage]:
         if item.native is not None:
             history.extend(ModelMessagesTypeAdapter.validate_python([item.native]))
         else:
-            history.append(ModelRequest(parts=[UserPromptPart(item.message["content"])]))
+            prompt = UserPromptPart(user_content(item.message["content"]))
+            history.append(ModelRequest(parts=[prompt]))
     return history
+
+
+def user_content(content: UserContent) -> str | list[str | ImageUrl]:
+    """A user message's content as pydantic-ai user content: text parts become strings and image
+    parts `ImageUrl`s (a `detail` goes in `vendor_metadata`, where the OpenAI models read it)."""
+    if isinstance(content, str):
+        return content
+    return [
+        part["text"] if part["type"] == "text" else _image(part["image_url"]) for part in content
+    ]
+
+
+def _image(image: dict[str, Any]) -> ImageUrl:
+    detail = image.get("detail")
+    return ImageUrl(image["url"], vendor_metadata={"detail": detail} if detail else None)
+
+
+def chat_content(content: Any) -> UserContent:
+    """The inverse of `user_content`: pydantic-ai user content as chat content parts."""
+    if isinstance(content, str):
+        return content
+    parts: list[dict[str, Any]] = []
+    for piece in content:
+        if isinstance(piece, ImageUrl):
+            detail = (piece.vendor_metadata or {}).get("detail")
+            image = {"url": piece.url, **({"detail": detail} if detail else {})}
+            parts.append({"type": "image_url", "image_url": image})
+        else:
+            parts.append({"type": "text", "text": str(piece)})
+    return parts
 
 
 def to_openai(message: ModelMessage, responses_api: bool = False) -> list[dict[str, Any]]:
@@ -81,7 +113,7 @@ def to_openai(message: ModelMessage, responses_api: bool = False) -> list[dict[s
         elif isinstance(part, RetryPromptPart):
             out.append({"role": "user", "content": part.model_response()})
         elif isinstance(part, UserPromptPart):
-            out.append({"role": "user", "content": part.content})
+            out.append({"role": "user", "content": chat_content(part.content)})
     return out
 
 

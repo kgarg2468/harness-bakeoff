@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 import pytest
-from test_our_loop import NOTE, OBJ, SYSTEM, Server, StubTools, items, no_wait, of, run, user
+from test_our_loop import NOTE, OBJ, PARTS, SYSTEM, Server, StubTools, items, no_wait, of, run, user
 
 from bakeoff.our_version.responses import input_items, static_body
 from bakeoff.shared.contract import Item, Limits, ModelConfig, TurnInput
@@ -411,6 +411,23 @@ async def test_a_new_system_prompt_rebuilds_the_cached_prefix() -> None:
     assert first[0] == {"role": "developer", "content": SYSTEM}
     assert second[0] == {"role": "developer", "content": "You fix pipelines."}
     assert second[1:] == [*first[1:], message("one"), NOTE, history[-1].message]
+
+
+async def test_user_content_parts_become_input_parts() -> None:
+    server = Server(answer("A sketch."), answer("Still a sketch."))
+    loop, history = server.loop(), [Item("u1", "t0", {"role": "user", "content": PARTS})]
+    history += items(await run(loop, history, StubTools(), model=MODEL))
+    await run(loop, [*history, user("And now?")], StubTools(), model=MODEL)
+    expected = {
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "What is in this sketch?"},
+            {"type": "input_image", "image_url": "https://example.com/sketch", "detail": "auto"},
+            {"type": "input_image", "image_url": PARTS[2]["image_url"]["url"], "detail": "low"},
+        ],
+    }
+    first, second = (json.loads(body)["input"] for body in server.bodies)
+    assert first[1] == expected and second[1] == expected  # every request replays them
 
 
 def test_request_options_and_items_without_native() -> None:

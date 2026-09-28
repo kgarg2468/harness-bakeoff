@@ -19,7 +19,15 @@ from typing import Any
 import httpx
 import pytest
 from pai_sse_server import Reply, SSEServer, chunk, done, text, tool_call
-from pydantic_ai import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai import (
+    ImageUrl,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -759,6 +767,49 @@ async def test_a_new_system_prompt_is_sent_from_the_turn_that_brings_it(loop):
         note,
         {"role": "user", "content": "again"},
     ]
+
+
+PARTS = [
+    {"type": "text", "text": "What is in this sketch?"},
+    {"type": "image_url", "image_url": {"url": "https://example.com/sketch"}},
+    {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo=", "detail": "low"},
+    },
+]
+
+
+def test_user_content_parts_map_to_pydantic_ai_content_and_back():
+    text, image, inline = mapping.user_content(PARTS)
+    assert text == "What is in this sketch?"
+    assert isinstance(image, ImageUrl) and image.url == "https://example.com/sketch"
+    assert image.vendor_metadata is None  # no detail: the chat request sends none either
+    assert inline.vendor_metadata == {"detail": "low"}
+    assert mapping.chat_content([text, image, inline]) == PARTS
+    assert mapping.user_content("hi") == mapping.chat_content("hi") == "hi"
+    request = ModelRequest(parts=[UserPromptPart([text, image, inline])])
+    assert mapping.to_openai(request) == [{"role": "user", "content": PARTS}]
+
+
+async def test_user_content_parts_reach_chat_completions_and_the_responses_api(loop, tmp_path):
+    parts_user = Item("u1", "t0", {"role": "user", "content": PARTS})
+    with SSEServer(Reply([*text("A sketch."), done()])) as srv:
+        events = await run(loop, turn([parts_user], config(srv)), StubTools())
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+    assert srv.requests[0]["messages"][1] == {"role": "user", "content": PARTS}
+
+    expected = [
+        {"type": "input_text", "text": "What is in this sketch?"},
+        {"type": "input_image", "image_url": "https://example.com/sketch", "detail": "auto"},
+        {"type": "input_image", "image_url": PARTS[2]["image_url"]["url"], "detail": "low"},
+    ]
+    exchange = {
+        "expect": {"input_at": [{"index": 0, "role": "user", "parts": expected}]},
+        "respond": {"stream": [{"text": "A sketch."}, COMPLETED]},
+    }
+    with responses_server(tmp_path, exchange) as srv:
+        events = await run(loop, turn([parts_user], responses_config(srv)), StubTools())
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]
 
 
 async def test_rate_limit_retry_is_visible_and_honours_retry_after(loop):

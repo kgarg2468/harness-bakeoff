@@ -323,13 +323,18 @@ def _args(raw: Any) -> str:
 
 
 def _text(content: Any) -> str:
-    """A message's content as text (list content is joined text parts)."""
+    """A message's content as text (list content is joined text parts; an image part shows as
+    `[image]`)."""
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+        return "".join(
+            "[image]" if p.get("type") == "image_url" else str(p.get("text", ""))
+            for p in content
+            if isinstance(p, dict)
+        )
     return json.dumps(content, ensure_ascii=False)
 
 

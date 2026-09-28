@@ -115,13 +115,21 @@ class ToolResult:
     error: ToolError | None = None
 
 
+# What a user message says: text, or a list of content parts in the OpenAI chat format,
+# {"type": "text", "text": ...} and {"type": "image_url", "image_url": {"url": ..., "detail"?}}.
+# The runner stores it as given and caps its size (`runner.MAX_USER_BYTES`): large files go by
+# reference (a URL), not inline. A loop converts the parts for its API.
+UserContent = str | list[dict[str, Any]]
+
+
 @dataclass(slots=True)
 class Item:
     """One durable entry in a thread's history. Items are append-only."""
 
     id: str
     turn_id: str
-    # An OpenAI chat-completions message ({"role": ..., ...}) as it goes on the wire.
+    # An OpenAI chat-completions message ({"role": ..., ...}) as it goes on the wire. A user
+    # message's content is `UserContent`.
     message: dict[str, Any]
     # "incomplete" = cut short by a cancel; how a loop replays it is its own policy.
     status: Literal["complete", "incomplete"] = "complete"

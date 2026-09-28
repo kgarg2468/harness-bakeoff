@@ -16,7 +16,8 @@ and a stream that ends before any of them.
 Not from Pi: the output items after a reasoning item that is not kept go back without their ids
 (Pi drops only a function call's id, for calls from another model, against the same check).
 
-Not ported (this harness does not need them): images, custom and grammar tools, tool search,
+Not ported: images (`content.py`, written here, converts a user message's content parts), and
+what this harness does not need: custom and grammar tools, tool search,
 service tiers and their pricing, cache retention options, session headers, Copilot, foreign
 provider id rewriting, text signatures (the whole output items are kept instead), streamed
 arguments (a call is used once its `output_item.done` arrives, which also makes it complete for
@@ -29,6 +30,7 @@ from typing import Any
 
 from bakeoff.shared.contract import Event, Item, ModelConfig, ToolSpec
 
+from .content import input_content
 from .provider import Stream, StreamedCall, dump, stream_error
 from .retry import classify
 
@@ -98,7 +100,8 @@ def input_items(item: Item) -> list[dict[str, Any]]:
                 "output": msg["content"],
             }
         ]
-    text = [] if msg.get("content") is None else [{"role": msg["role"], "content": msg["content"]}]
+    content = msg.get("content")
+    text = [] if content is None else [{"role": msg["role"], "content": input_content(content)}]
     return text + [
         {
             "type": "function_call",

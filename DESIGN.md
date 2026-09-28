@@ -100,7 +100,14 @@ holding it dies. Its git processes inherit it, so a dead worker's last git proce
 
 `Item.message` is an OpenAI chat-completions message, exactly as it goes on the wire:
 
-- user: `{"role": "user", "content": "..."}` (created by the runner)
+- user: `{"role": "user", "content": "..." | [part, ...]}` (created by the runner). The content is
+  text or a list of content parts in the chat format (`{"type": "text", "text"}`, `{"type":
+  "image_url", "image_url": {"url", "detail"?}}`), stored as given (`contract.UserContent`). The
+  runner refuses one whose JSON (UTF-8) is over `runner.MAX_USER_BYTES` (256 KiB), inline data
+  included: large files go by URL. Chat completions take the parts as they are; on the Responses
+  API loop B converts them to `input_text` and `input_image` parts (`our_version/content.py`),
+  and loop A to pydantic-ai's user content, strings and `ImageUrl` (`mapping.user_content`),
+  which its model maps to either API.
 - assistant: `{"role": "assistant", "content": "..." | None, "tool_calls": [...], "reasoning_details": [...]}`.
   `tool_calls[].function.arguments` is the raw streamed string. `reasoning_details` is kept
   verbatim (never rebuilt).
@@ -272,11 +279,13 @@ recordings and the session log, never from what a loop says about itself.
 | S14 | BYOK strict endpoint: 400 if body has `reasoning`, `reasoning_effort` or `stream_options` (configured via compat flags) | the turn finishes |
 | S15 | compaction hand-off: runner appends a summary item; loop sends [system, summary, new user] | prefix resets only at the compaction boundary |
 | S17 | settings change between turns: a new system prompt and rules that make `write_file` ask | the new system prompt, the kept history, the runner's note, the new message; the write asks, then runs once |
+| S18 | a user message with a text part and two image parts (by URL, and inline with `detail: low`) | the parts reach the model as sent, in every request |
 | R01 | Responses API (`gpt-6-luna`, effort `xhigh`, summary `auto`): text only | `store: false`, `include` has `reasoning.encrypted_content`, `reasoning.summary` sent, Responses tools; exact text; usage from `response.completed` |
 | R02 | reasoning + one function call + its `function_call_output`, then the answer | the reasoning item replayed exactly as sent; tool ran once |
 | R03 | commentary + 3 function calls in one response; `write_file` asks; approve in a new process | as S05; the resumed request replays reasoning, commentary (`phase`) and all calls |
 | R04 | 429 with `retry-after: 1`, then OK; next turn an `error` event mid-stream, then OK | waited per Retry-After; nothing of the failed attempt is replayed |
 | R05 | cancel while reasoning streams | stops within 200 ms; next turn passes `reject_unencrypted_reasoning` |
+| R06 | Responses API: the same user message with images | `input_text` and `input_image` parts (URL flat, `detail` `auto` unless given), in every request |
 
 The driver (`shared/scenario.py`) runs the steps with the real runner, session log, working copy
 and ToolHost on MockEngine. `approve` with `new_process` and the user turn after `crash_after` run

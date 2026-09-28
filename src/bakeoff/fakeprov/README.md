@@ -78,7 +78,7 @@ a file (JSON schema plus cross-checks) and raises `ScenarioError` naming the exa
 
 | Step | Meaning |
 |---|---|
-| `{"user": str, "cancel_after_ms"?: int, "system"?: str, "rules"?: {...}}` | run a turn with this user message; set `cancel` that many ms after the turn starts; `system` and `rules` change the thread's settings from this turn on (`Runner.turn`, which notes the change in history). Not after `crash_after` |
+| `{"user": str \| [part, ...], "cancel_after_ms"?: int, "system"?: str, "rules"?: {...}}` | run a turn with this user message (text, or chat content parts: `text`, `image_url`); set `cancel` that many ms after the turn starts; `system` and `rules` change the thread's settings from this turn on (`Runner.turn`, which notes the change in history). After `crash_after`: text only, no settings |
 | `{"approve": {"allow"?: [ids] \| "all", "deny"?: [ids], "reason"?: str}, "new_process": bool}` | answer the pending `permission.asked` calls and resume (`Resume(kind="approval")`), in a fresh process if `new_process` |
 | `{"crash_after": "<event type>", "call_id"?: str}` | run the **next** user step in a child process that SIGKILLs itself when its runner publishes the first event of this type; with `call_id`, the first one about that call (see below) |
 | `{"resume": "crash"}` | resume the killed turn (`Resume(kind="crash")`) |
@@ -118,8 +118,9 @@ Only `respond` is required. Before answering, the server applies, in order:
    it; `""` only checks that the result exists), `body_equals: {"dotted.path": value}` (exact
    value at a path in the body; an integer segment indexes a list, e.g. `"tools.0.name"`),
    `body_contains: {"dotted.path": value}` (the value at that path is a list that contains
-   it), `messages_at: [{index, role?, contains?}]` (checks one message; a negative index
-   counts from the end), and `min_gap_ms` (the request must arrive at least this long after
+   it), `messages_at: [{index, role?, contains?, parts?}]` (checks one message; a negative index
+   counts from the end; `parts`: the content is exactly that many parts, each with at least the
+   listed keys and values, nested objects too), and `min_gap_ms` (the request must arrive at least this long after
    the cursor's previous one, e.g. a retry that honours `retry-after`). Responses scenarios
    check `input` instead of `messages` (see below).
 
@@ -181,7 +182,8 @@ shape, `param` naming the field (e.g. `Missing required parameter: 'input[3].out
 
 - `message` (`type` may be left out): `role` (`user`, `assistant`, `system`, `developer`) and
   `content`, a string or parts (`input_text`, `input_image`, `input_file`; for `assistant`,
-  `output_text` or `refusal`); a text part has a string `text`;
+  `output_text` or `refusal`); a text part has a string `text`, an `input_image` a string
+  `image_url` or `file_id`;
 - `function_call`: strings `call_id`, `name` and `arguments`;
 - `function_call_output`: a string `call_id` and `output`, a string or input parts;
 - `reasoning`: a string `id`, a `summary` list of `summary_text` parts, and `encrypted_content`
@@ -246,7 +248,7 @@ loop puts it. An item without a `type` but with a `role` is a `message`.
 | `last_type` | the last item's type: `message`, `function_call`, `function_call_output` or `reasoning` |
 | `last_role` | the last item's `role` (`user`, `assistant`) |
 | `last_content_contains` | the last item's text contains it: a message's text (a string or text parts), a `function_call_output`'s `output`, a `function_call`'s `arguments`, a reasoning summary |
-| `input_at` | `[{index, type?, role?, phase?, contains?}]`: checks one item; a negative index counts from the end |
+| `input_at` | `[{index, type?, role?, phase?, contains?, parts?}]`: checks one item; a negative index counts from the end; `parts` as in chat's `messages_at` |
 | `tool_result_contains` | `{call_id: substring}`: a `function_call_output` with that `call_id` contains it (`""`: it exists) |
 | `reasoning_replayed` | `[reasoning id]`: `input` has that reasoning item exactly once, equal to its done item (same keys and values; `encrypted_content` byte for byte; with a summary if this request asks for one, since a thread's requests all do or all don't). The loader checks that an earlier exchange sends it |
 
@@ -325,11 +327,13 @@ The next request replays the done reasoning item verbatim, the function call and
 | S14 | BYOK strict endpoint: 400 on `reasoning`, `reasoning_effort` or `stream_options` |
 | S15 | compaction: after the summary a request is `[system, summary, new user]`, then append-only |
 | S17 | settings change between turns: a new system prompt and rules under which `write_file` asks; the request after the change is `[new system, history, note, new user]`; approve |
+| S18 | a user message with images: a text part, an `image_url` by URL and one inline (a data URL, `detail: low`); both requests carry the parts as sent |
 | R01 | Responses API, `gpt-6-luna` at effort `xhigh`: the request shape (`store: false`, `include` has `reasoning.encrypted_content`, Responses-style tools, no `temperature`/`max_tokens`/`reasoning_effort`); reasoning with a summary, then the answer |
 | R02 | reasoning (two summary parts), one `describe_component` call, its output, then the answer; the reasoning item is replayed exactly as its done event sent it |
 | R03 | reasoning, a `commentary` message and three calls in one response (`validate_pipeline` and `describe_component` allowed, `write_file` asks); approve in a new process; the resumed request replays everything, `phase` included |
 | R04 | 429 with `retry-after: 1`, then OK; next turn: a complete reasoning item, cut text and an `error` event mid-stream, then the same request again, keeping nothing of the failed attempt |
 | R05 | cancel while a reasoning item streams (cut before its done event); strict `reject_unencrypted_reasoning`: the next turn must not replay the cut item |
+| R06 | the same user message as S18: `input_text` and `input_image` parts (the URL flat, `detail` `auto` unless the part says), in both requests |
 
 Every R scenario uses model kind `openai_responses`, `gpt-6-luna`, `reasoning: {"effort":
 "xhigh"}`, `temperature: null`, and strict `reject_params` (`temperature`, `max_tokens`,

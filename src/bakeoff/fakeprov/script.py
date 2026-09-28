@@ -228,8 +228,19 @@ _RULES = {
     },
 }
 _STEPS = {
-    # `system` and `rules` change the thread's settings from this turn on (`Runner.turn`).
-    "user": _obj({"user": _STR, "cancel_after_ms": _INT0, "system": _STR, "rules": _RULES}, "user"),
+    # `user` is text or chat content parts (`contract.UserContent`). `system` and `rules` change
+    # the thread's settings from this turn on (`Runner.turn`).
+    "user": _obj(
+        {
+            "user": {
+                "anyOf": [_STR, {"type": "array", "minItems": 1, "items": {"type": "object"}}]
+            },
+            "cancel_after_ms": _INT0,
+            "system": _STR,
+            "rules": _RULES,
+        },
+        "user",
+    ),
     "approve": _obj(
         {
             "approve": _obj(
@@ -257,6 +268,8 @@ _STRICT = {
     "chat": _obj({"reject_params": _STRS, "reject_unsigned_reasoning": _BOOL}),
     "responses": _obj({"reject_params": _STRS, "reject_unencrypted_reasoning": _BOOL}),
 }
+# A message's content parts, each checked on the keys it lists (nested objects too).
+_PARTS = {"type": "array", "items": {"type": "object"}}
 # Exchange `expect` keys that read the body as it is, in both APIs.
 _BODY_EXPECT = {
     "body_has": _STRS,
@@ -279,10 +292,13 @@ _EXCHANGE_EXPECT = {
             "last_content_contains": _STR,
             "messages_len": _INT1,
             "tool_result_contains": {"type": "object", "additionalProperties": _STR},
-            # Checks on specific messages; `index` may be negative (from the end).
+            # Checks on specific messages; `index` may be negative (from the end). `parts`: the
+            # content is exactly that many parts, each with the given keys and values.
             "messages_at": {
                 "type": "array",
-                "items": _obj({"index": {"type": "integer"}, "role": _STR, "contains": _STR}),
+                "items": _obj(
+                    {"index": {"type": "integer"}, "role": _STR, "contains": _STR, "parts": _PARTS}
+                ),
             },
         }
     ),
@@ -306,6 +322,7 @@ _EXCHANGE_EXPECT = {
                         "role": _STR,
                         "contains": _STR,
                         "phase": _STR,
+                        "parts": _PARTS,
                     },
                     "index",
                 ),
@@ -479,8 +496,9 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
             turns += 1
         if "crash_after" in step and (i + 1 == len(steps) or "user" not in steps[i + 1]):
             fail(f"$.driver[{i}]", "crash_after must be followed by a user step")
-        if crashed and ({"system", "rules"} & set(step)):
-            fail(f"$.driver[{i}]", "the user step after crash_after cannot change settings")
+        if crashed and ({"system", "rules"} & set(step) or not isinstance(step["user"], str)):
+            # It runs as `bakeoff turn --user TEXT` in a child process.
+            fail(f"$.driver[{i}]", "the user step after crash_after takes text only, no settings")
         if "call_id" in step:
             referenced.add(step["call_id"])
             if step["crash_after"] not in _CALL_EVENTS:
@@ -688,7 +706,27 @@ def _expect_failures(
             )
         if "contains" in check and check["contains"] not in _text(message.get("content")):
             failures.append(f"message {i} lacks {check['contains']!r}")
+        if "parts" in check and (problem := _parts_problem(message.get("content"), check["parts"])):
+            failures.append(f"message {i} {problem}")
     return failures
+
+
+def _parts_problem(content: object, want: list[dict[str, Any]]) -> str | None:
+    """Why `content` is not exactly the parts `want` lists (each with at least its keys), or None."""
+    got = content if isinstance(content, list) else []
+    if len(got) != len(want):
+        return f"has {len(got)} content parts, expected {len(want)}"
+    for n, (part, expected) in enumerate(zip(got, want, strict=True)):
+        if not _has(part, expected):
+            return f"content part {n} is {json.dumps(part)[:200]}, expected {json.dumps(expected)}"
+    return None
+
+
+def _has(got: object, want: object) -> bool:
+    """Whether `got` equals `want`, where an object needs only the keys `want` has."""
+    if isinstance(want, dict):
+        return isinstance(got, dict) and all(k in got and _has(got[k], v) for k, v in want.items())
+    return got == want
 
 
 def _text(content: object) -> str:
@@ -928,6 +966,11 @@ def _malformed_parts(parts: str | list[Any], types: tuple[str, ...], at: str) ->
             problem := _field_problem(part, "text", (str,), where)
         ):
             return problem
+        # An image is a URL (a data URL too) or an uploaded file's id.
+        if part["type"] == "input_image" and not any(
+            isinstance(part.get(key), str) for key in ("image_url", "file_id")
+        ):
+            return _missing(f"{where}.image_url")
     return None
 
 
@@ -1105,6 +1148,8 @@ def _input_failures(
                 failures.append(f"input item {i} {key} is {got[key]!r}, expected {check[key]!r}")
         if "contains" in check and check["contains"] not in _item_text(item):
             failures.append(f"input item {i} lacks {check['contains']!r}")
+        if "parts" in check and (problem := _parts_problem(item.get("content"), check["parts"])):
+            failures.append(f"input item {i} {problem}")
     scripted = _scripted_reasoning(scenario, index)  # the loader checks each id is in it
     for rid in expect.get("reasoning_replayed", []):
         # A thread's model config is fixed, so this request asks for summaries if the one that

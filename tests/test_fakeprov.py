@@ -540,8 +540,14 @@ SCENARIO_FILES = sorted(SCENARIOS_DIR.glob("*.json"))
 
 
 def test_every_designed_scenario_exists():
-    expected = {f"S{n:02d}" for n in range(1, 16)} - {"S10"} | {"S10a", "S10b", "S12b", "S17"}
-    expected |= {f"R{n:02d}" for n in range(1, 6)}  # the Responses API scenarios
+    expected = {f"S{n:02d}" for n in range(1, 16)} - {"S10"} | {
+        "S10a",
+        "S10b",
+        "S12b",
+        "S17",
+        "S18",
+    }
+    expected |= {f"R{n:02d}" for n in range(1, 7)}  # the Responses API scenarios
     assert {p.stem for p in SCENARIO_FILES} == expected
 
 
@@ -583,7 +589,7 @@ def test_scenario_file_is_valid_and_consistent(path: Path):
                 s["driver"].insert(0, {"crash_after": "item"}),
                 s["driver"][1].update(system="x"),
             ),
-            "$.driver[1]: the user step after crash_after cannot change settings",
+            "$.driver[1]: the user step after crash_after takes text only, no settings",
         ),
         (
             lambda s: s["driver"].insert(0, {"crash_after": "turn.end", "call_id": "call_1"}),

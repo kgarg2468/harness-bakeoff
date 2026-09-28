@@ -1023,6 +1023,25 @@ async def test_crash_after_an_incomplete_answer_asks_again(usage: dict[str, Any]
     assert items(events)[0].message["content"] == "Done." and events[-1].data["stop"] == "end_turn"
 
 
+PARTS = [
+    {"type": "text", "text": "What is in this sketch?"},
+    {"type": "image_url", "image_url": {"url": "https://example.com/sketch"}},
+    {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo=", "detail": "low"},
+    },
+]
+
+
+async def test_user_content_parts_go_out_as_given() -> None:
+    """Chat completions take the chat content parts the runner stored, text and images alike."""
+    server = Server(reply("A sketch."))
+    parts_user = Item("u1", "t0", {"role": "user", "content": PARTS})
+    await run(server.loop(), [parts_user], StubTools())
+    assert server.messages(0)[1] == {"role": "user", "content": PARTS}
+    assert json.dumps(PARTS, separators=(",", ":")).encode() in server.bodies[0]
+
+
 NOTE = {"role": "user", "content": "[harness] Configuration changed: a new system prompt."}
 
 

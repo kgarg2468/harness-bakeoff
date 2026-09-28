@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import sqlite3
 import subprocess
 from typing import ClassVar
@@ -18,6 +19,7 @@ from bakeoff.shared.contract import (
 )
 from bakeoff.shared.invariants import check_commits, check_seq, check_tool_results
 from bakeoff.shared.runner import (
+    MAX_USER_BYTES,
     NdjsonMirror,
     Runner,
     ThreadBusy,
@@ -1313,6 +1315,44 @@ async def test_a_loop_cannot_write_a_runner_item(runner, log, tid, suffix):
     summary = await runner.turn(FakeLoop(forge), tid, model=MODEL, user_text="go")
     assert summary["stop"] == "error"
     assert [i.id for i in log.items(tid)] == [f"{tid}.0:user"]
+
+
+IMAGE = {"type": "image_url", "image_url": {"url": "https://example.com/sketch.png"}}
+
+
+async def test_a_user_message_may_be_content_parts(runner, log, tid):
+    parts = [{"type": "text", "text": "Build this."}, IMAGE]
+    loop = FakeLoop(only(Event("turn.end", {"stop": "end_turn", "steps": 0})))
+    await runner.turn(loop, tid, model=MODEL, user_text=parts)
+    assert loop.inputs[0].history[-1].message == {"role": "user", "content": parts}
+    assert log.items(tid)[-1].message["content"] == parts  # stored as given
+    # The cap is on the content's JSON: exactly the limit passes.
+    await runner.turn(loop, tid, model=MODEL, user_text="x" * (MAX_USER_BYTES - 2))
+
+
+@pytest.mark.parametrize(
+    ("content", "problem"),
+    [
+        ([], "it has no content parts"),
+        ([{"type": "text", "text": "a"}, {"type": "file", "file": {}}], "part 1 is not a text"),
+        ([{"type": "image_url", "image_url": "https://example.com/a.png"}], "part 0 is not"),
+        ([{"type": "text"}], "part 0 is not"),
+        ({"text": "a"}, "must be text or a list of content parts"),
+        ("x" * (MAX_USER_BYTES - 1), f"more than {MAX_USER_BYTES}: pass large files by URL"),
+        (
+            [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 300_000}}],
+            "pass large files by URL",
+        ),
+    ],
+    ids=["empty", "file", "flat-image", "no-text", "dict", "long-text", "inline-image"],
+)
+async def test_a_user_message_is_checked_before_anything_is_recorded(
+    runner, log, tid, content, problem
+):
+    loop = FakeLoop(only(Event("turn.end", {"stop": "end_turn", "steps": 0})))
+    with pytest.raises(ValueError, match=re.escape(problem)):
+        await runner.turn(loop, tid, model=MODEL, user_text=content)
+    assert log.turns(tid) == [] and loop.inputs == []
 
 
 async def test_ndjson_mirror(log, tmp_path):
