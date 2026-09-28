@@ -79,6 +79,22 @@ def item_from_json(data: dict[str, Any]) -> Item:
     return Item(**data)
 
 
+# Logs written before `turn.saved` replaced it end each saved turn with a `commit` event
+# ({sha, files}). Events are append-only, so they stay as written and readers accept both.
+LEGACY_SAVED_EVENT = "commit"
+
+
+def saved_data(event: dict[str, Any]) -> dict[str, Any] | None:
+    """A stored `turn.saved` event's data (`{version, files}`), also for a legacy `commit`
+    event; None for any other event."""
+    data = event.get("data") or {}
+    if event.get("type") == "turn.saved":
+        return data
+    if event.get("type") == LEGACY_SAVED_EVENT:
+        return {"version": data.get("sha"), "files": data.get("files") or []}
+    return None
+
+
 def event_row(envelope: dict[str, Any]) -> EventRow:
     """Serialize an event envelope (`{"v", "thread", "turn", "impl", "seq", "t_us", "type",
     "data"}`) for `append_events` / `append_item`. Raises TypeError if it is not JSON."""

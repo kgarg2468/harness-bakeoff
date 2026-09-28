@@ -697,6 +697,10 @@ class _TurnWalk:
                       "pending": data.get("pending") or [], "error": data.get("error"),
                       "usage": dict(self.usage)})  # fmt: skip
 
+    def on_commit(self, t: float, data: dict, is_late: bool) -> None:
+        """A log written before `turn.saved` replaced it ends a saved turn with `commit`."""
+        self.on_turn_saved(t, {"version": data.get("sha"), "files": data.get("files")}, is_late)
+
     def on_turn_saved(self, t: float, data: dict, is_late: bool) -> None:
         files = sorted(map(str, data.get("files") or []))
         version = data.get("version")

@@ -622,6 +622,27 @@ async def test_commits_ok(log, tmp_path):
     assert check.info["turns"] == check.info["commits"] == 4
 
 
+async def test_a_log_from_before_turn_saved_passes_with_its_commit_events(log, tmp_path):
+    """Logs written before `turn.saved` end a saved turn with a `commit` event ({sha, files}).
+    Events are append-only, so I7 reads that event as the turn's saved version."""
+    wc = WorkCopy(tmp_path / "wc")
+    await wc.init()
+    turn = log.start_turn("th", "user")
+    log.append_events([event(log, turn["id"], "turn.start")])
+    sha, files = await wc.save("turn 1")
+    legacy = event(log, turn["id"], "commit", sha=sha, files=files)
+    log.set_turn_status(turn["id"], "done", stop="end_turn", commit_sha=sha, events=[legacy])
+    check = check_commits(log, "th", wc.root)
+    assert check.ok, check.detail
+    # A legacy event for another version is still a problem.
+    other = log.start_turn("th", "user")
+    sha2, files2 = await wc.save("turn 2")
+    wrong = event(log, other["id"], "commit", sha="0" * 40, files=files2)
+    log.set_turn_status(other["id"], "done", stop="end_turn", commit_sha=sha2, events=[wrong])
+    check = check_commits(log, "th", wc.root)
+    assert (check.ok, check.info["saved_events"]) == (False, [other["id"]])
+
+
 async def test_an_error_turn_that_failed_to_commit_is_not_a_committed_turn(log, tmp_path):
     wc = WorkCopy(tmp_path / "wc")
     await wc.init()

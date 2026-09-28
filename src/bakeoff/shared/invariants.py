@@ -16,7 +16,7 @@ from typing import Any
 
 from bakeoff.shared.contract import Item
 from bakeoff.shared.runner import CONFIG_PREFIX, NEW_SYSTEM_PROMPT
-from bakeoff.shared.sessionlog import SessionLog
+from bakeoff.shared.sessionlog import SessionLog, saved_data
 from bakeoff.shared.workcopy import GIT_CONFIG, git_env
 
 _REASONING_KEYS = ("type", "text", "signature", "data", "format", "index")
@@ -602,19 +602,20 @@ def _saved_event_problems(
     turns: Sequence[dict[str, Any]], events: Sequence[dict[str, Any]]
 ) -> list[str]:
     """The turns whose stored events break rule 7: a turn with a saved version has exactly one
-    `turn.saved` event, for that version, as its last event; any other turn has none."""
+    `turn.saved` event, for that version, as its last event; any other turn has none. A log
+    written before `turn.saved` existed has a `commit` event there instead (see `saved_data`)."""
     by_turn: dict[str, list[dict[str, Any]]] = {}
     for event in events:
         by_turn.setdefault(event["turn"], []).append(event)
     problems = []
     for turn in turns:
         stream = by_turn.get(turn["id"], [])
-        saved = [e for e in stream if e["type"] == "turn.saved"]
+        saved = [e for e in stream if saved_data(e) is not None]
         if turn["commit_sha"]:
             ok = (
                 len(saved) == 1
                 and stream[-1] is saved[0]
-                and saved[0]["data"].get("version") == turn["commit_sha"]
+                and (saved_data(saved[0]) or {}).get("version") == turn["commit_sha"]
             )
         else:
             ok = not saved

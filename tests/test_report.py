@@ -294,6 +294,20 @@ def test_every_glossary_term_has_a_tooltip_on_the_page(out: Path) -> None:
     assert {label for label, _ in render.GLOSSARY.values()} - used == set()
 
 
+def test_replay_reads_the_commit_event_of_logs_from_before_turn_saved() -> None:
+    """A log written before `turn.saved` ends a saved turn with `commit` ({sha, files})."""
+    events = our_events()
+    old = events[-1]
+    events[-1] = {**old, "type": "commit", "data": {"sha": "abc1234def", "files": ["a.txt"]}}
+    turns = [{"id": old["turn"], "kind": "user", "status": "done", "late": None}]
+    replay = data.build_replay(events, turns)
+    assert [c["k"] for c in replay["cards"]][-1] == "saved"
+    assert replay["cards"][-1]["version"] == "abc1234def"
+    (marker,) = replay["lanes"]["git"]
+    assert marker["kind"] == "saved" and marker["version"] == "abc1234def"
+    assert marker["files"] == ["a.txt"]
+
+
 def test_replay_and_wire_data(out: Path) -> None:
     scenarios = {s["id"]: s for s in Page(make(out)).data["scenarios"]}
     ours = scenarios["S01"]["runs"]["our"]["replay"]
