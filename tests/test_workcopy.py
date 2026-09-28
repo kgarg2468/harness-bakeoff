@@ -36,7 +36,7 @@ async def test_init_repairs_a_repo_without_its_initial_commit(tmp_path):
     wc.init_sync()
     assert git(root, "log", "--format=%s").stdout.split() == ["init"]
     (root / "a.pipe").write_text("{}")
-    _, files = await wc.commit("turn 0")
+    _, files = await wc.save("turn 0")
     assert files == ["a.pipe"]
 
 
@@ -44,7 +44,7 @@ async def test_commit_reports_changed_files(wc):
     (wc.root / "a.txt").write_text("a")
     (wc.root / "dir").mkdir()
     (wc.root / "dir" / "b c.pipe").write_text("{}")
-    sha, files = await wc.commit("turn 0: end_turn")
+    sha, files = await wc.save("turn 0: end_turn")
     assert sha == await wc.head()
     assert files == ["a.txt", "dir/b c.pipe"]
     assert git(wc.root, "log", "-1", "--format=%s %an <%ae>").stdout.strip() == (
@@ -53,22 +53,22 @@ async def test_commit_reports_changed_files(wc):
 
     (wc.root / "a.txt").unlink()
     (wc.root / "dir" / "b c.pipe").write_text('{"x": 1}')
-    _, files = await wc.commit("turn 1: end_turn")
+    _, files = await wc.save("turn 1: end_turn")
     assert files == ["a.txt", "dir/b c.pipe"]
 
 
 async def test_empty_commit(wc):
     before = await wc.head()
-    sha, files = await wc.commit("turn 0: error")
+    sha, files = await wc.save("turn 0: error")
     assert sha != before
     assert files == []
 
 
 async def test_revert_is_a_new_commit(wc):
     (wc.root / "a.txt").write_text("a")
-    first, _ = await wc.commit("turn 0")
+    first, _ = await wc.save("turn 0")
     (wc.root / "b.txt").write_text("b")
-    await wc.commit("turn 1")
+    await wc.save("turn 1")
     sha, files = await wc.revert(first)
     assert files == ["a.txt"]
     assert sha == await wc.head()
@@ -78,16 +78,16 @@ async def test_revert_is_a_new_commit(wc):
 
 
 async def test_revert_of_an_empty_commit(wc):
-    empty, _ = await wc.commit("turn 0")
+    empty, _ = await wc.save("turn 0")
     sha, files = await wc.revert(empty)
     assert (sha != empty, files) == (True, [])
 
 
 async def test_revert_conflict_aborts(wc):
     (wc.root / "a.txt").write_text("1")
-    first, _ = await wc.commit("turn 0")
+    first, _ = await wc.save("turn 0")
     (wc.root / "a.txt").write_text("2")
-    head, _ = await wc.commit("turn 1")
+    head, _ = await wc.save("turn 1")
     with pytest.raises(RuntimeError, match="git revert failed"):
         await wc.revert(first)
     assert await wc.head() == head
@@ -100,7 +100,7 @@ async def test_hooks_never_run(wc):
     hook = wc.root / ".git" / "hooks" / "pre-commit"
     hook.write_text("#!/bin/sh\ntouch hook-ran\n")
     hook.chmod(0o755)
-    await wc.commit("turn 1")
+    await wc.save("turn 1")
     assert not (wc.root / "hook-ran").exists()
 
 
@@ -115,7 +115,7 @@ async def test_cancel_stops_git(wc, monkeypatch):
     hook.write_text("#!/bin/sh\ntouch started\nsleep 0.3\n")
     hook.chmod(0o755)
     before = await wc.head()
-    task = asyncio.create_task(wc.commit("turn 0"))
+    task = asyncio.create_task(wc.save("turn 0"))
     for _ in range(500):
         if (wc.root / "started").exists():
             break
@@ -130,18 +130,18 @@ async def test_cancel_stops_git(wc, monkeypatch):
 
 async def test_recover_drops_unrecorded_commits_and_a_stale_lock(wc):
     (wc.root / "a.txt").write_text("a")
-    recorded, _ = await wc.commit("turn 0")
+    recorded, _ = await wc.save("turn 0")
     (wc.root / "b.txt").write_text("b")
-    await wc.commit("orphan")  # landed after its worker died
+    await wc.save("orphan")  # landed after its worker died
     (wc.root / ".git" / "index.lock").write_text("")
     await wc.recover(recorded)
     assert await wc.head() == recorded
-    _, files = await wc.commit("turn 1")
+    _, files = await wc.save("turn 1")
     assert files == ["b.txt"]
 
     await wc.recover(None)  # no turn recorded a commit: back to the initial one
     assert git(wc.root, "rev-list", "--count", "HEAD").stdout.strip() == "1"
-    _, files = await wc.commit("turn 0")
+    _, files = await wc.save("turn 0")
     assert files == ["a.txt", "b.txt"]
 
 
@@ -165,7 +165,7 @@ async def test_user_git_config_and_env_do_not_leak(tmp_path, monkeypatch):
     (wc.root / "b.pipe").write_text("{}")
     (wc.root / "out").mkdir()
     (wc.root / "out" / "c.json").write_text("{}")
-    _, files = await wc.commit("turn 0")
+    _, files = await wc.save("turn 0")
     monkeypatch.undo()
     assert files == ["a.txt", "b.pipe", "out/c.json"]
     assert git(wc.root, "log", "-1", "--format=%an").stdout.strip() == "bakeoff"

@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from bakeoff.shared.contract import Item
-from bakeoff.shared.sessionlog import SessionLog
+from bakeoff.shared.runner import CONFIG_PREFIX, NEW_SYSTEM_PROMPT
+from bakeoff.shared.sessionlog import SessionLog, saved_data
 from bakeoff.shared.workcopy import GIT_CONFIG, git_env
 
 _REASONING_KEYS = ("type", "text", "signature", "data", "format", "index")
@@ -58,20 +59,36 @@ def check_prefix(
     `instructions` (the system prompt, if sent there) followed by its `input` items.
     `ok` is semantic equality; byte equality of the raw elements is reported in
     `info["byte_prefix"]`. A prefix may reset only at a new compaction summary, placed right
-    after the unchanged system messages (contract rule 8). Only the compaction `items` of
-    the runner's "compact" turns (`turns`, as `SessionLog.turns` returns them) count as
-    summaries, so neither a look-alike message nor a loop's own item can fake a reset. They
-    are matched in log order: a reset moves to a compaction item after the one the prefix
-    starts from, never back to an older one, and two compactions may share a summary text.
+    after the unchanged system messages (contract rule 8), or at a configuration change: the
+    system messages may differ from the previous request's only if the part of the request
+    that the previous one lacks holds a configuration-change note, and the history before it is
+    still the previous request's (unless a new compaction summary starts it over as well).
+    Only the runner's items count (`turns`, as `SessionLog.turns` returns them): the compaction
+    `items` of "compact" turns as summaries, and as notes the `<turn>:config` items of "user"
+    turns that name a new system prompt (a note of new rules alone changes no request), so
+    neither a look-alike message nor a loop's own item can fake a reset. Summaries are
+    matched in log order: a reset moves to a compaction item after the one the prefix starts
+    from, never back to an older one, and two compactions may share a summary text.
     """
-    compact_turns = {t["id"] for t in turns if t["kind"] == "compact"}
+    kinds = {t["id"]: t["kind"] for t in turns}
     summary_messages = [
-        item.message for item in items if item.compaction and item.turn_id in compact_turns
+        item.message for item in items if item.compaction and kinds.get(item.turn_id) == "compact"
     ]
-    # A summary is a user message: in the Responses API the same shape is an input message.
+    config_messages = [
+        item.message
+        for item in items
+        if item.id == f"{item.turn_id}:config"
+        and kinds.get(item.turn_id) == "user"
+        and _names_a_new_system_prompt(item.message)
+    ]
+    # Both are user messages: in the Responses API the same shape is an input message.
     summaries = {
         "chat": [_semantic(m) for m in summary_messages],
         "responses": [_semantic_item(m) for m in summary_messages],
+    }
+    configs = {
+        "chat": [_semantic(m) for m in config_messages],
+        "responses": [_semantic_item(m) for m in config_messages],
     }
     requests: list[_Conversation] = []
     for i, body in enumerate(bodies):
@@ -92,19 +109,18 @@ def check_prefix(
             used = _next_summary(summaries[requests[0].api], first[n], -1)
     for i in range(1, len(requests)):
         prev, cur = requests[i - 1], requests[i]
-        kept = len(prev.semantic)  # the elements that must reach `cur` unchanged
+        kept, at = prev.raw, 0  # the raw elements that must reach `cur`, from `at`, unchanged
         j = _first_difference(prev.semantic, cur.semantic)
         if j is not None:
-            k = _reset_to(prev.semantic, cur.semantic, summaries[cur.api], used)
-            if k < 0:
+            reset = _reset(prev, cur, summaries[cur.api], configs[cur.api], used)
+            if reset is None:
                 violations.append({"request": i, "message": j})
                 continue
-            used = k
+            used, kept, at = reset
             resets.append(i)
-            kept = _system_count(prev.semantic)
-        k = _first_difference(prev.raw[:kept], cur.raw)
+        k = _first_difference(kept, cur.raw[at:])
         if k is not None:
-            byte_mismatches.append({"request": i, "message": k})
+            byte_mismatches.append({"request": i, "message": at + k})
     info = {
         "requests": len(requests),
         "apis": sorted({r.api for r in requests}),
@@ -120,9 +136,10 @@ def check_prefix(
             f" {requests[v['request'] - 1].label(v['message'])} changed or was dropped"
         )
     else:
+        byte_prefix = "yes" if not byte_mismatches else "no"
         detail = (
-            f"{len(requests)} requests append-only ({len(resets)} compaction resets);"
-            f" byte-identical prefix: {'yes' if not byte_mismatches else 'no'}"
+            f"{len(requests)} requests append-only ({len(resets)} resets at a compaction or a"
+            f" configuration change); byte-identical prefix: {byte_prefix}"
         )
     return Check("I1", not violations, detail, info)
 
@@ -163,6 +180,12 @@ def _conversation(body: bytes) -> _Conversation:
     return _Conversation(
         "responses", [system, *semantic], [*_raw_elements(body, b'"instructions"'), *raw], True
     )
+
+
+def _names_a_new_system_prompt(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    changes = content.removeprefix(CONFIG_PREFIX) if isinstance(content, str) else ""
+    return content != changes and NEW_SYSTEM_PROMPT in changes
 
 
 def _semantic(msg: dict[str, Any]) -> dict[str, Any]:
@@ -253,18 +276,34 @@ def _system_count(messages: list[dict[str, Any]]) -> int:
     )
 
 
-def _reset_to(
-    prev: list[dict[str, Any]],
-    cur: list[dict[str, Any]],
+def _reset(
+    prev: _Conversation,
+    cur: _Conversation,
     summaries: list[dict[str, Any]],
+    configs: list[dict[str, Any]],
     used: int,
-) -> int:
-    """Where `cur` starts over as rule 8 says (`prev`'s system messages, then a summary): the
-    index of the first compaction item after `used` with that summary, or -1 if none."""
-    n = _system_count(prev)
-    if len(cur) <= n or cur[:n] != prev[:n]:
-        return -1
-    return _next_summary(summaries, cur[n], used)
+) -> tuple[int, list[bytes], int] | None:
+    """How `cur` may start over from `prev`, or None if it may not. With the same system
+    messages, only as rule 8 says: then comes the first compaction item after `used`. With other
+    system messages, only at a configuration change: the part of `cur` that `prev` lacks holds a
+    note of `configs`, and before it comes `prev`'s history, or a new compaction summary.
+
+    Returns (the compaction item the prefix now starts from, the raw elements of `prev` that
+    must start `cur` from index `at` unchanged, `at`)."""
+    p, c = prev.semantic, cur.semantic
+    n, m = _system_count(p), _system_count(c)
+    if c[:m] == p[:n]:
+        k = _next_summary(summaries, c[n], used) if len(c) > n else -1
+        return None if k < 0 else (k, prev.raw[:n], 0)
+    rest = c[m:]
+    k = _next_summary(summaries, rest[0], used) if rest else -1
+    if k >= 0:  # a compaction came first: nothing of `prev` is left
+        new, kept = rest[1:], []
+    elif _first_difference(p[n:], rest) is None:
+        k, new, kept = used, rest[len(p) - n :], prev.raw[n:]
+    else:
+        return None
+    return (k, kept, m) if any(element in configs for element in new) else None
 
 
 def _next_summary(summaries: list[dict[str, Any]], message: dict[str, Any], after: int) -> int:
@@ -389,7 +428,8 @@ def check_tool_results(
     Runs are the `tool.start` events plus those the turn rows (`SessionLog.turns`) keep in
     `late`: tools that started after their loop's `turn.end`. A result must come from a run
     (`ToolHost.run`), unless the user denied the call (`Resume.decisions`, recorded in
-    `turn.start`) or the result's turn stopped early (`_EARLY_STOPS`).
+    `turn.start`) or the result's turn stopped early (`_EARLY_STOPS`). A result delivered by a
+    later resume (contract rule 9) comes from the run that started its work.
     """
     calls: Counter[Any] = Counter()
     results: Counter[Any] = Counter()
@@ -470,7 +510,11 @@ def _unfinished(events: Sequence[dict[str, Any]], stops: dict[Any, Any]) -> list
 
 
 def check_seq(events: Sequence[dict[str, Any]], items: Sequence[Item]) -> Check:
-    """I3: event seqs are 1..n without gaps, and `item` events match the item rows."""
+    """I3: the stored events' seqs are 1..n without gaps, and `item` events match the item rows.
+
+    A runtime may deliver the live-only events (`contract.LIVE_ONLY_EVENTS`) without storing
+    them; it gives them no seq, so this holds either way. The reference runner stores them all.
+    """
     seqs = [e["seq"] for e in events]
     seen = set(seqs)
     item_events = [e["data"]["item"]["id"] for e in events if e["type"] == "item"]
@@ -492,14 +536,15 @@ def check_seq(events: Sequence[dict[str, Any]], items: Sequence[Item]) -> Check:
 
 
 def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
-    """I7: one commit per completed turn, in order; HEAD is the last turn's commit; and each
-    commit is on record as its turn's last event (rule 7).
+    """I7: one saved version per completed turn, in order; the workspace's head is the last
+    turn's version; and each is on record as its turn's last event, `turn.saved` (rule 7).
+    The workspace here is a git `WorkCopy`, so a version is a commit.
 
-    Completed = done, error or cancelled. Compaction turns change no files and have no
-    commit; paused turns are committed by the turn that resumes them. An "error" turn without
-    a commit failed to commit: a later turn's commit includes its changes, so a later git turn
-    must have a commit. (A revert without a commit recorded nothing, and the runner undid what
-    git did for it.)
+    Completed = done, error or cancelled. Compaction turns change no files and save no
+    version; paused and waiting turns are saved by the turn that resumes them. An "error" turn
+    without a version failed to save: a later turn's version includes its changes, so a later
+    workspace turn must have one. (A revert without a version recorded nothing, and the runner
+    undid what git did for it.)
     """
     all_turns = log.turns(thread_id)
     rows = [t for t in all_turns if t["kind"] != "compact"]
@@ -534,7 +579,7 @@ def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
         "commits": len(commits),
         "uncommitted": [t["id"] for t in turns if not t["commit_sha"]] + stranded,
         "unknown": [t["id"] for t in turns if t["commit_sha"] and t["commit_sha"] not in commits],
-        "commit_events": _commit_event_problems(all_turns, log.events(thread_id)),
+        "saved_events": _saved_event_problems(all_turns, log.events(thread_id)),
     }
     if info["uncommitted"] or info["unknown"]:
         detail = f"turns without a commit: {info['uncommitted']}; unknown shas: {info['unknown']}"
@@ -543,36 +588,37 @@ def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
             f"{len(commits)} commits after init for {len(turns)} completed turns"
             " (HEAD or order does not match the turn rows)"
         )
-    elif info["commit_events"]:
+    elif info["saved_events"]:
         detail = (
-            "turns whose commit event is missing, repeated, not their last event or for"
-            f" another sha: {info['commit_events']}"
+            "turns whose turn.saved event is missing, repeated, not their last event or for"
+            f" another version: {info['saved_events']}"
         )
     else:
         return Check("I7", True, f"{len(turns)} turns, one commit each; HEAD matches", info)
     return Check("I7", False, detail, info)
 
 
-def _commit_event_problems(
+def _saved_event_problems(
     turns: Sequence[dict[str, Any]], events: Sequence[dict[str, Any]]
 ) -> list[str]:
-    """The turns whose stored events break rule 7: a turn with a commit sha has exactly one
-    `commit` event, for that sha, as its last event; any other turn has none."""
+    """The turns whose stored events break rule 7: a turn with a saved version has exactly one
+    `turn.saved` event, for that version, as its last event; any other turn has none. A log
+    written before `turn.saved` existed has a `commit` event there instead (see `saved_data`)."""
     by_turn: dict[str, list[dict[str, Any]]] = {}
     for event in events:
         by_turn.setdefault(event["turn"], []).append(event)
     problems = []
     for turn in turns:
         stream = by_turn.get(turn["id"], [])
-        commits = [e for e in stream if e["type"] == "commit"]
+        saved = [e for e in stream if saved_data(e) is not None]
         if turn["commit_sha"]:
             ok = (
-                len(commits) == 1
-                and stream[-1] is commits[0]
-                and commits[0]["data"].get("sha") == turn["commit_sha"]
+                len(saved) == 1
+                and stream[-1] is saved[0]
+                and (saved_data(saved[0]) or {}).get("version") == turn["commit_sha"]
             )
         else:
-            ok = not commits
+            ok = not saved
         if not ok:
             problems.append(turn["id"])
     return problems

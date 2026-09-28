@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from bakeoff import loops
+from bakeoff import cli, loops
 from bakeoff.fakeprov.script import SCENARIOS_DIR
 from bakeoff.fakeprov.server import FakeProvider
 from bakeoff.our_version import OurLoop
@@ -108,8 +108,10 @@ def test_every_expect_key_passes_on_matching_facts(tmp_path: Path) -> None:
         "cost_usd": 0.003,
         "usage": {"input_tokens": 30, "output_tokens": 5, "cached_tokens": 5},
         "cost_source": "provider",
+        "events": {"context.near_limit": 1, "retry": 0},
     }
-    results = evaluate_expect(expect, observed(tmp_path, usage=usage))
+    events = {"usage": 2, "context.near_limit": 1}
+    results = evaluate_expect(expect, observed(tmp_path, usage=usage, events=events))
     assert set(results) == set(expect)
     assert all(r["ok"] for r in results.values()), results
 
@@ -128,6 +130,7 @@ def test_each_expect_key_explains_a_mismatch(tmp_path: Path) -> None:
         "cost_usd": 0.25,
         "usage": {"input_tokens": 2},
         "cost_source": "none",
+        "events": {"context.near_limit": 1},
     }
     results = evaluate_expect(expect, observed(tmp_path, usage=usage))
     details = {key: r["detail"] for key, r in results.items() if not r["ok"]}
@@ -141,6 +144,7 @@ def test_each_expect_key_explains_a_mismatch(tmp_path: Path) -> None:
     assert details["text_contains"] == "missing 'bye' in 'Hello, team!'"
     assert details["cost_usd"] == "got 0.5, expected 0.25"
     assert details["cost_source"] == "got estimate, expected none"
+    assert details["events"] == "got {'context.near_limit': 0}, expected {'context.near_limit': 1}"
 
 
 def test_cost_source_needs_usage_events_and_one_source(tmp_path: Path) -> None:
@@ -303,7 +307,7 @@ async def test_result_json_shape_and_layout(real_provider: FakeProvider, tmp_pat
     types = [
         json.loads(line)["type"] for line in (directory / "events.ndjson").read_text().splitlines()
     ]
-    assert types[0] == "turn.start" and types[-2:] == ["turn.end", "commit"]
+    assert types[0] == "turn.start" and types[-2:] == ["turn.end", "turn.saved"]
 
 
 async def test_a_run_id_is_never_reused(real_provider: FakeProvider, tmp_path: Path) -> None:
@@ -368,8 +372,8 @@ class _Tools:
     def specs(self):  # type: ignore[no-untyped-def]
         return self.inner.specs()
 
-    def check(self, call):  # type: ignore[no-untyped-def]
-        return self.inner.check(call)
+    async def check(self, call):  # type: ignore[no-untyped-def]
+        return await self.inner.check(call)
 
     async def run(self, call):  # type: ignore[no-untyped-def]
         return await self.inner.run(call)
@@ -746,7 +750,7 @@ def test_the_scenario_command_ends_even_if_a_task_ignores_every_cancel(tmp_path:
     script = f"""
 import sys
 from dataclasses import replace
-from bakeoff import loops
+from bakeoff import cli, loops
 from bakeoff.cli import main
 from bakeoff.shared import scenario
 scenario.STRAY_WAIT_S = 0.2
@@ -878,7 +882,7 @@ def test_load_tells_missing_loops_from_broken_ones(
 
 def test_scenario_ids_are_every_file_in_order() -> None:
     ids = scenario.scenario_ids()
-    assert ids[0] == "R01" and ids[-1] == "S15" and {"R05", "S01", "S12b"} <= set(ids)
+    assert ids[0] == "R01" and ids[-1] == "S19" and {"R05", "S01", "S12b"} <= set(ids)
     assert ids == sorted(p.stem for p in SCENARIOS_DIR.glob("*.json"))
 
 
@@ -887,7 +891,7 @@ async def test_cancel_command_reaches_a_worker_turn(
 ) -> None:
     """`bakeoff cancel` from another process stops the turn a `bakeoff turn` worker runs."""
     db = tmp_path / "log.sqlite"
-    ws = scenario.Workspace(db)
+    ws = scenario.RunDir(db)
     model = ModelConfig(base_url=real_provider.base_url("S07", "r1", "our"), model="m")
     ws.runner.new_thread(impl="our", system="s", rules={"*": "allow"}, model=model, thread_id="t1")
     ws.close()
@@ -945,3 +949,15 @@ async def test_a_provider_that_cannot_start_releases_the_run_id(tmp_path, monkey
     assert not (tmp_path / "runs" / "retry").exists()
     summary = await run_matrix(["S01"], ["our"], out=tmp_path, run_id="retry")
     assert summary and (tmp_path / "runs" / "retry" / "S01" / "our" / "result.json").is_file()
+
+
+def test_deliver_options_become_results() -> None:
+    results = cli._results(["c1=valid: a=b"], ["c2=engine down"])
+    assert results == {
+        "c1": ToolResult("c1", True, "valid: a=b"),
+        "c2": ToolResult("c2", False, "engine down", "failed"),
+    }
+    with pytest.raises(ValueError, match="expected CALL_ID=TEXT"):
+        cli._results(["no-equals"], [])
+    with pytest.raises(ValueError, match="at least one"):
+        cli._results([], [])

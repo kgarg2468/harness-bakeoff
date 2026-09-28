@@ -242,6 +242,71 @@ def test_a_reset_still_compares_the_system_bytes():
     assert check_prefix([before, encode(SYSTEM, SUMMARY)], COMPACTION, TURNS).info["byte_prefix"]
 
 
+NOTE = {"role": "user", "content": "[harness] Configuration changed: a new system prompt."}
+NEW_SYSTEM = {"role": "system", "content": "new sys"}
+CONFIG = [Item("t.1:config", "t.1", NOTE)]
+CONFIG_TURNS = [{"id": "t.0", "kind": "user"}, {"id": "t.1", "kind": "user"}]
+
+
+def test_the_system_prompt_may_change_at_a_configuration_note():
+    before = encode(SYSTEM, USER, ANSWER)
+    after = encode(NEW_SYSTEM, USER, ANSWER, NOTE, user("next"))
+    later = encode(NEW_SYSTEM, USER, ANSWER, NOTE, user("next"), ANSWER)
+    check = check_prefix([before, after, later], CONFIG, CONFIG_TURNS)
+    assert (check.ok, check.info["resets"]) == (True, [1]), check.detail
+    assert check.info["byte_prefix"]  # the history after the system prompt kept its bytes
+    # Without the note, or with a history that changed as well, the change is a violation.
+    for bad in [
+        encode(NEW_SYSTEM, USER, ANSWER, user("next")),
+        encode(NEW_SYSTEM, USER, NOTE, user("next")),  # the answer was dropped
+        encode(NEW_SYSTEM, user("edited"), ANSWER, NOTE, user("next")),
+    ]:
+        assert not check_prefix([before, bad], CONFIG, CONFIG_TURNS).ok, bad
+    # The note must be new to the request: one the previous request already had is no reset.
+    had = encode(SYSTEM, USER, ANSWER, NOTE)
+    assert not check_prefix([had, encode(NEW_SYSTEM, USER, ANSWER, NOTE)], CONFIG, CONFIG_TURNS).ok
+    # Only the runner's note of a user turn counts, not a message that looks like one.
+    assert not check_prefix([before, after], [Item("t.1:x", "t.1", NOTE)], CONFIG_TURNS).ok
+    compact_turn = [{"id": "t.1", "kind": "compact"}]
+    assert not check_prefix([before, after], CONFIG, compact_turn).ok
+    assert not check_prefix([before, after], CONFIG).ok
+
+
+def test_a_note_of_new_rules_alone_does_not_allow_a_new_system_prompt():
+    rules_only = {
+        "role": "user",
+        "content": '[harness] Configuration changed: new permission rules {"*": "ask"}.',
+    }
+    before = encode(SYSTEM, USER, ANSWER)
+    after = encode(NEW_SYSTEM, USER, ANSWER, rules_only, user("next"))
+    notes = [Item("t.1:config", "t.1", rules_only)]
+    assert not check_prefix([before, after], notes, CONFIG_TURNS).ok
+    # With the system prompt kept, such a note is only appended: no reset needed.
+    kept = encode(SYSTEM, USER, ANSWER, rules_only, user("next"))
+    assert check_prefix([before, kept], notes, CONFIG_TURNS).info["resets"] == []
+
+
+def test_a_configuration_change_may_come_with_a_compaction():
+    log_items = [*COMPACTION, Item("t.2:config", "t.2", NOTE)]
+    turns = [*TURNS, {"id": "t.2", "kind": "user"}]
+    before = encode(SYSTEM, USER, ANSWER)
+    check = check_prefix(
+        [before, encode(NEW_SYSTEM, SUMMARY, NOTE, user("next"))], log_items, turns
+    )
+    assert (check.ok, check.info["resets"]) == (True, [1]), check.detail
+    no_note = encode(NEW_SYSTEM, SUMMARY, user("next"))
+    assert not check_prefix([before, no_note], log_items, turns).ok
+
+
+def test_responses_instructions_may_change_at_a_configuration_note():
+    note_parts = {"role": "user", "content": [{"type": "input_text", "text": NOTE["content"]}]}
+    before = responses_body(R_USER, R_ANSWER)
+    after = responses_body(R_USER, R_ANSWER, note_parts, R_USER, instructions="new sys")
+    check = check_prefix([before, after], CONFIG, CONFIG_TURNS)
+    assert (check.ok, check.info["resets"]) == (True, [1]), check.detail
+    assert not check_prefix([before, after]).ok
+
+
 def test_unreadable_body_fails():
     check = check_prefix([encode(SYSTEM, USER), b'{"model": "m"}'])
     assert not check.ok
@@ -525,18 +590,18 @@ def log(tmp_path):
     log.close()
 
 
-def event(log, turn_id, type_="commit", **data):
+def event(log, turn_id, type_="turn.saved", **data):
     env = {"v": 1, "thread": "th", "turn": turn_id, "impl": "our", "seq": log.next_seq("th")}
     return event_row({**env, "t_us": 0, "type": type_, "data": data})
 
 
 async def committed_turn(log, wc, status="done", kind="user"):
-    """A turn as the runner records it: the sha on the row, a `commit` event last."""
+    """A turn as the runner records it: the sha on the row, a `turn.saved` event last."""
     turn = log.start_turn("th", kind)
     log.append_events([event(log, turn["id"], "turn.start")])
-    sha, files = await wc.commit(f"turn {turn['idx']}")
-    commit = event(log, turn["id"], sha=sha, files=files)
-    log.set_turn_status(turn["id"], status, stop="end_turn", commit_sha=sha, events=[commit])
+    sha, files = await wc.save(f"turn {turn['idx']}")
+    saved = event(log, turn["id"], version=sha, files=files)
+    log.set_turn_status(turn["id"], status, stop="end_turn", commit_sha=sha, events=[saved])
     return sha
 
 
@@ -555,6 +620,27 @@ async def test_commits_ok(log, tmp_path):
     check = check_commits(log, "th", wc.root)
     assert check.ok, check.detail
     assert check.info["turns"] == check.info["commits"] == 4
+
+
+async def test_a_log_from_before_turn_saved_passes_with_its_commit_events(log, tmp_path):
+    """Logs written before `turn.saved` end a saved turn with a `commit` event ({sha, files}).
+    Events are append-only, so I7 reads that event as the turn's saved version."""
+    wc = WorkCopy(tmp_path / "wc")
+    await wc.init()
+    turn = log.start_turn("th", "user")
+    log.append_events([event(log, turn["id"], "turn.start")])
+    sha, files = await wc.save("turn 1")
+    legacy = event(log, turn["id"], "commit", sha=sha, files=files)
+    log.set_turn_status(turn["id"], "done", stop="end_turn", commit_sha=sha, events=[legacy])
+    check = check_commits(log, "th", wc.root)
+    assert check.ok, check.detail
+    # A legacy event for another version is still a problem.
+    other = log.start_turn("th", "user")
+    sha2, files2 = await wc.save("turn 2")
+    wrong = event(log, other["id"], "commit", sha="0" * 40, files=files2)
+    log.set_turn_status(other["id"], "done", stop="end_turn", commit_sha=sha2, events=[wrong])
+    check = check_commits(log, "th", wc.root)
+    assert (check.ok, check.info["saved_events"]) == (False, [other["id"]])
 
 
 async def test_an_error_turn_that_failed_to_commit_is_not_a_committed_turn(log, tmp_path):
@@ -598,26 +684,26 @@ async def test_each_commit_is_its_turns_last_event(log, tmp_path):
     assert check_commits(log, "th", wc.root).ok
     log.append_events([event(log, "th.0", "text.delta", text="after the commit")])
     check = check_commits(log, "th", wc.root)
-    assert (check.ok, check.info["commit_events"]) == (False, ["th.0"])
-    assert "commit event is missing, repeated, not their last event" in check.detail
+    assert (check.ok, check.info["saved_events"]) == (False, ["th.0"])
+    assert "turn.saved event is missing, repeated, not their last event" in check.detail
 
     turn = log.start_turn("th", "user")  # the sha is on the row, but no commit event
     (wc.root / "a.pipe").write_text("{}")
-    sha, _ = await wc.commit("turn 1")
+    sha, _ = await wc.save("turn 1")
     log.set_turn_status(turn["id"], "done", stop="end_turn", commit_sha=sha)
-    assert check_commits(log, "th", wc.root).info["commit_events"] == ["th.0", "th.1"]
+    assert check_commits(log, "th", wc.root).info["saved_events"] == ["th.0", "th.1"]
     # A commit event for another sha, or for a turn without one, is wrong too.
-    log.append_events([event(log, "th.1", sha="0" * 40)])
+    log.append_events([event(log, "th.1", version="0" * 40)])
     compact = log.start_turn("th", "compact")["id"]
-    log.set_turn_status(compact, "done", events=[event(log, compact, sha=sha)])
-    assert check_commits(log, "th", wc.root).info["commit_events"] == ["th.0", "th.1", "th.2"]
+    log.set_turn_status(compact, "done", events=[event(log, compact, version=sha)])
+    assert check_commits(log, "th", wc.root).info["saved_events"] == ["th.0", "th.1", "th.2"]
 
 
 async def test_extra_commit_fails(log, tmp_path):
     wc = WorkCopy(tmp_path / "wc")
     await wc.init()
     await committed_turn(log, wc)
-    await wc.commit("not a turn")
+    await wc.save("not a turn")
     check = check_commits(log, "th", wc.root)
     assert not check.ok
     assert "2 commits after init for 1 completed turns" in check.detail

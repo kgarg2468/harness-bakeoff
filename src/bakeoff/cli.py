@@ -18,7 +18,7 @@ from typing import Any
 from bakeoff import live, loops
 from bakeoff.fakeprov.__main__ import main as fakeprov_main
 from bakeoff.shared import netguard, scenario
-from bakeoff.shared.contract import Limits, Resume
+from bakeoff.shared.contract import Limits, Resume, ToolResult
 from bakeoff.shared.sessionlog import SessionLog
 
 
@@ -53,6 +53,13 @@ def _worker_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--max-steps", type=int, default=Limits().max_steps)
     parser.add_argument("--engine-delay-ms", type=int, default=0, help="MockEngine delay")
+    parser.add_argument(
+        "--background-tool",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="a tool whose runs only start their work; results come with `deliver`",
+    )
     parser.add_argument("--env-file", type=Path, help="env file with OPENAI_API_KEY (live threads)")
     _key_host_arg(parser)
 
@@ -139,6 +146,21 @@ def build_parser() -> argparse.ArgumentParser:
     _worker_args(p)
     p.add_argument("--call", action="append", default=[], help="call id (default: all pending)")
     p.add_argument("--reason", help="shown to the model")
+
+    p = sub.add_parser("deliver", help="deliver the results of waiting tool calls and resume")
+    _worker_args(p)
+    p.add_argument(
+        "--ok", action="append", default=[], metavar="CALL_ID=TEXT", help="a call's result"
+    )
+    p.add_argument(
+        "--failed",
+        action="append",
+        default=[],
+        metavar="CALL_ID=TEXT",
+        help="a call whose work failed, and why",
+    )
+    p.add_argument("--crash-after", help="SIGKILL this process at the first event of this type")
+    p.add_argument("--call-id", help="... about this tool call")
 
     p = sub.add_parser("resume", help="resume a turn whose worker died (crash resume)")
     _worker_args(p)
@@ -340,10 +362,10 @@ def _worker(args: argparse.Namespace) -> int:
     live.guard_network(base_url)
     sinks = []
     user_text, resume = None, None
+    if getattr(args, "crash_after", None):
+        sinks.append(scenario.crash_sink(args.crash_after, args.call_id))
     if args.command == "turn":
         user_text = args.user
-        if args.crash_after:
-            sinks.append(scenario.crash_sink(args.crash_after, args.call_id))
     elif args.command == "approve":
         decisions = scenario.decide(_pending(args), args.allow or "all", args.deny)
         resume = Resume(kind="approval", decisions=decisions, reason=args.reason)
@@ -351,6 +373,8 @@ def _worker(args: argparse.Namespace) -> int:
         pending = _pending(args)
         decisions = scenario.decide(pending, [], args.call or pending)
         resume = Resume(kind="approval", decisions=decisions, reason=args.reason)
+    elif args.command == "deliver":
+        resume = Resume(kind="tool_result", results=_results(args.ok, args.failed))
     else:
         resume = Resume(kind="crash")
     summary = asyncio.run(
@@ -365,10 +389,24 @@ def _worker(args: argparse.Namespace) -> int:
             wc=args.wc,
             events=args.events,
             sinks=sinks,
+            background=args.background_tool,
         )
     )
     print(json.dumps(summary))  # one line: the driver parses it
     return 0
+
+
+def _results(ok: list[str], failed: list[str]) -> dict[str, ToolResult]:
+    """`deliver`'s CALL_ID=TEXT options as results; the runner checks that each call waits."""
+    results = {}
+    for spec, good in [*((s, True) for s in ok), *((s, False) for s in failed)]:
+        call_id, sep, text = spec.partition("=")
+        if not sep or not call_id:
+            raise ValueError(f"expected CALL_ID=TEXT, got {spec!r}")
+        results[call_id] = ToolResult(call_id, good, text, None if good else "failed")
+    if not results:
+        raise ValueError("deliver needs at least one --ok or --failed result")
+    return results
 
 
 def _cancel(args: argparse.Namespace) -> int:
@@ -397,6 +435,7 @@ _COMMANDS = {
     "turn": _worker,
     "approve": _worker,
     "deny": _worker,
+    "deliver": _worker,
     "resume": _worker,
     "cancel": _cancel,
     "fakeprov": _fakeprov,

@@ -48,7 +48,7 @@ class ReferenceLoop:
                 paused = []
                 for call in open_calls:
                     decision = (turn.resume.decisions if turn.resume else {}).get(call.id)
-                    decision = decision or tools.check(call)
+                    decision = decision or await tools.check(call)
                     if decision == "ask":
                         paused.append(call)
                         continue

@@ -1,0 +1,110 @@
+{
+  "id": "S18",
+  "title": "A user message with images: text and image_url parts reach the model as sent, in every request",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [
+    {
+      "user": [
+        {"type": "text", "text": "Which component in this sketch reads the chat? Look it up."},
+        {
+          "type": "image_url",
+          "image_url": {"url": "https://example.com/sketches/chat-pipeline.png"}
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+            "detail": "low"
+          }
+        }
+      ]
+    }
+  ],
+  "exchanges": [
+    {
+      "note": "The user message is a text part and two image_url parts: one by URL, one inline (a data URL) with detail low.",
+      "expect": {
+        "last_role": "user",
+        "messages_len": 2,
+        "last_content_contains": "this sketch",
+        "messages_at": [
+          {
+            "index": 1,
+            "role": "user",
+            "parts": [
+              {"type": "text", "text": "Which component in this sketch reads the chat? Look it up."},
+              {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/sketches/chat-pipeline.png"}
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+                  "detail": "low"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {"id": "call_S18_1", "name": "describe_component", "arguments": {"name": "chat"}}
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 1900, "completion_tokens": 40, "cost": 0.0061}}
+        ]
+      }
+    },
+    {
+      "note": "The next request replays the user message with its parts unchanged.",
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 4,
+        "tool_result_contains": {"call_S18_1": "questions"},
+        "messages_at": [
+          {
+            "index": 1,
+            "role": "user",
+            "parts": [
+              {"type": "text", "text": "Which component in this sketch reads the chat? Look it up."},
+              {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/sketches/chat-pipeline.png"}
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+                  "detail": "low"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "respond": {
+        "stream": [
+          {"text": "The chat component reads the chat and sends its questions on.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 2000, "completion_tokens": 20, "cost": 0.0062}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn"],
+    "requests": 2,
+    "commits": 1,
+    "text_contains": "chat component",
+    "tool_runs": {"call_S18_1": 1}
+  }
+}

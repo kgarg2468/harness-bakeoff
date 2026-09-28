@@ -1,0 +1,103 @@
+{
+  "id": "S17",
+  "title": "Settings change between turns: a new system prompt and rules, noted in the history",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {"kind": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "driver": [
+    {"user": "Create notes.md with a title."},
+    {
+      "user": "Now save a draft chat pipeline as draft.pipe.",
+      "system": "You are Rocket Agent in review mode. Ask before you write any file.",
+      "rules": {"*": "allow", "write_file": "ask"}
+    },
+    {"approve": {"allow": "all"}, "new_process": false}
+  ],
+  "exchanges": [
+    {
+      "expect": {"last_role": "user", "messages_len": 2},
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S17_1",
+                "name": "write_file",
+                "arguments": {"path": "notes.md", "content": "# Notes\n"}
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 900, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "expect": {"last_role": "tool", "messages_len": 4, "tool_result_contains": {"call_S17_1": ""}},
+      "respond": {
+        "stream": [
+          {"text": "Created notes.md.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1000, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "The new system prompt, then the history as before, the runner's note of the change and the new message. Under the new rules the write asks.",
+      "expect": {
+        "last_role": "user",
+        "messages_len": 7,
+        "last_content_contains": "draft.pipe",
+        "messages_at": [
+          {"index": 0, "role": "system", "contains": "in review mode"},
+          {"index": 1, "role": "user", "contains": "Create notes.md"},
+          {
+            "index": -2,
+            "role": "user",
+            "contains": "[harness] Configuration changed: a new system prompt, and new permission rules"
+          }
+        ]
+      },
+      "respond": {
+        "stream": [
+          {
+            "tool_calls": [
+              {
+                "id": "call_S17_2",
+                "name": "write_file",
+                "arguments": {"path": "draft.pipe", "content": "{\"components\": []}\n"}
+              }
+            ]
+          },
+          {"finish": "tool_calls"},
+          {"usage": {"prompt_tokens": 1200, "completion_tokens": 40, "cost": 0.0033}}
+        ]
+      }
+    },
+    {
+      "note": "Approved: the write ran once, and the request extends the one before it.",
+      "expect": {
+        "last_role": "tool",
+        "messages_len": 9,
+        "tool_result_contains": {"call_S17_2": ""},
+        "messages_at": [{"index": 0, "role": "system", "contains": "in review mode"}]
+      },
+      "respond": {
+        "stream": [
+          {"text": "draft.pipe is saved.", "chunks": 3},
+          {"finish": "stop"},
+          {"usage": {"prompt_tokens": 1300, "completion_tokens": 20, "cost": 0.0033}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["end_turn", "paused", "end_turn"],
+    "requests": 4,
+    "commits": 2,
+    "files": {"notes.md": "# Notes", "draft.pipe": "components"},
+    "tool_runs": {"call_S17_1": 1, "call_S17_2": 1}
+  }
+}

@@ -25,18 +25,18 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/two-loops.svg" alt="Two loop folders sit on top and are the only code that is counted: A, pydantic_version, the loop on pydantic-ai with Agent.iter and deferred tools, used the way its docs recommend; and B, our_version, our own low-latency loop on raw httpx with some pieces ported from Pi. Both implement one seam, shared/contract.py: a loop gets the history and the tools, and only yields events. Everything under the seam is shared, identical for both and not counted: the runner, session log, git working copy, RocketRide tools, permission rules and skills that run a turn, and the fake model server, 22 scenarios, invariants I1, I2, I3, I5 and I7, metrics and report page that judge it." width="880">
+  <img src="docs/assets/two-loops.svg" alt="Two loop folders sit on top and are the only code that is counted: A, pydantic_version, the loop on pydantic-ai with Agent.iter and deferred tools, used the way its docs recommend; and B, our_version, our own low-latency loop on raw httpx with some pieces ported from Pi. Both implement one seam, shared/contract.py: a loop gets the history and the tools, and only yields events. Everything under the seam is shared, identical for both and not counted: the runner, session log, git working copy, RocketRide tools, permission rules and skills that run a turn, and the fake model server, 28 scenarios, invariants I1, I2, I3, I5 and I7, metrics and report page that judge it." width="880">
 </p>
 
 ## Results at a glance
 
 | | **A** · pydantic-ai | **B** · our loop |
 | --- | --- | --- |
-| Lines of its own code | 778 | 869 (468 ported from Pi) |
+| Lines of its own code | 838 | 936 (470 ported from Pi) |
 | Packages it installs | 35 · 35.4 MB | 12 · 3.9 MB |
 | Cold import | 1.19 s | 71.4 ms |
 | Harness overhead per turn (p50) | 369.8 ms (184.1 µs per chunk) | 12.8 ms (6.4 µs per chunk) |
-| Scenarios S01–S15 and R01–R05 | 22 / 22 pass | 22 / 22 pass |
+| Scenarios S01–S19 and R01–R07 | 28 / 28 pass | 28 / 28 pass |
 | Fits in the engine's Python | up to 2.31.1; 2.32+ needs openai 3 | yes, at the engine's own versions |
 | Live `gpt-6-luna` runs that built and validated `chat.pipe` | 5 / 5 | 5 / 5 |
 | Live, chat completions, reasoning `none`: time and input tokens per step (median of 3; within 10%) | 1.60 s · 21,433 tokens | 1.49 s · 20,475 tokens |
@@ -52,9 +52,9 @@ New to the repo? [`docs/learn/bakeoff-101.html`](docs/learn/bakeoff-101.html) is
 <details>
 <summary><strong>Where these numbers come from</strong></summary>
 
-- **Lines of code:** `uv run python -m bakeoff.metrics.loc` on `main`. Code lines only (no comments, docstrings or blanks); ported files are marked at the top and counted separately.
+- **Lines of code:** `uv run python -m bakeoff.metrics.loc`. Code lines only (no comments, docstrings or blanks); ported files are marked at the top and counted separately.
 - **Packages, import time and overhead:** `out/metrics.json` from `python -m bakeoff.metrics.collect --deps --bench full`, at commit `b6acae3` (`main` with both Responses API PRs merged). Each loop's dependency set is installed alone in a fresh virtual environment. The benchmark turn is a tool step of 2,000 streamed chunks plus a one-chunk answer, against the local fake server, 100 measured turns per loop; overhead is the loop's turn time minus a bare `httpx` client reading the same stream. AMD Ryzen 9 6900HS, Python 3.12.3.
-- **Scenarios:** `uv run bakeoff scenario --all --impl our,pydantic`. All 22 pass for both loops, R01–R05 (the Responses API) included.
+- **Scenarios:** `uv run bakeoff scenario --all --impl our,pydantic`. All 28 pass for both loops, R01–R07 (the Responses API) included.
 - **Engine fit:** `./scripts/engine_fit.sh` asks uv to resolve each loop's dependencies together with the engine's pins.
 - **Live runs:** `bakeoff live` on 2026-09-25, `gpt-6-luna` on api.openai.com, a 20-step cap, unattended, and the prompt *"Build a RocketRide pipeline that answers questions from a chat using an LLM, save it as chat.pipe, and validate it."* Three runs per loop on chat completions with reasoning `none` (7 or 8 steps each), and two per loop on the Responses API (`--api responses`) with reasoning `xhigh` (10 to 13 steps). Medians per step, because the model chooses how many steps to take. Every run ended with `end_turn`, its one `validate_pipeline` call returned 0 errors and 0 warnings (on MockEngine, which carries the real RocketRide node catalog), and the invariants checked on live runs (I2, I3, I5, I7) held. Each run's key fields, validation result included, are kept in [`docs/results/live-2026-09-25.json`](docs/results/live-2026-09-25.json) (chat completions) and [`docs/results/live-responses-2026-09-25.json`](docs/results/live-responses-2026-09-25.json) (Responses API), written by [`scripts/snapshot_live.py`](scripts/snapshot_live.py), so these figures can be checked without paying for new runs.
 - **Responses API lines:** `bakeoff.metrics.loc` before and after each loop's PR. B: 713 → 869 ([#13](https://github.com/kgarg2468/harness-bakeoff/pull/13); 332 → 468 ported from Pi). A: 681 → 778 ([#14](https://github.com/kgarg2468/harness-bakeoff/pull/14)). The first-cut figures are the line tables in the PRs' descriptions (B 853, A 727).
@@ -70,25 +70,26 @@ New to the repo? [`docs/learn/bakeoff-101.html`](docs/learn/bakeoff-101.html) is
 A turn starts with your message. The shared runner saves it and hands the loop the whole history. Boxes with a coloured border are the loop's own code, A or B; the grey ones are shared.
 
 - **Each step is one streamed model request.** The loop builds it from the full history and streams the answer: text, reasoning and tool calls. B builds each request from cached bytes and starts read-only tools while the model is still streaming; A does it all through pydantic-ai's `Agent.iter()`.
-- **The loop only yields events.** It never writes the log, git or the screen itself. The shared runner saves each item to a SQLite session log, publishes each event, and ends a completed turn with one git commit in the thread's working copy.
+- **The loop only yields events.** It never writes the log, the working copy or the screen itself. The shared runner saves each item to a SQLite session log, publishes each event, and ends a completed turn by saving a version of the thread's working copy (one git commit here) and publishing `turn.saved`.
 - **Tools go through one shared ToolHost.** It checks arguments against each tool's JSON schema, applies the permission rules (allow, ask or deny, per tool and per file pattern) and times every run. The tools are RocketRide's: list, describe and validate pipeline components against the real node catalog, read and edit files, and load the RocketRide pipeline skills.
 - **Ask means pause.** The turn ends as `paused`. You approve or deny later, even from another process (`bakeoff approve`), and the turn picks up where it stopped. A denied call never runs; the model gets the reason as its result.
+- **A tool that runs for minutes makes the turn wait.** Its call gets no result yet, and the turn ends as `waiting`. The result comes back later, from any process (`bakeoff deliver`), and the turn picks up; until the last one arrives, the loop sends nothing and nothing runs twice.
 - **A crash is just another resume.** If the worker dies mid-turn, `bakeoff resume` rebuilds the turn from the saved history. A tool whose result was saved never runs twice.
 
-The seam is [`src/bakeoff/shared/contract.py`](src/bakeoff/shared/contract.py): one `Loop` protocol and eight rules every loop follows. [`DESIGN.md`](DESIGN.md) has the rest.
+The seam is [`src/bakeoff/shared/contract.py`](src/bakeoff/shared/contract.py): one `Loop` protocol and nine rules every loop follows, plus what the runtime around it promises: the events it may deliver without storing, and that a turn runs in its own task, in one place at a time. A user message may carry images, the system prompt and the permission rules may change between turns (a note in the history says so), and the loop says when the context is nearly full, so the runtime can compact. [`DESIGN.md`](DESIGN.md) has the rest.
 
 ## How we keep it fair
 
 <p align="center">
-  <img src="docs/assets/fairness.svg" alt="The same test for both loops. A, pydantic-ai, and B, our own loop, each talk to the same fake model server, fakeprov on 127.0.0.1, which plays 22 scripted scenarios, with a fresh copy of each script per loop. Every request a loop sends, the session log and the git working copy are recorded. Both loops are judged the same way from those recordings only: each scenario's checks and the invariants I1, I2, I3, I5 and I7 give a pass or fail matrix (I6, no traffic beyond this machine, is enforced by a network guard instead). The rules from FAIRNESS.md: predictions were written before either loop; A is used the way the pydantic-ai docs recommend, per A_CHECKLIST.md, which its reviewer can change; both loops have the same feature floor (retries, cost, cancel, approvals, crash resume); and there is no automatic winner: the report shows evidence and people decide." width="880">
+  <img src="docs/assets/fairness.svg" alt="The same test for both loops. A, pydantic-ai, and B, our own loop, each talk to the same fake model server, fakeprov on 127.0.0.1, which plays 28 scripted scenarios, with a fresh copy of each script per loop. Every request a loop sends, the session log and the git working copy are recorded. Both loops are judged the same way from those recordings only: each scenario's checks and the invariants I1, I2, I3, I5 and I7 give a pass or fail matrix (I6, no traffic beyond this machine, is enforced by a network guard instead). The rules from FAIRNESS.md: predictions were written before either loop; A is used the way the pydantic-ai docs recommend, per A_CHECKLIST.md, which its reviewer can change; both loops have the same feature floor (retries, cost, cancel, approvals, crash resume); and there is no automatic winner: the report shows evidence and people decide." width="880">
 </p>
 
 - **One seam.** Only `our_version/` and `pydantic_version/` are counted. Everything else is shared and identical for both.
 - **Same scenarios, same fake model.** `fakeprov` is a scripted OpenAI- and OpenRouter-style streaming server on 127.0.0.1. Each loop gets its own copy of the same script, and every request body is recorded.
-- **Judged from the outside.** Pass or fail comes only from the recorded requests and the session log, never from what a loop reports about itself. Every scenario also checks the invariants: **I1** history is append-only, **I2** every tool call gets exactly one result, **I3** the event sequence has no gaps, **I5** the loop prints nothing, **I7** one git commit per completed turn. A socket guard enforces **I6**: no connection leaves 127.0.0.1.
+- **Judged from the outside.** Pass or fail comes only from the recorded requests and the session log, never from what a loop reports about itself. Every scenario also checks the invariants: **I1** history is append-only, **I2** every tool call gets exactly one result, **I3** the event sequence has no gaps, **I5** the loop prints nothing, **I7** one saved version (a git commit) per completed turn. A socket guard enforces **I6**: no connection leaves 127.0.0.1.
 - **Predictions first.** [`PREDICTIONS.md`](PREDICTIONS.md) was committed before either loop was written.
 - **A is used the recommended way.** [`A_CHECKLIST.md`](A_CHECKLIST.md) ties each choice to the pydantic-ai docs, and its reviewer can change A to match. It also lists the code A had to add and the library behaviours it works around.
-- **Same feature floor.** Both loops have retries with backoff, provider-reported cost, feedback on bad tool arguments, cancel, a step cap, approvals that survive a restart, and crash resume. Each is covered by a test, so neither loop looks small by skipping work.
+- **Same feature floor.** Both loops have retries with backoff, provider-reported cost, feedback on bad tool arguments, cancel, a step cap, approvals that survive a restart, tool results that arrive later, images in user messages, a signal when the context is nearly full, and crash resume. Each is covered by a test, so neither loop looks small by skipping work.
 - **No automatic winner.** The report shows evidence for each side, including scenarios that favour A. People decide.
 
 ## Quick start
@@ -135,9 +136,9 @@ src/bakeoff/
   our_version/         B: our loop on raw httpx (counted; files ported from Pi say so at the top)
   shared/              everything else, identical for both
     contract.py        the seam: the Loop protocol, Item and Event types, the rules (read this first)
-    runner.py          drives one turn: loop events -> session log -> publish -> git commit
+    runner.py          drives one turn: loop events -> session log -> publish -> save a version
     sessionlog.py      SQLite log of threads, turns, items and events
-    workcopy.py        one git working copy per thread; one commit per completed turn
+    workcopy.py        the Workspace the runner saves to; WorkCopy: one git repository per thread
     toolhost.py        tool registry, argument checks, permission checks, tool timing
     permissions.py     allow / ask / deny rules with wildcards (ported from OpenCode)
     tools/             file tools, RocketRide engine tools, load_skill
@@ -163,10 +164,10 @@ out/                   generated runs, metrics and report (gitignored)
 
 ## Scenarios
 
-Each scenario is a JSON script: the user's turns, approvals, cancels and crashes, plus what the fake model answers. Every loop plays the same script.
+Each scenario is a JSON script: the user's turns, approvals, tool results that arrive later, cancels and crashes, plus what the fake model answers. Every loop plays the same script.
 
 <details>
-<summary><strong>All 22 scenarios</strong></summary>
+<summary><strong>All 28 scenarios</strong></summary>
 
 | ID | What happens | Passes when |
 | --- | --- | --- |
@@ -187,13 +188,19 @@ Each scenario is a JSON script: the user's turns, approvals, cancels and crashes
 | S13 | A BYOK endpoint, a non-OpenAI model name, reasoning asked for | the reasoning parameter reaches the wire |
 | S14 | A strict BYOK endpoint that answers 400 to `reasoning`, `reasoning_effort` or `stream_options` | the turn finishes |
 | S15 | Compaction: the runner adds a summary item | the next request is system prompt, summary, new message |
+| S16 | Two calls start work that runs for minutes, one runs now; a new process delivers both results and is killed after the first is saved; crash resume | the turn waits, then goes on with one result per call; nothing runs twice |
+| S17 | Between turns, a new system prompt, and rules under which a write asks | the next request has the new prompt, the same history and a note of the change; the write asks, then runs once |
+| S18 | A user message with a text part and two images, one by URL and one inline | the parts reach the model as sent, in every request |
+| S19 | The input fills 82%, then 86% of the context window in one turn; the runtime compacts before the next | one `context.near_limit`; the next request is system prompt, summary, new message |
 | R01 | Responses API, `gpt-6-luna` at effort `xhigh`: text only | a stateless request (`store: false`, encrypted reasoning); exact text; usage |
 | R02 | Reasoning and one function call, then the answer | the reasoning item is replayed exactly as sent; the tool runs once |
 | R03 | Commentary and three calls in one response; the write asks; approve in a new process | as S05, and the resumed request replays reasoning, commentary and all calls |
 | R04 | 429, then OK; next turn an error event mid-stream, then OK | waited per `Retry-After`; nothing of the failed attempt is replayed |
 | R05 | Cancel while reasoning streams | stops within 200 ms; the next turn passes the encrypted-reasoning check |
+| R06 | The message with images, on the Responses API | `input_text` and `input_image` parts, in every request |
+| R07 | Two calls wait, one runs; one result arrives, then the other from a new process | no request while a call still waits; then one result per call, and the reasoning item replayed as sent |
 
-Both loops pass R01–R05: B since [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13), A since [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14). A loop's expected failures (none on `main` now) are listed in [`loops.py`](src/bakeoff/loops.py) with the exact checks they fail, so a fix shows up as clearly as a regression.
+Both loops pass R01–R07 (R01–R05 since [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13) for B and [#14](https://github.com/kgarg2468/harness-bakeoff/pull/14) for A). A loop's expected failures (none on `main` now) are listed in [`loops.py`](src/bakeoff/loops.py) with the exact checks they fail, so a fix shows up as clearly as a regression.
 
 </details>
 
@@ -206,22 +213,22 @@ Only what the measurements show, plus a few design properties labelled as such. 
 - **Installs less:** 12 packages (3.9 MB) against 35 (35.4 MB).
 - **Starts faster:** a cold import takes 71.4 ms against 1.19 s.
 - **Adds less on top of the model:** 12.8 ms against 369.8 ms per benchmark turn (p50; p95 18.1 ms against 379.8 ms), or 6.4 against 184.1 µs per streamed chunk. At its peak the process holds 3.3 MB more than before the loop was imported, against 67.4 MB more (import, warm-up and benchmark turns).
-- **Starts tools early:** 20 read-only tool runs started while the model was still streaming, against 0, across the 22 scenarios.
-- **Reuses connections:** 29 connections against 56 for the same 59 requests, in the 22 scenarios where both loops sent the same number of requests.
+- **Starts tools early:** 29 read-only tool runs started while the model was still streaming, against 0, across the 28 scenarios.
+- **Reuses connections:** 36 connections against 70 for the same 74 requests, in the 28 scenarios where both loops sent the same number of requests.
 - **Less time per step on the Responses API, over 2 runs:** median 6.31 s against 7.19 s with reasoning `xhigh` (10 and 12 steps against 12 and 13). Only 2 runs each, and the time is mostly the model's, so this is a hint, not a settled result.
 - **Fits the engine as it moves:** it needs only packages the engine already ships. A can't take pydantic-ai 2.32 or later until the engine's crewai node accepts openai 3.
 - **Nothing to work around (by design):** [`A_CHECKLIST.md`](A_CHECKLIST.md) lists the library behaviours A had to work around, such as OpenRouter's string error code and retrying a stream that fails midway.
 
 **A, pydantic-ai:**
 
-- **Less of its own code:** 778 lines against 869.
+- **Less of its own code:** 838 lines against 936.
 - **New provider APIs are mostly settings:** Responses API support took +97 lines against +156 for B, 136 of those ported from Pi ([#14](https://github.com/kgarg2468/harness-bakeoff/pull/14) and [#13](https://github.com/kgarg2468/harness-bakeoff/pull/13)). The first cuts were +46 against +140.
-- **Features come with the library (by design):** retries, usage limits, approvals (deferred tools), cancellation and the message history format are pydantic-ai's, so fixes and new features arrive with upgrades.
+- **Features come with the library (by design):** retries, usage limits, approvals and tools that run for minutes (deferred tools), cancellation and the message history format are pydantic-ai's, so fixes and new features arrive with upgrades.
 - **Many providers behind one interface (by design):** OpenAI, Anthropic, Gemini and more, should the engine ever need more than OpenAI-compatible endpoints.
 
 **Too close to call:**
 
-- **Scenarios:** 22 / 22 each, R01–R05 (the Responses API) included.
+- **Scenarios:** 28 / 28 each, R01–R07 (the Responses API) included.
 - **Live runs:** all 10 runs wrote `chat.pipe` and validated it with 0 errors. On chat completions, time per step (median 1.49 s against 1.60 s) and input tokens per step (20,475 against 21,433) are within 10%. On the Responses API, input tokens per step are too (24,827 against 25,818).
 
 ## More
@@ -235,7 +242,7 @@ Only what the measurements show, plus a few design properties labelled as such. 
 | `bakeoff report` | Build `out/report.html` from `out/runs/latest`, `out/live` and `out/metrics.json` |
 | `bakeoff live` | One prompt against a real model, per loop, side by side |
 | `bakeoff chat` | A REPL on one loop: approvals prompted, `/revert N`, `/compact TEXT`, `/exit` |
-| `bakeoff turn` · `approve` · `deny` · `resume` · `cancel` | Act on one thread of a session log from a separate process; the scenario driver uses these for approval in a new process and for crash resume |
+| `bakeoff turn` · `approve` · `deny` · `deliver` · `resume` · `cancel` | Act on one thread of a session log from a separate process; the scenario driver uses these for approvals and tool results in a new process and for crash resume |
 | `bakeoff fakeprov` | Serve the fake model server on 127.0.0.1 (`--port`), or check every scenario file (`--check`) |
 | `python -m bakeoff.metrics.collect` | Lines, dependencies (`--deps`) and overhead (`--bench full`) into `out/metrics.json` |
 | `python -m bakeoff.metrics.bench` | The harness overhead benchmark alone |
@@ -279,7 +286,7 @@ A run id is never reused. Wire recordings (scenario runs only) hold request bodi
 <details>
 <summary><strong>Status</strong></summary>
 
-Both loops are complete: all 22 scenarios, chat completions and the Responses API, live runs on `gpt-6-luna`. Each piece landed through a reviewed pull request. A third loop, `hybrid` (our loop on pydantic-ai's model layer), is registered in `loops.py` but not built yet.
+Both loops are complete: all 28 scenarios, chat completions and the Responses API, live runs on `gpt-6-luna`. Each piece landed through a reviewed pull request. A third loop, `hybrid` (our loop on pydantic-ai's model layer), is registered in `loops.py` but not built yet.
 
 </details>
 

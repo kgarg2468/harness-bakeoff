@@ -55,11 +55,11 @@ class StubTools:
     def specs(self) -> list[ToolSpec]:
         return SPECS
 
-    def check(self, call: ToolCall) -> Any:
+    async def check(self, call: ToolCall) -> Any:
         return self.rules.get(call.name, "allow")
 
     async def run(self, call: ToolCall) -> ToolResult:
-        if self.check(call) == "deny":
+        if await self.check(call) == "deny":
             return ToolResult(call.id, False, "denied by rule")
         self.run_counts[call.id] += 1
         self.started.set()
@@ -394,6 +394,206 @@ async def test_calls_after_an_ask_wait_for_the_answer() -> None:
         ("c0", "write_file ok"),
         ("c1", "validated v2"),
     ]
+
+
+class AwaitedRules(StubTools):
+    """Permission rules that take a moment to read, as from a database."""
+
+    async def check(self, call: ToolCall) -> Any:
+        await asyncio.sleep(0.01)
+        return await super().check(call)
+
+
+async def test_awaited_permission_rules_decide_as_before() -> None:
+    """`check()` is awaited on the early-start path and when the step's calls are scheduled."""
+    tools = AwaitedRules(rules={"write_file": "ask"})
+    seen: list[dict[str, int]] = []
+
+    async def body() -> AsyncIterator[bytes]:
+        yield sse_bytes(call(0, '{"name": "a"}', "c0", "describe_component"))
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(tools.started.wait(), 1)
+        seen.append(dict(tools.run_counts))
+        yield sse_bytes(call(1, WRITE, "c1", "write_file"), finish("tool_calls"))
+
+    history = [user("go")]
+    paused = await run(Server(lambda: httpx.Response(200, content=body())).loop(), history, tools)
+    assert seen == [{"c0": 1}]  # the read started while the model was still streaming
+    assert paused[-1].data == {"stop": "paused", "steps": 1, "pending": ["c1"]}
+    history += [persisted(it) for it in items(paused)]
+    resume = Resume("approval", {"c1": "allow"})
+    resumed = await run(Server(reply("ok")).loop(), history, tools, resume=resume)
+    assert tools.run_counts == {"c0": 1, "c1": 1}
+    assert resumed[-1].data == {"stop": "end_turn", "steps": 2}
+
+
+class Background(StubTools):
+    """StubTools whose `background` tools only start their work: the result is pending."""
+
+    def __init__(self, background: set[str], **kwargs: Any):
+        super().__init__(**kwargs)
+        self.background = background
+        self.running: dict[str, asyncio.Event] = {}  # set when a call's tool starts
+
+    async def run(self, call: ToolCall) -> ToolResult:
+        self.running.setdefault(call.id, asyncio.Event()).set()
+        if call.name not in self.background:
+            return await super().run(call)
+        self.run_counts[call.id] += 1
+        return ToolResult(call.id, True, f"{call.name} started", pending=True)
+
+
+def waiting_batch() -> httpx.Response:
+    return sse(
+        call(0, '{"pipeline": {}}', "c0", "validate_pipeline"),  # starts work for later
+        call(1, '{"name": "a"}', "c1", "describe_component"),
+        call(2, '{"path": "a.pipe", "content": "x"}', "c2", "write_file"),
+        call(3, '{"pipeline": {}}', "c3", "validate_pipeline"),  # starts work for later
+        finish("tool_calls"),
+    )
+
+
+def delivered(call_id: str, text: str = "valid") -> ToolResult:
+    return ToolResult(call_id, True, f"{call_id}: {text}")
+
+
+async def test_a_tool_that_runs_for_minutes_makes_the_turn_wait() -> None:
+    """Rule 9: the step's other calls run as usual; the pending ones get no result yet, and the
+    turn ends waiting for them, without another request."""
+    tools = Background({"validate_pipeline"})
+    history = [user("check it")]
+    first = Server(waiting_batch())
+    events = await run(first.loop(), history, tools)
+    assert events[-1].data == {"stop": "waiting", "steps": 1, "pending": ["c0", "c3"]}
+    assert [it.message.get("tool_call_id") for it in items(events)] == [None, "c1", "c2"]
+    assert tools.run_counts == {"c0": 1, "c1": 1, "c2": 1, "c3": 1}
+    history += [persisted(it) for it in items(events)]
+
+    # One result comes: still waiting for the other, and no request.
+    part = Resume("tool_result", results={"c0": delivered("c0")}, waiting=("c3",))
+    events = await run(Server().loop(), history, tools, resume=part)
+    assert events[-1].data == {"stop": "waiting", "steps": 1, "pending": ["c3"]}
+    assert [it.message for it in items(events)] == [
+        {"role": "tool", "tool_call_id": "c0", "content": "c0: valid"}
+    ]
+    history += [persisted(it) for it in items(events)]
+
+    # A crash resume while it waits never runs the waiting call and sends nothing either.
+    crash = Resume("crash", waiting=("c3",))
+    events = await run(Server().loop(), history, tools, resume=crash)
+    assert events[-1].data == {"stop": "waiting", "steps": 1, "pending": ["c3"]} and not items(
+        events
+    )
+
+    # The last result: the next request has exactly one result per call, none run twice.
+    rest = Resume("tool_result", results={"c3": delivered("c3", "1 error")})
+    last = Server(reply("c0 is valid, c3 has an error."))
+    events = await run(last.loop(), history, tools, resume=rest)
+    assert events[-1].data == {"stop": "end_turn", "steps": 2}
+    history += [persisted(it) for it in items(events)]
+    assert_no_orphans(history)
+    sent = [m.get("tool_call_id") for m in last.messages(0) if m["role"] == "tool"]
+    assert sorted(sent) == ["c0", "c1", "c2", "c3"]
+    assert tools.run_counts == {"c0": 1, "c1": 1, "c2": 1, "c3": 1}
+    assert last.bodies[0].startswith(first.bodies[0][:-2])  # the prefix held throughout
+
+
+async def test_a_delivered_failure_is_the_calls_result() -> None:
+    tools = Background({"validate_pipeline"})
+    history = [user("check it")]
+    history += [
+        persisted(it) for it in items(await run(Server(waiting_batch()).loop(), history, tools))
+    ]
+    failed = {c: ToolResult(c, False, f"{c}: engine down", "failed") for c in ("c0", "c3")}
+    server = Server(reply("Both failed."))
+    events = await run(server.loop(), history, tools, resume=Resume("tool_result", results=failed))
+    assert events[-1].data == {"stop": "end_turn", "steps": 2}
+    sent = {m["tool_call_id"]: m["content"] for m in server.messages(0) if m["role"] == "tool"}
+    assert (sent["c0"], sent["c3"]) == ("c0: engine down", "c3: engine down")
+
+
+async def test_an_ask_pauses_and_the_waiting_calls_wait_on() -> None:
+    tools = Background({"validate_pipeline"}, rules={"write_file": "ask"})
+    history = [user("check it")]
+    events = await run(Server(waiting_batch()).loop(), history, tools)
+    assert events[-1].data == {"stop": "paused", "steps": 1, "pending": ["c2"]}
+    assert tools.run_counts == {"c0": 1, "c1": 1}  # c3 comes after the ask: not yet
+    history += [persisted(it) for it in items(events)]
+    approve = Resume("approval", {"c2": "allow"}, waiting=("c0",))
+    events = await run(Server().loop(), history, tools, resume=approve)
+    assert events[-1].data == {"stop": "waiting", "steps": 1, "pending": ["c0", "c3"]}
+    assert [it.message["tool_call_id"] for it in items(events)] == ["c2"]
+    assert tools.run_counts == {"c0": 1, "c1": 1, "c2": 1, "c3": 1}
+
+
+async def test_a_cancel_gives_a_waiting_call_a_result() -> None:
+    tools = Background({"validate_pipeline"}, delays={"write_file": 10})
+    cancel = asyncio.Event()
+
+    async def cancel_when_writing() -> None:
+        await tools.running.setdefault("c2", asyncio.Event()).wait()
+        cancel.set()
+
+    canceller = asyncio.ensure_future(cancel_when_writing())
+    history = [user("check it")]
+    async with asyncio.timeout(2):
+        events = await run(Server(waiting_batch()).loop(), history, tools, cancel)
+    await canceller
+    assert events[-1].data == {"stop": "cancelled", "steps": 1}
+    results = {it.message["tool_call_id"]: it.message["content"] for it in items(events)[1:]}
+    assert results == {
+        "c0": "Cancelled by user",  # its work started, but the turn was cancelled
+        "c1": "describe_component ok",
+        "c2": "Cancelled by user",
+        "c3": "Cancelled by user",
+    }
+    assert_no_orphans(history + items(events))
+
+
+async def test_a_cancel_keeps_a_delivered_result() -> None:
+    tools = Background({"validate_pipeline"})
+    history = [user("check it")]
+    history += [
+        persisted(it) for it in items(await run(Server(waiting_batch()).loop(), history, tools))
+    ]
+    cancel = asyncio.Event()
+    cancel.set()
+    deliver = Resume("tool_result", results={"c0": delivered("c0")}, waiting=("c3",))
+    events = await run(Server().loop(), history, tools, cancel, resume=deliver)
+    assert events[-1].data == {"stop": "cancelled", "steps": 1}
+    results = {it.message["tool_call_id"]: it.message["content"] for it in items(events)}
+    assert results == {"c0": "c0: valid", "c3": "Cancelled by user"}
+
+
+class SlowRules(StubTools):
+    """Permission rules that take a second to read (a slow database)."""
+
+    async def check(self, call: ToolCall) -> Any:
+        await asyncio.sleep(1)
+        return await super().check(call)
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [("describe_component", '{"name": "a"}'), ("write_file", WRITE)],
+    ids=["early-start", "scheduling"],
+)
+async def test_a_cancel_does_not_wait_for_a_slow_permission_check(
+    name: str, arguments: str
+) -> None:
+    """`check()` runs where the cancel watcher can stop it: while a read-only call is checked
+    for an early start mid-stream, and while the step's calls are checked after it."""
+    server = Server(sse(call(0, arguments, "c0", name), finish("tool_calls")))
+    cancel = asyncio.Event()
+    turn_task = asyncio.ensure_future(run(server.loop(), [user("go")], SlowRules(), cancel))
+    await asyncio.sleep(0.1)  # the check is under way
+    cancelled_at = time.perf_counter()
+    cancel.set()
+    async with asyncio.timeout(2):
+        events = await turn_task
+    assert time.perf_counter() - cancelled_at < 0.2
+    assert events[-1].data["stop"] == "cancelled"
+    assert_no_orphans([user("go"), *items(events)])
 
 
 def approval_batch() -> httpx.Response:
@@ -990,6 +1190,85 @@ async def test_crash_after_an_incomplete_answer_asks_again(usage: dict[str, Any]
     assert of(events, "request.start") == [{"step": 2, "attempt": 1}]  # not end_turn
     assert server.messages(0) == [{"role": "system", "content": SYSTEM}, user("go").message]
     assert items(events)[0].message["content"] == "Done." and events[-1].data["stop"] == "end_turn"
+
+
+def step_reply(n: int, prompt_tokens: int) -> httpx.Response:
+    """A response with one read call (id c<n>) that used `prompt_tokens` of input."""
+    usage = {"prompt_tokens": prompt_tokens, "completion_tokens": 5}
+    return sse(
+        call(0, '{"name": "a"}', f"c{n}", "describe_component"),
+        finish("tool_calls", usage),
+        "data: [DONE]",
+    )
+
+
+async def test_context_near_limit_is_said_once_per_turn_after_the_usage() -> None:
+    """At 80% of the context window (8,000 of 10,000 tokens) the loop says so, once in a turn,
+    right after the step's usage. Compacting is the runtime's decision, between turns."""
+    answer = sse(delta(content="done"), finish("stop", {"prompt_tokens": 9_500}), "data: [DONE]")
+    server = Server(step_reply(0, 7_999), step_reply(1, 8_000), step_reply(2, 9_000), answer)
+    model = ModelConfig(base_url=MODEL.base_url, model=MODEL.model, context_window=10_000)
+    history = [user("go")]
+    events = await run(server.loop(), history, StubTools(), model=model)
+    near = [n for n, e in enumerate(events) if e.type == "context.near_limit"]
+    assert [events[n].data for n in near] == [{"input_tokens": 8_000, "context_window": 10_000}]
+    assert events[near[0] - 1].data == of(events, "usage")[1]  # right after step 2's usage
+    # A new turn says it again; without a known window nothing is said.
+    history += [*items(events), user("more")]
+    again = await run(Server(reply("ok")).loop(), history, StubTools(), model=model)
+    assert of(again, "context.near_limit") == []  # "ok" used no tokens: below the limit
+    hot = sse(delta(content="ok"), finish("stop", {"prompt_tokens": 9_900}), "data: [DONE]")
+    again = await run(Server(hot).loop(), history, StubTools(), model=model)
+    assert of(again, "context.near_limit") == [{"input_tokens": 9_900, "context_window": 10_000}]
+    unknown = await run(Server(hot).loop(), history, StubTools())
+    assert of(unknown, "context.near_limit") == []
+
+
+PARTS = [
+    {"type": "text", "text": "What is in this sketch?"},
+    {"type": "image_url", "image_url": {"url": "https://example.com/sketch"}},
+    {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo=", "detail": "low"},
+    },
+]
+
+
+async def test_user_content_parts_go_out_as_given() -> None:
+    """Chat completions take the chat content parts the runner stored, text and images alike."""
+    server = Server(reply("A sketch."))
+    parts_user = Item("u1", "t0", {"role": "user", "content": PARTS})
+    await run(server.loop(), [parts_user], StubTools())
+    assert server.messages(0)[1] == {"role": "user", "content": PARTS}
+    assert json.dumps(PARTS, separators=(",", ":")).encode() in server.bodies[0]
+
+
+NOTE = {"role": "user", "content": "[harness] Configuration changed: a new system prompt."}
+
+
+async def test_a_new_system_prompt_rebuilds_the_cached_prefix() -> None:
+    """The request prefix is cached per thread and keyed on the system prompt (among others). A
+    turn with a new one, after the runner changed the thread's settings, sends it, then the
+    history as before, byte for byte."""
+    server = Server(reply("one"), reply("two"))
+    loop, tools = server.loop(), StubTools()
+    history = [user("hi")]
+    history += items(await run(loop, history, tools))
+    history += [Item("n1", "t2", NOTE), user("again")]
+    changed = TurnInput("thread-1", "t2", "You fix pipelines.", history, None, Limits(), MODEL)
+    events = [e async for e in loop.run_turn(changed, tools, asyncio.Event())]
+    assert events[-1].data["stop"] == "end_turn"
+    first, second = server.messages(0), server.messages(1)
+    assert first[0] == {"role": "system", "content": SYSTEM}
+    assert second == [
+        {"role": "system", "content": "You fix pipelines."},
+        *first[1:],
+        {"role": "assistant", "content": "one"},
+        NOTE,
+        history[-1].message,
+    ]
+    tail = server.bodies[0][server.bodies[0].index(b'{"role":"user"') : -2]
+    assert tail in server.bodies[1]
 
 
 async def test_compaction_item_resets_the_prefix() -> None:

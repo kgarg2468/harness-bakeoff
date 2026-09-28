@@ -1,0 +1,81 @@
+{
+  "id": "R07",
+  "title": "Responses API: two calls wait, one runs; one result delivered, still waiting, then the other in a new process",
+  "system": "You are Rocket Agent. You build and fix RocketRide pipelines (.pipe JSON files) in the working copy with the tools provided. Validate every pipeline you write before you answer.",
+  "model": {
+    "kind": "openai_responses",
+    "model": "gpt-6-luna",
+    "reasoning": {"effort": "xhigh"},
+    "temperature": null
+  },
+  "rules": {"*": "allow"},
+  "limits": {"max_steps": 12},
+  "engine": {"delay_ms": 0},
+  "strict": {
+    "reject_params": ["temperature", "max_tokens", "max_completion_tokens", "reasoning_effort"],
+    "reject_unencrypted_reasoning": true
+  },
+  "background_tools": ["validate_pipeline"],
+  "driver": [
+    {"user": "Validate chat.pipe and rag.pipe, and tell me what the chat component does."},
+    {"deliver": {"call_R07_1": "chat.pipe: 0 errors, 0 warnings."}, "new_process": false},
+    {
+      "deliver": {"call_R07_3": "rag.pipe: 1 error: lane 'documents' has no source."},
+      "new_process": true
+    }
+  ],
+  "exchanges": [
+    {
+      "note": "Reasoning, then three calls: the two validate_pipeline calls wait, describe_component runs.",
+      "expect": {"input_len": 1, "last_role": "user"},
+      "respond": {
+        "stream": [
+          {
+            "reasoning_item": {
+              "id": "rs_R07_1",
+              "encrypted_content": "gAAAAABpR07-waiting-for-two-validations-encrypted",
+              "summary": ["Validate both, describe chat."]
+            }
+          },
+          {
+            "tool_calls": [
+              {"id": "call_R07_1", "name": "validate_pipeline", "arguments": {"path": "chat.pipe"}},
+              {"id": "call_R07_2", "name": "describe_component", "arguments": {"name": "chat"}},
+              {"id": "call_R07_3", "name": "validate_pipeline", "arguments": {"path": "rag.pipe"}}
+            ]
+          },
+          {"completed": {"input_tokens": 1900, "output_tokens": 60, "reasoning_tokens": 20}}
+        ]
+      }
+    },
+    {
+      "note": "The first delivery left call_R07_3 waiting, so it sent nothing; the second, in a new process, sends every result once, the reasoning replayed as sent.",
+      "expect": {
+        "input_len": 8,
+        "last_type": "function_call_output",
+        "reasoning_replayed": ["rs_R07_1"],
+        "tool_result_contains": {
+          "call_R07_1": "0 errors",
+          "call_R07_2": "questions",
+          "call_R07_3": "no source"
+        }
+      },
+      "respond": {
+        "stream": [
+          {
+            "text": "chat.pipe is valid; rag.pipe has one error. The chat component reads questions from a chat.",
+            "phase": "final_answer"
+          },
+          {"completed": {"input_tokens": 2200, "output_tokens": 30}}
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "stops": ["waiting", "waiting", "end_turn"],
+    "requests": 2,
+    "commits": 1,
+    "tool_runs": {"call_R07_1": 1, "call_R07_2": 1, "call_R07_3": 1},
+    "text_contains": "rag.pipe has one error"
+  }
+}

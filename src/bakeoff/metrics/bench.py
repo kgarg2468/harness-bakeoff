@@ -124,7 +124,7 @@ class NoopTools:
         """The shared tool specs, in the usual order."""
         return [tool.spec for tool in TOOLS]
 
-    def check(self, call: ToolCall) -> Decision:
+    async def check(self, call: ToolCall) -> Decision:
         """Everything is allowed."""
         return "allow"
 

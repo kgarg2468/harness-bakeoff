@@ -540,8 +540,8 @@ SCENARIO_FILES = sorted(SCENARIOS_DIR.glob("*.json"))
 
 
 def test_every_designed_scenario_exists():
-    expected = {f"S{n:02d}" for n in range(1, 16)} - {"S10"} | {"S10a", "S10b", "S12b"}
-    expected |= {f"R{n:02d}" for n in range(1, 6)}  # the Responses API scenarios
+    expected = {f"S{n:02d}" for n in range(1, 20)} - {"S10"} | {"S10a", "S10b", "S12b"}
+    expected |= {f"R{n:02d}" for n in range(1, 8)}  # the Responses API scenarios
     assert {p.stem for p in SCENARIO_FILES} == expected
 
 
@@ -575,9 +575,16 @@ def test_scenario_file_is_valid_and_consistent(path: Path):
         ),
         (
             lambda s: s["driver"].append({"crash_after": "tool.end"}),
-            "$.driver[1]: crash_after must be followed by a user step",
+            "$.driver[1]: crash_after must be followed by a user or deliver step",
         ),
         (lambda s: s["driver"].insert(0, {"crash_after": "boom"}), "$.driver[0].crash_after"),
+        (
+            lambda s: (
+                s["driver"].insert(0, {"crash_after": "item"}),
+                s["driver"][1].update(system="x"),
+            ),
+            "$.driver[1]: the user step after crash_after takes text only, no settings",
+        ),
         (
             lambda s: s["driver"].insert(0, {"crash_after": "turn.end", "call_id": "call_1"}),
             "$.driver[0].call_id: turn.end events name no tool call",
@@ -587,6 +594,11 @@ def test_scenario_file_is_valid_and_consistent(path: Path):
             "$.expect: unknown tool call ids: ['call_x']",
         ),
         (lambda s: s.update(id="Other"), "$.id: 'Other' must match the file name"),
+        (
+            lambda s: s["driver"].append({"deliver": {"call_x": "done"}}),
+            "$.expect: unknown tool call ids: ['call_x']",
+        ),
+        (lambda s: s["driver"].append({"deliver": {}}), "$.driver[1].deliver"),
         (
             lambda s: s["expect"].update(tool_runs={"call_x": 1}),
             "$.expect: unknown tool call ids: ['call_x']",

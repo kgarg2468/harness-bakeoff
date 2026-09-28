@@ -10,11 +10,13 @@ Responses API, the chat-shaped view of it, without the reasoning items).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
 from pydantic_ai import (
+    ImageUrl,
     ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
@@ -30,7 +32,7 @@ from pydantic_ai.messages import INTERRUPTED_TOOL_RETURN_CONTENT
 from pydantic_ai.profiles import DEFAULT_THINKING_TAGS
 from pydantic_ai.usage import RunUsage
 
-from bakeoff.shared.contract import Item
+from bakeoff.shared.contract import Item, ToolResult, UserContent
 
 
 def dump(message: ModelMessage) -> dict[str, Any]:
@@ -48,8 +50,8 @@ def split(message: ModelMessage) -> list[ModelMessage]:
 def to_history(items: list[Item]) -> list[ModelMessage]:
     """Rebuild the native history from the last compaction item onward (contract rule 8).
 
-    Items the runner wrote (user messages, revert notes, summaries) have no native and become
-    user prompts.
+    Items the runner wrote (user messages, notes, summaries) have no native and become user
+    prompts.
     """
     start = max((i for i, item in enumerate(items) if item.compaction), default=0)
     history: list[ModelMessage] = []
@@ -57,8 +59,39 @@ def to_history(items: list[Item]) -> list[ModelMessage]:
         if item.native is not None:
             history.extend(ModelMessagesTypeAdapter.validate_python([item.native]))
         else:
-            history.append(ModelRequest(parts=[UserPromptPart(item.message["content"])]))
+            prompt = UserPromptPart(user_content(item.message["content"]))
+            history.append(ModelRequest(parts=[prompt]))
     return history
+
+
+def user_content(content: UserContent) -> str | list[str | ImageUrl]:
+    """A user message's content as pydantic-ai user content: text parts become strings and image
+    parts `ImageUrl`s (a `detail` goes in `vendor_metadata`, where the OpenAI models read it)."""
+    if isinstance(content, str):
+        return content
+    return [
+        part["text"] if part["type"] == "text" else _image(part["image_url"]) for part in content
+    ]
+
+
+def _image(image: dict[str, Any]) -> ImageUrl:
+    detail = image.get("detail")
+    return ImageUrl(image["url"], vendor_metadata={"detail": detail} if detail else None)
+
+
+def chat_content(content: Any) -> UserContent:
+    """The inverse of `user_content`: pydantic-ai user content as chat content parts."""
+    if isinstance(content, str):
+        return content
+    parts: list[dict[str, Any]] = []
+    for piece in content:
+        if isinstance(piece, ImageUrl):
+            detail = (piece.vendor_metadata or {}).get("detail")
+            image = {"url": piece.url, **({"detail": detail} if detail else {})}
+            parts.append({"type": "image_url", "image_url": image})
+        else:
+            parts.append({"type": "text", "text": str(piece)})
+    return parts
 
 
 def to_openai(message: ModelMessage, responses_api: bool = False) -> list[dict[str, Any]]:
@@ -81,7 +114,7 @@ def to_openai(message: ModelMessage, responses_api: bool = False) -> list[dict[s
         elif isinstance(part, RetryPromptPart):
             out.append({"role": "user", "content": part.model_response()})
         elif isinstance(part, UserPromptPart):
-            out.append({"role": "user", "content": part.content})
+            out.append({"role": "user", "content": chat_content(part.content)})
     return out
 
 
@@ -127,12 +160,18 @@ def pending_calls(history: list[ModelMessage]) -> list[ToolCallPart]:
     return []
 
 
-def close_pending(history: list[ModelMessage]) -> list[ModelMessage]:
+def close_pending(
+    history: list[ModelMessage], delivered: Mapping[str, ToolResult] | None = None
+) -> list[ModelMessage]:
     """Results for calls a cancel, an error or an abandoned pause left open, exactly as
-    pydantic-ai's own history repair would synthesize them before the next request. Persisting
-    them keeps rule 4 in the log."""
+    pydantic-ai's own history repair would synthesize them before the next request. A call whose
+    result was delivered for the run (contract rule 9) gets that result instead: it cannot come
+    again. Persisting them keeps rule 4 in the log."""
+    delivered = delivered or {}
     parts = [
-        ToolReturnPart(
+        _returned(call, delivered[call.tool_call_id])
+        if call.tool_call_id in delivered
+        else ToolReturnPart(
             tool_name=call.tool_name,
             content=INTERRUPTED_TOOL_RETURN_CONTENT,
             tool_call_id=call.tool_call_id,
@@ -141,6 +180,17 @@ def close_pending(history: list[ModelMessage]) -> list[ModelMessage]:
         for call in pending_calls(history)
     ]
     return [ModelRequest(parts=parts)] if parts else []
+
+
+def _returned(call: ToolCallPart, result: ToolResult) -> ToolReturnPart | RetryPromptPart:
+    """A delivered result as the library makes it from an external call's answer: a retry
+    prompt for bad arguments, else a return, failed if the work failed."""
+    if result.error == "invalid_args":
+        return RetryPromptPart(
+            result.content, tool_name=call.tool_name, tool_call_id=call.tool_call_id
+        )
+    outcome = "success" if result.ok else "failed"
+    return ToolReturnPart(call.tool_name, result.content, call.tool_call_id, outcome=outcome)
 
 
 def close_abandoned(history: list[ModelMessage]) -> list[ModelMessage]:

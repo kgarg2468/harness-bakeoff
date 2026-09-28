@@ -102,7 +102,7 @@ def our_events(thread: str = "S01-our") -> list[dict[str, Any]]:
         env(thread, t, 11, 2900, "usage", step=2, input_tokens=900, output_tokens=40, cached_tokens=0, cost_usd=0.0033, cost_source="provider"),
         env(thread, t, 12, 3000, "item", **item(t, "a2", {"role": "assistant", "content": "All done."})),
         env(thread, t, 13, 3100, "turn.end", stop="end_turn", steps=2),
-        env(thread, t, 14, 5000, "commit", sha="abc1234def", files=["a.txt"]),
+        env(thread, t, 14, 5000, "turn.saved", version="abc1234def", files=["a.txt"]),
     ]  # fmt: skip
 
 
@@ -162,7 +162,7 @@ def write_pydantic_log(path: Path, thread: str = "S01-pydantic") -> None:
         commit_sha="fff0000",
         events=[
             event_row(env(thread, t1, 11, 1800, "turn.end", stop="end_turn", steps=1)),
-            event_row(env(thread, t1, 12, 2500, "commit", sha="fff0000", files=[])),
+            event_row(env(thread, t1, 12, 2500, "turn.saved", version="fff0000", files=[])),
         ],
     )
     log.close()  # fmt: skip
@@ -294,11 +294,25 @@ def test_every_glossary_term_has_a_tooltip_on_the_page(out: Path) -> None:
     assert {label for label, _ in render.GLOSSARY.values()} - used == set()
 
 
+def test_replay_reads_the_commit_event_of_logs_from_before_turn_saved() -> None:
+    """A log written before `turn.saved` ends a saved turn with `commit` ({sha, files})."""
+    events = our_events()
+    old = events[-1]
+    events[-1] = {**old, "type": "commit", "data": {"sha": "abc1234def", "files": ["a.txt"]}}
+    turns = [{"id": old["turn"], "kind": "user", "status": "done", "late": None}]
+    replay = data.build_replay(events, turns)
+    assert [c["k"] for c in replay["cards"]][-1] == "saved"
+    assert replay["cards"][-1]["version"] == "abc1234def"
+    (marker,) = replay["lanes"]["git"]
+    assert marker["kind"] == "saved" and marker["version"] == "abc1234def"
+    assert marker["files"] == ["a.txt"]
+
+
 def test_replay_and_wire_data(out: Path) -> None:
     scenarios = {s["id"]: s for s in Page(make(out)).data["scenarios"]}
     ours = scenarios["S01"]["runs"]["our"]["replay"]
     kinds = [c["k"] for c in ours["cards"]]
-    assert kinds == ["user", "assistant", "result", "assistant", "end", "commit"]
+    assert kinds == ["user", "assistant", "result", "assistant", "end", "saved"]
     (tool,) = ours["lanes"]["tools"]
     assert tool["eager"] is True and tool["t0"] == 1.0 and tool["t1"] == 2.1  # ms
     assert [m["end"] for m in ours["lanes"]["model"]] == ["ok", "ok"]
@@ -306,7 +320,7 @@ def test_replay_and_wire_data(out: Path) -> None:
     theirs = scenarios["S01"]["runs"]["pydantic"]["replay"]
     assert [t["kind"] for t in theirs["turns"]] == ["user", "crash"]
     kinds = [c["k"] for c in theirs["cards"]]
-    assert kinds == ["user", "crash", "resume", "retry", "assistant", "end", "commit"]
+    assert kinds == ["user", "crash", "resume", "retry", "assistant", "end", "saved"]
     assert theirs["stats"]["retries"] == 1
     assert [m["end"] for m in theirs["lanes"]["model"]] == ["killed", "retry", "ok"]
     # Wire: the tool list is stored once for all three bodies, found in both layouts.
@@ -967,3 +981,12 @@ def test_older_live_results_without_a_template_still_group_their_loops(
             write_json(path, data)
     text = re.sub(r"<[^>]+>", "", make(out, live=live))
     assert "over 2 live runs of one prompt and setup" in text
+
+
+def test_an_image_part_shows_in_a_user_card():
+    parts = [
+        {"type": "text", "text": "Like this: "},
+        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+    ]
+    card = data._item_card({"message": {"role": "user", "content": parts}}, data._Calls.scan([]))
+    assert card == {"k": "user", "text": "Like this: [image]"}

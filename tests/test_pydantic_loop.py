@@ -19,7 +19,15 @@ from typing import Any
 import httpx
 import pytest
 from pai_sse_server import Reply, SSEServer, chunk, done, text, tool_call
-from pydantic_ai import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai import (
+    ImageUrl,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -86,7 +94,7 @@ class StubTools:
     def specs(self) -> list[ToolSpec]:
         return SPECS
 
-    def check(self, call: ToolCall) -> Decision:
+    async def check(self, call: ToolCall) -> Decision:
         self.checked.append(call.id)
         return self.rules.get(call.name, "allow")
 
@@ -108,7 +116,7 @@ class StubTools:
         if "path" not in args:
             invalid = "invalid arguments: 'path' is a required property"
             return ToolResult(call.id, False, invalid, error="invalid_args")
-        if self.check(call) == "deny":
+        if await self.check(call) == "deny":
             return ToolResult(call.id, False, f"Denied by permission rules: {call.name}", "denied")
         if args["path"] == "missing":
             return ToolResult(call.id, False, "No such file: missing", error="failed")
@@ -350,6 +358,30 @@ async def test_approval_pauses_then_resumes_in_a_fresh_loop(loop):
     assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
 
 
+class AwaitedRules(StubTools):
+    """Permission rules that take a moment to read, as from a database."""
+
+    async def check(self, call: ToolCall) -> Decision:
+        await asyncio.sleep(0.01)
+        return await super().check(call)
+
+
+async def test_awaited_permission_rules_pause_and_resume_as_before(loop):
+    """`check()` is awaited in the `before_tool_execute` hook, for new calls and for the calls a
+    crash resume finds open."""
+    tools = AwaitedRules({"write_file": "ask"})
+    with SSEServer(_batch(), Reply([*text("written"), done()])) as srv:
+        history = await _pause_for_write(loop, srv, tools)
+        crash = await run(loop, turn(history, config(srv), resume=Resume("crash")), tools)
+        assert of(crash, "turn.end") == [{"stop": "paused", "steps": 1, "pending": ["c2"]}]
+        history += items(crash)
+        resume = Resume("approval", {"c2": "allow"})
+        events = await run(loop, turn(history, config(srv), resume=resume), tools)
+
+    assert [c.id for c in tools.runs] == ["c1", "c2"]
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+
+
 async def test_deny_sends_the_reason_to_the_model_without_running_the_tool(loop):
     tools = StubTools({"write_file": "ask"})
     with SSEServer(_batch(), Reply([*text("ok"), done()])) as srv:
@@ -524,6 +556,142 @@ async def test_cancel_during_a_slow_tool_closes_the_open_call(loop):
     assert of(events, "turn.end") == [{"stop": "cancelled", "steps": 1}]
     tool_messages = [m for m in srv.requests[1]["messages"] if m["role"] == "tool"]
     assert sorted(m["tool_call_id"] for m in tool_messages) == ["c1", "c2"]  # no repair needed
+
+
+class Background(StubTools):
+    """StubTools whose `validate_pipeline` only starts its work: the result is pending."""
+
+    async def run(self, call: ToolCall) -> ToolResult:
+        if call.name != "validate_pipeline":
+            return await super().run(call)
+        self.runs.append(call)
+        self.running[call.id].set()
+        return ToolResult(call.id, True, "validation started", pending=True)
+
+
+def _waiting_batch() -> Reply:
+    calls = [
+        tool_call(0, "c1", "validate_pipeline", '{"path": "a.pipe"}'),  # starts work for later
+        tool_call(1, "c2", "read_file", '{"path": "a"}'),
+        tool_call(2, "c3", "write_file", '{"path": "b", "content": "x"}'),
+        tool_call(3, "c4", "validate_pipeline", '{"path": "b.pipe"}'),  # starts work for later
+    ]
+    return Reply([*(chunk for c in calls for chunk in c), done("tool_calls")])
+
+
+def _delivered(call_id: str, text: str = "valid") -> ToolResult:
+    return ToolResult(call_id, True, f"{call_id}: {text}")
+
+
+async def test_a_tool_that_runs_for_minutes_makes_the_turn_wait(loop):
+    """Rule 9 on the library's deferred tools: a pending result is an external call
+    (`CallDeferred`), a delivered one goes back in `DeferredToolResults.calls`, and a call still
+    waiting is deferred again before it can run. No request is sent while calls wait."""
+    tools = Background()
+    history = [user("check it")]
+    with SSEServer(
+        _waiting_batch(), Reply([*text("c1 is valid, c4 has an error."), done()])
+    ) as srv:
+        events = await run(loop, turn(history, config(srv)), tools)
+        assert of(events, "turn.end") == [{"stop": "waiting", "steps": 1, "pending": ["c1", "c4"]}]
+        assert sorted(i.message.get("tool_call_id") or "" for i in items(events)) == [
+            "",
+            "c2",
+            "c3",
+        ]
+        history += items(events)
+
+        part = Resume("tool_result", results={"c1": _delivered("c1")}, waiting=("c4",))
+        events = await run(loop, turn(history, config(srv), resume=part), tools)
+        assert of(events, "turn.end") == [{"stop": "waiting", "steps": 1, "pending": ["c4"]}]
+        assert [i.message for i in items(events)] == [
+            {"role": "tool", "tool_call_id": "c1", "content": "c1: valid"}
+        ]
+        history += items(events)
+
+        crash, fresh = Resume("crash", waiting=("c4",)), PydanticLoop()
+        events = await run(fresh, turn(history, config(srv), resume=crash), tools)
+        await fresh.aclose()
+        assert of(events, "turn.end") == [{"stop": "waiting", "steps": 1, "pending": ["c4"]}]
+        assert items(events) == []
+        assert len(srv.requests) == 1  # nothing was sent while a call waited
+
+        rest = Resume("tool_result", results={"c4": _delivered("c4", "1 error")})
+        events = await run(loop, turn(history, config(srv), resume=rest), tools)
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+    assert [c.id for c in tools.runs].count("c1") == 1 and [c.id for c in tools.runs].count(
+        "c4"
+    ) == 1
+    sent = [m["tool_call_id"] for m in srv.requests[1]["messages"] if m["role"] == "tool"]
+    assert sorted(sent) == ["c1", "c2", "c3", "c4"]
+    first, second = srv.requests
+    assert second["messages"][: len(first["messages"])] == first["messages"]
+
+
+async def test_a_delivered_failure_reaches_the_model_as_a_failure(loop):
+    tools = Background()
+    history = [user("check it")]
+    with SSEServer(_waiting_batch(), Reply([*text("Both failed."), done()])) as srv:
+        history += items(await run(loop, turn(history, config(srv)), tools))
+        failed = {c: ToolResult(c, False, f"{c}: engine down", "failed") for c in ("c1", "c4")}
+        events = await run(
+            loop, turn(history, config(srv), resume=Resume("tool_result", results=failed)), tools
+        )
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 2}]
+    sent = {
+        m["tool_call_id"]: m["content"] for m in srv.requests[1]["messages"] if m["role"] == "tool"
+    }
+    assert "c1: engine down" in sent["c1"] and "c4: engine down" in sent["c4"]
+
+
+async def test_an_ask_pauses_and_the_waiting_calls_wait_on(loop):
+    tools = Background({"write_file": "ask"})
+    history = [user("check it")]
+    with SSEServer(_waiting_batch()) as srv:
+        events = await run(loop, turn(history, config(srv)), tools)
+        assert of(events, "turn.end") == [{"stop": "paused", "steps": 1, "pending": ["c3"]}]
+        history += items(events)
+        approve = Resume("approval", {"c3": "allow"}, waiting=("c1", "c4"))
+        events = await run(loop, turn(history, config(srv), resume=approve), tools)
+    assert of(events, "turn.end") == [{"stop": "waiting", "steps": 1, "pending": ["c1", "c4"]}]
+    assert [i.message["tool_call_id"] for i in items(events)] == ["c3"]
+    assert sorted(c.id for c in tools.runs) == ["c1", "c2", "c3", "c4"]  # each once
+
+
+async def test_a_cancel_gives_a_waiting_call_a_result(loop):
+    tools = Background(slow="read_file")
+    cancel = asyncio.Event()
+    with SSEServer(_waiting_batch()) as srv:
+        task = asyncio.create_task(run(loop, turn([user("go")], config(srv)), tools, cancel))
+        await tools.running["c2"].wait()
+        await asyncio.sleep(0.05)
+        cancel.set()
+        events = await task
+    assert of(events, "turn.end") == [{"stop": "cancelled", "steps": 1}]
+    answered = sorted(i.message["tool_call_id"] for i in items(events)[1:])
+    assert answered == ["c1", "c2", "c3", "c4"]  # the waiting calls too
+
+
+@pytest.mark.parametrize("delay", [0, 0.001])
+async def test_a_cancel_keeps_a_delivered_result(loop, delay):
+    """A cancel before the library applied a delivered result still saves that result as its
+    call's: it cannot come again (rule 9). The call that still waits is closed like any other."""
+    tools = Background()
+    history = [user("check it")]
+    with SSEServer(_waiting_batch()) as srv:
+        history += items(await run(loop, turn(history, config(srv)), tools))
+        cancel = asyncio.Event()
+        asyncio.get_running_loop().call_later(delay, cancel.set)
+        if not delay:
+            cancel.set()
+        deliver = Resume("tool_result", results={"c1": _delivered("c1")}, waiting=("c4",))
+        events = await run(loop, turn(history, config(srv), resume=deliver), tools, cancel)
+    assert of(events, "turn.end") == [{"stop": "cancelled", "steps": 1}]
+    results = {i.message["tool_call_id"]: i.message["content"] for i in items(events)}
+    assert results == {
+        "c1": "c1: valid",
+        "c4": "The tool call was interrupted before a result was produced.",
+    }
 
 
 async def test_max_steps_stops_after_exactly_that_many_requests(loop):
@@ -713,6 +881,101 @@ async def test_compaction_item_resets_the_request_prefix(loop):
         {"role": "user", "content": summary},
         {"role": "user", "content": "new question"},
     ]
+
+
+async def test_a_new_system_prompt_is_sent_from_the_turn_that_brings_it(loop):
+    """The runner changed the thread's settings: the run's instructions are the new system
+    prompt, and the history follows as before, with the runner's note."""
+    note = {"role": "user", "content": "[harness] Configuration changed: a new system prompt."}
+    with SSEServer(Reply([*text("one"), done()]), Reply([*text("two"), done()])) as srv:
+        history = [user("hi")]
+        history += items(await run(loop, turn(history, config(srv)), StubTools()))
+        history += [Item("n1", "t2", note), user("again")]
+        changed = TurnInput("th", "t2", "You fix pipelines.", history, None, Limits(), config(srv))
+        events = await run(loop, changed, StubTools())
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+    first, second = (request["messages"] for request in srv.requests)
+    assert first[0] == {"role": "system", "content": "SYS"}
+    assert second == [
+        {"role": "system", "content": "You fix pipelines."},
+        *first[1:],
+        {"role": "assistant", "content": "one"},
+        note,
+        {"role": "user", "content": "again"},
+    ]
+
+
+async def test_context_near_limit_is_said_once_per_turn_after_the_usage(loop):
+    """At 80% of the context window (8,000 of 10,000 tokens) the loop says so, once in a turn,
+    right after the step's usage."""
+
+    def step(n: int, prompt: int) -> Reply:
+        return Reply(
+            [
+                *tool_call(0, f"c{n}", "read_file", '{"path": "a"}'),
+                done("tool_calls", prompt=prompt),
+            ]
+        )
+
+    replies = [
+        step(0, 7_999),
+        step(1, 8_000),
+        step(2, 9_000),
+        Reply([*text("done"), done(prompt=9_500)]),
+    ]
+    with SSEServer(*replies, Reply([*text("ok"), done(prompt=9_900)])) as srv:
+        cfg = config(srv, context_window=10_000)
+        events = await run(loop, turn([user("go")], cfg), StubTools())
+        history = [user("go"), *items(events), user("more")]
+        again = await run(loop, turn(history, cfg), StubTools())
+
+    near = [n for n, e in enumerate(events) if e.type == "context.near_limit"]
+    assert [events[n].data for n in near] == [{"input_tokens": 8_000, "context_window": 10_000}]
+    assert events[near[0] - 1].type == "usage" and events[near[0] - 1].data["step"] == 2
+    assert of(again, "context.near_limit") == [{"input_tokens": 9_900, "context_window": 10_000}]
+
+
+PARTS = [
+    {"type": "text", "text": "What is in this sketch?"},
+    {"type": "image_url", "image_url": {"url": "https://example.com/sketch"}},
+    {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo=", "detail": "low"},
+    },
+]
+
+
+def test_user_content_parts_map_to_pydantic_ai_content_and_back():
+    text, image, inline = mapping.user_content(PARTS)
+    assert text == "What is in this sketch?"
+    assert isinstance(image, ImageUrl) and image.url == "https://example.com/sketch"
+    assert image.vendor_metadata is None  # no detail: the chat request sends none either
+    assert inline.vendor_metadata == {"detail": "low"}
+    assert mapping.chat_content([text, image, inline]) == PARTS
+    assert mapping.user_content("hi") == mapping.chat_content("hi") == "hi"
+    request = ModelRequest(parts=[UserPromptPart([text, image, inline])])
+    assert mapping.to_openai(request) == [{"role": "user", "content": PARTS}]
+
+
+async def test_user_content_parts_reach_chat_completions_and_the_responses_api(loop, tmp_path):
+    parts_user = Item("u1", "t0", {"role": "user", "content": PARTS})
+    with SSEServer(Reply([*text("A sketch."), done()])) as srv:
+        events = await run(loop, turn([parts_user], config(srv)), StubTools())
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]
+    assert srv.requests[0]["messages"][1] == {"role": "user", "content": PARTS}
+
+    expected = [
+        {"type": "input_text", "text": "What is in this sketch?"},
+        {"type": "input_image", "image_url": "https://example.com/sketch", "detail": "auto"},
+        {"type": "input_image", "image_url": PARTS[2]["image_url"]["url"], "detail": "low"},
+    ]
+    exchange = {
+        "expect": {"input_at": [{"index": 0, "role": "user", "parts": expected}]},
+        "respond": {"stream": [{"text": "A sketch."}, COMPLETED]},
+    }
+    with responses_server(tmp_path, exchange) as srv:
+        events = await run(loop, turn([parts_user], responses_config(srv)), StubTools())
+    assert of(events, "turn.end") == [{"stop": "end_turn", "steps": 1}]
 
 
 async def test_rate_limit_retry_is_visible_and_honours_retry_after(loop):

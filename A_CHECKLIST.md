@@ -55,15 +55,31 @@ If you'd do something differently, edit this file in a PR, and A will be changed
 - [x] **Approvals**: `ApprovalRequiredToolset(approval_required_func=...)` backed by the shared
       permission rules. `output_type=[str, DeferredToolRequests]`. Resume with `message_history` +
       `DeferredToolResults` (`ToolDenied(message)` for a denial). ([deferred-tools](https://ai.pydantic.dev/deferred-tools/))
-      *A crash resume, or an approval that answers only some calls, uses the same
+      *Changed: the contract's `check()` is async (the rules may come from a database), and
+      `ApprovalRequiredToolset` calls `approval_required_func` without awaiting it (2.31.1). So A
+      raises `ApprovalRequired` from an async `Hooks(before_tool_execute=...)` instead: the hook
+      runs before every tool call, awaits `check()` and defers the call if it says "ask". The docs
+      name `before_tool_execute` as a place to raise it from, and it is what A already used for
+      resumed calls. A crash resume, or an approval that answers only some calls, uses the same
       `DeferredToolResults`. The library needs an answer for every open call, so a call the user
-      did not answer is passed as approved and re-checked in `Hooks(before_tool_execute=...)`,
-      which the docs name as the hook to defer from: `check()` == "ask" raises `ApprovalRequired`
-      again. So the decided calls run now and only the others pause (before, a partial answer was
-      lost and the thread could never finish). Open calls that must never run get the library's
+      did not answer is passed as approved, and the same hook checks it again: every call the user
+      did not decide in this resume goes through `check()`. So the decided calls run now and only
+      the others pause (before, a partial answer was lost and the thread could never finish). Open calls that must never run get the library's
       own "interrupted" result, saved as items: their response was cut short by a cancel, or the
       user sent a new message instead of answering. This is decided from the history, so a crash
       right after a cancel cannot run the cancelled call.*
+- [x] **Tools that run for minutes**: deferred tools of the external kind: the tool raises
+      `CallDeferred`, the run ends with `DeferredToolRequests.calls`, and a later run gets the
+      finished results in `DeferredToolResults.calls`. ([deferred-tools, "External tool execution"](https://ai.pydantic.dev/deferred-tools/))
+      *A tool whose `ToolHost.run()` result is pending raises `CallDeferred` (contract rule 9); a
+      run whose `DeferredToolRequests` has calls and no approvals ends `waiting` (with approvals
+      it pauses, and the calls wait on). A delivered result (`Resume.results`) goes back as the
+      call's `DeferredToolResults.calls` entry: its content, `ModelRetry` for bad arguments,
+      else `ToolFailed`. The library needs an answer for every open call and has none for "still
+      running", so a call that still waits (`Resume.waiting`) is passed as approved and deferred
+      again with `CallDeferred` in the same `before_tool_execute` hook, before it can run. A
+      partial delivery, or a crash resume while calls wait, then ends `waiting` again without a
+      request: the library ends a run whose calls are all deferred without one.*
 - [x] **History**: native `ModelMessagesTypeAdapter` JSON, persisted after every model response
       and tool batch (node boundaries in `iter()`), so a crash loses nothing.
       *Every item carries the native of exactly what it shows: a response, or one part of a request
@@ -157,6 +173,11 @@ The library has no mechanism for these, so A has its own code (counted like ever
   only when the whole batch is done.
 - **Waiting for the runner before each request** (`await out.join()`, 1 line; the same wait
   orders `tool.start`).
+- **Keeping a delivered result when a cancel comes first** (`mapping._returned` and 5 lines in
+  `mapping.close_pending`, 2 in `_run`). A cancel that lands before the library has applied
+  `DeferredToolResults.calls` leaves those calls open, and closing them as interrupted would
+  lose a result that cannot come again (contract rule 9), so each gets the part the library
+  would have made from it.
 - **Retrying a Responses stream that failed** (5 lines in `_run`, `_note_events` and 4 lines in
   `_on_response`: about 25 lines, and the warning filter). The library ends the stream as if it were
   done after an `error` event (it has no handler for it) or a `response.failed`, so the partial
@@ -225,7 +246,7 @@ The library has no mechanism for these, so A has its own code (counted like ever
   A's `ProcessHistory` drops such an item.
 - **Worked around**: a `cost_limit` drops the response that crosses it from history (above).
 - **Worked around**: `DeferredToolResults` needs an answer for every open call, so there is no
-  partial approval (above).
+  partial approval, nor a way to say that an external call is still running (above).
 - **Recorded**: `Agent.parallel_tool_call_execution_mode("parallel_ordered_events")` would give
   results in call order, but on 2.31.1 it holds every result event until the whole batch is
   done, so A keeps the default mode and orders the early-saved results itself.

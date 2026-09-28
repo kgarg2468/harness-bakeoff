@@ -23,8 +23,8 @@ src/bakeoff/
   shared/
     contract.py        the seam: Loop protocol, Item/Event/ToolCall types, rules (read this first)
     sessionlog.py      SQLite log: threads, turns, items, events (items/events append-only)
-    runner.py          drives one turn: TurnInput -> loop events -> persist -> publish -> git commit
-    workcopy.py        git working copy per thread; one commit per completed turn; revert = new commit
+    runner.py          drives one turn: TurnInput -> loop events -> persist -> publish -> save the workspace
+    workcopy.py        Workspace protocol; WorkCopy: a git repository per thread, one commit per saved version
     toolhost.py        tool registry, JSON-schema validation, permission rules, tool.start/end events
     permissions.py     allow/ask/deny rules with wildcard patterns (ported from OpenCode)
     skills.py          RocketRide skills: frontmatter, the system-prompt section, load_skill paths
@@ -48,12 +48,14 @@ out/                   generated: log.sqlite, wc/, wire/, metrics.json, report.h
 
 ## The seam
 
-Read `src/bakeoff/shared/contract.py`. In short, a `Loop` gets a `TurnInput` (frozen system
-prompt, full history, optional resume decisions, limits, model config), a `ToolHost`, and a
-cancel `asyncio.Event`. It yields `Event`s. The shared runner:
+Read `src/bakeoff/shared/contract.py`. In short, a `Loop` gets a `TurnInput` (the thread's system
+prompt, full history, an optional resume with decisions, delivered results and the calls still
+waiting, limits, model config), a `ToolHost`, and a cancel `asyncio.Event`. It yields `Event`s.
+The shared runner:
 
 1. creates the turn row and appends the user's message as an `Item` (so `history` already ends
-   with the user item when the loop starts; on resume there is no new user item);
+   with the user item when the loop starts; on resume there is no new user item), after a note
+   of changed settings if the turn brings any (below);
 2. emits `turn.start`, then consumes the loop's events, stamping each with
    `{v, thread, turn, impl, seq, t_us, type, data}` (`seq` has no gaps per thread; `t_us` is
    microseconds since turn start);
@@ -61,19 +63,52 @@ cancel `asyncio.Event`. It yields `Event`s. The shared runner:
    `tool.start` before its tool runs, so a crash cannot hide a run) and other events in
    batches (flush on item, on `tool.start`, on `turn.end`, and every 64 events), then publishes
    each event to the sink (CLI printer, ndjson mirror, tests);
-4. on `turn.end` with stop `end_turn`, `max_steps`, `budget`, `cancelled` or `error`, commits the
-   working copy (`git add -A && git commit --allow-empty`), stores the sha on the turn row
-   together with the `commit` event (one transaction), then publishes `commit` (always the final
-   event of a completed turn, right after the loop's `turn.end`). A `paused` turn is not committed until the resumed turn finishes.
+4. on `turn.end` with stop `end_turn`, `max_steps`, `budget`, `cancelled` or `error`, saves the
+   thread's workspace (`Workspace.save`), stores the version on the turn row together with the
+   `turn.saved` event `{version, files}` (one transaction), then publishes `turn.saved` (always
+   the final event of a completed turn, right after the loop's `turn.end`). A `paused` or
+   `waiting` turn is not saved until the turn that resumes it finishes.
+
+`Workspace` (`shared/workcopy.py`) is all the runner needs from a thread's files: `save`,
+`revert`, `head` and `recover` (plus `init_sync` when a thread is created). A version is an
+opaque string. The default, `WorkCopy`, is a git repository per thread: `save` is `git add -A &&
+git commit --allow-empty` and a version is the commit sha; `Runner(make_workspace=...)` takes any
+other implementation. Git is not part of the contract.
 
 `ToolHost` is built by the runner with an `emit` callback, so `tool.start` and `tool.end` are
 timed identically for every loop.
+
+**Live-only events.** `contract.LIVE_ONLY_EVENTS` (`text.delta`, `reasoning.delta`) are for
+watching a turn as it happens; nothing that resumes or judges a turn reads them. A runtime may
+deliver them without storing them, and then gives them no `seq`, so the stored events still
+number 1..n (I3). Stored events are the rest: messages (`item`), tool start and end, permission
+requests, usage and the turn boundaries, plus `request.start`, `tool_call.ready`, `retry` and
+`error`. The reference runner stores every event (the report's replay draws streaming from the
+deltas).
+
+### Turn ownership
+
+The runtime runs each turn in its own task, independent of any client connection: a client that
+disconnects neither stops nor pauses the turn (only `cancel` does), and it can attach to the
+turn's events again. One conversation runs in one place at a time, under a lock that expires if
+its holder dies: every turn, revert and compaction of a thread takes it, and a crash resume takes
+it once the dead holder's lock is gone. Here a turn runs in the task that calls `Runner.turn`
+(for `bakeoff turn`, `approve` and `resume`, a worker process that no client holds open), and the
+lock is an OS file lock per thread (`runner._try_lock`) that the kernel drops when the process
+holding it dies. Its git processes inherit it, so a dead worker's last git process releases it.
 
 ### Items and history
 
 `Item.message` is an OpenAI chat-completions message, exactly as it goes on the wire:
 
-- user: `{"role": "user", "content": "..."}` (created by the runner)
+- user: `{"role": "user", "content": "..." | [part, ...]}` (created by the runner). The content is
+  text or a list of content parts in the chat format (`{"type": "text", "text"}`, `{"type":
+  "image_url", "image_url": {"url", "detail"?}}`), stored as given (`contract.UserContent`). The
+  runner refuses one whose JSON (UTF-8) is over `runner.MAX_USER_BYTES` (256 KiB), inline data
+  included: large files go by URL. Chat completions take the parts as they are; on the Responses
+  API loop B converts them to `input_text` and `input_image` parts (`our_version/content.py`),
+  and loop A to pydantic-ai's user content, strings and `ImageUrl` (`mapping.user_content`),
+  which its model maps to either API.
 - assistant: `{"role": "assistant", "content": "..." | None, "tool_calls": [...], "reasoning_details": [...]}`.
   `tool_calls[].function.arguments` is the raw streamed string. `reasoning_details` is kept
   verbatim (never rebuilt).
@@ -87,9 +122,28 @@ history, so reasoning items go back verbatim with their `encrypted_content`.
 
 `Item.native` is loop-private. `pydantic_version` stores pydantic-ai's native `ModelMessage` JSON
 there (each item gets the native of exactly what it shows) and rebuilds its history from it.
-Items the runner created (user messages, revert notes, compaction summaries) have `native=None`, and every
-loop must handle them. A compaction item (`Item.compaction=True`, a user message starting with
-`[harness] Conversation summary:`) replaces everything before it (contract rule 8).
+Items the runner created (user messages, revert notes, notes of changed settings, compaction
+summaries) have `native=None`, and every loop must handle them. A compaction item
+(`Item.compaction=True`, a user message starting with `[harness] Conversation summary:`) replaces
+everything before it (contract rule 8).
+
+A loop never writes a summary. With `ModelConfig.context_window` set, it emits
+`context.near_limit` `{input_tokens, context_window}` right after the `usage` of the first
+response in a turn whose input tokens reach 80% of the window (`contract.CONTEXT_NEAR_LIMIT`),
+and at most once per turn. The runtime decides whether to compact before the next turn
+(`Runner.compact`).
+
+The system prompt and the permission rules can change between turns. `Runner.turn(system=...,
+rules=...)` checks new rules, reads the thread's settings once it holds the thread's lock (a
+resume may have waited for a turn that changed them) and compares; if they differ, it stores
+them on the thread and,
+in the same transaction, appends a runner item `<turn>:config` before the user's message: a user
+message that starts with `[harness] Configuration changed:` and names what changed (new rules are
+quoted, since the model cannot see them otherwise). So the history says why the request prefix
+changed, and I1 lets the system messages change there. Only a user turn changes settings: on a
+resume the note would come between calls and their results. Both loops build the request prefix
+from `TurnInput.system` (B caches it per thread, keyed on the system prompt, the model config and
+the tools), and the runner builds each turn's ToolHost from the thread's rules.
 
 ### Resume
 
@@ -99,12 +153,38 @@ loop must handle them. A compaction item (`Item.compaction=True`, a user message
   The loop runs the allowed ones, feeds `ToolResult(ok=False, content="Denied by user: <reason>")`
   for denied ones, and continues. Until then the runner refuses a new user message, a
   compaction and a revert: each would come between the pending calls and their results.
+- **Tool results**: a tool that runs for minutes (a pipeline run, say) returns
+  `ToolResult(pending=True)` from `run()`: its work goes on elsewhere, and its call gets no
+  result item yet (contract rule 9). The loop handles the step's other calls as usual and ends
+  the turn with stop `waiting` and the pending ids; the runner records it like a paused turn
+  (status `waiting`, not saved). When the work finishes, the runtime delivers the result, from
+  any process (`bakeoff deliver THREAD --ok CALL=TEXT`), as
+  `Resume(kind="tool_result", results={call_id: ToolResult})`: the loop appends one result item
+  per delivered result, never running its call, then sends the next request, or ends `waiting`
+  again without one if calls still wait. The runner refuses a delivery for a call that does not
+  wait, and one while a turn is paused (approve first). Until the last result comes it refuses
+  a new user message, a compaction and a revert. If a step also has a call that asks, the turn
+  pauses, and the approval resume ends `waiting`.
 - **Crash**: the worker process died mid-turn. The runner restarts the turn with
   `Resume(kind="crash")`. The loop continues from history. Calls that have no result are
   re-checked: `ask` pauses again, `allow` runs. A tool whose result item was already persisted
-  must not run again.
+  must not run again, nor may a call that waits.
 
-Approval and crash resume are the same code path: rebuild from history, then continue.
+On every resume the runner sets `Resume.waiting` to the calls that wait: calls of the last
+complete assistant item that no result item answers, whose run stored a `tool.end` with
+`pending` in that item's turn or later (the runner stores it at once, as it does `tool.start`).
+A pending run whose call never reached history (a read-only call started early, before its
+response failed) waits for nothing. If that `tool.end` cannot be stored, `ToolHost.run()` answers
+the call with a failure instead, as it does when it cannot record a start: nothing durable would
+say that the call waits, and a resume could run it again. The loop never runs a waiting call. A
+crash resume of a tool_result turn also gets, in `Resume.results`, the results that turn
+delivered (its `turn.start` holds them) but did not save. The runner refuses decisions on
+anything but an approval resume and for waiting calls, and results on an approval resume. A
+cancel gives a waiting call of the step a result like any other call (a delivered result stays
+the call's own), so the runtime should stop the work behind it.
+
+Approval, tool-result and crash resume are the same code path: rebuild from history, then
+continue.
 
 ## Tools
 
@@ -137,7 +217,16 @@ Permission rules (OpenCode style), per thread:
 ```
 
 A tool maps to a decision, or to `{glob-on-path: decision}` with the first match winning. Paths
-that escape the working copy are always denied.
+that escape the working copy are always denied. `ToolHost.check()` is async, so a runtime can
+read its rules from a database; loop B awaits it on its early-start path and when it schedules a
+step's calls, loop A in a `before_tool_execute` hook (`A_CHECKLIST.md`, Approvals).
+
+`ToolSpec.timeout_s` limits a run: `ToolHost.run()` fails a call whose tool takes longer
+(`<tool> timed out after N s`); no shared tool sets one yet. A running tool may report how it is
+getting on (`ToolContext.progress`), which the ToolHost sends as `tool.progress`
+`{call_id, name, message}`. A tool that starts work which finishes later raises `ToolPending`,
+and `run()` returns a pending result (Resume, above). `build_toolhost(background=[...])` makes
+the named tools do only that, for the scenarios.
 
 ## Skills
 
@@ -150,7 +239,8 @@ their text files (`.md`, `.json`, `.pipe`, not the `tools/*.py` helpers) to
 
 Progressive disclosure: `skills_prompt()` (`shared/skills.py`) is the system-prompt section. It
 lists only `name: description` per skill and tells the model to call `load_skill` before acting on
-a matching task; it is deterministic, so appending it keeps the thread's system prompt frozen.
+a matching task; it is deterministic, so appending it keeps the thread's system prompt the same
+from request to request.
 `load_skill` returns the `SKILL.md`, or a file it mentions, after one harness paragraph: the
 ToolHost's real tool names, and that instructions to run scripts or tools not in that list do not
 apply here. `file` is read as the skill writes it: relative to the skill (`GATE_PROTOCOL.md`,
@@ -231,15 +321,22 @@ recordings and the session log, never from what a loop says about itself.
 | S13 | BYOK thinking: `openai_compat` endpoint, non-OpenAI model name, reasoning requested | the reasoning parameter reaches the wire |
 | S14 | BYOK strict endpoint: 400 if body has `reasoning`, `reasoning_effort` or `stream_options` (configured via compat flags) | the turn finishes |
 | S15 | compaction hand-off: runner appends a summary item; loop sends [system, summary, new user] | prefix resets only at the compaction boundary |
+| S16 | tools that run for minutes: two `validate_pipeline` calls start work for later (`background_tools`), `describe_component` runs; a new process delivers both results and is killed after the first is saved; crash resume | the turn ends `waiting`; the crash resume delivers the second result again and runs nothing; one result per call; each tool started once |
+| S17 | settings change between turns: a new system prompt and rules that make `write_file` ask | the new system prompt, the kept history, the runner's note, the new message; the write asks, then runs once |
+| S18 | a user message with a text part and two image parts (by URL, and inline with `detail: low`) | the parts reach the model as sent, in every request |
+| S19 | context nearly full: 8,200 then 8,600 input tokens of a 10,000-token window; the runtime compacts; the next turn is small | `context.near_limit` once (after step 1's usage); the request after the compaction is [system, summary, new user] |
 | R01 | Responses API (`gpt-6-luna`, effort `xhigh`, summary `auto`): text only | `store: false`, `include` has `reasoning.encrypted_content`, `reasoning.summary` sent, Responses tools; exact text; usage from `response.completed` |
 | R02 | reasoning + one function call + its `function_call_output`, then the answer | the reasoning item replayed exactly as sent; tool ran once |
 | R03 | commentary + 3 function calls in one response; `write_file` asks; approve in a new process | as S05; the resumed request replays reasoning, commentary (`phase`) and all calls |
 | R04 | 429 with `retry-after: 1`, then OK; next turn an `error` event mid-stream, then OK | waited per Retry-After; nothing of the failed attempt is replayed |
 | R05 | cancel while reasoning streams | stops within 200 ms; next turn passes `reject_unencrypted_reasoning` |
+| R06 | Responses API: the same user message with images | `input_text` and `input_image` parts (URL flat, `detail` `auto` unless given), in every request |
+| R07 | Responses API: two calls wait, one runs; one result is delivered (still waiting, no request), the other in a new process | one result per call in the next request; the reasoning item replayed as sent; each tool started once |
 
 The driver (`shared/scenario.py`) runs the steps with the real runner, session log, working copy
-and ToolHost on MockEngine. `approve` with `new_process` and the user turn after `crash_after` run
-as separate OS processes (`bakeoff approve`, `bakeoff turn`); the crash is a SIGKILL the child
+and ToolHost on MockEngine. `approve` and `deliver` with `new_process`, and the user or deliver
+step after `crash_after`, run as separate OS processes (`bakeoff approve`, `deliver`, `turn`);
+the crash is a SIGKILL the child
 sends itself from its runner's sink, so for `item`, `tool.start` and `turn.end` (stored before
 they are published) it comes right after the event is durable. Every key of the final `expect`
 and the invariants I1, I2, I3, I5 and I7 decide pass or fail. The timing criteria above are
@@ -260,16 +357,18 @@ that fails any other way is a plain failure.
 
 - **I1 append-only**: each request's `messages` (Responses API: `instructions`, then the `input`
   items) are a prefix of the next request's (semantic equality; byte equality reported
-  separately). Resets only at a compaction item.
+  separately). Resets only at a compaction item, and the system messages change only where a new
+  note of changed settings follows the history kept from the request before.
 - **I2** every tool call gets exactly one result; no call id runs twice (`tool.start` count);
   every run ends before its turn's `turn.end` (no orphan tools); and every result comes from a
-  run, unless the user denied the call or its turn stopped early (cancelled, max_steps, budget,
-  error).
+  run (a delivered one from the run that started its work), unless the user denied the call or
+  its turn stopped early (cancelled, max_steps, budget, error).
 - **I3** `seq` has no gaps; `item` events == item rows.
 - **I5** the loop writes nothing to stdout/stderr.
 - **I6** no connection leaves 127.0.0.1 (socket guard in tests and in every `bakeoff` command;
   `live` and `chat` also allow the model endpoint's host).
-- **I7** one commit per completed turn; `turns.commit_sha == git rev-parse`.
+- **I7** one saved version per completed turn, each on record as its turn's last event
+  (`turn.saved`); with `WorkCopy`, one git commit each and `turns.commit_sha == git rev-parse`.
 
 ## `our_version`: lean and fast
 

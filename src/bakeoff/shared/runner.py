@@ -1,7 +1,8 @@
-"""Drives turns: TurnInput -> loop events -> persist -> publish -> git commit.
+"""Drives turns: TurnInput -> loop events -> persist -> publish -> save the workspace.
 
 See DESIGN.md, "The seam". The runner is shared by every loop, so persistence, event
-stamping, tool timing and commits are identical for all of them.
+stamping, tool timing and saved versions are identical for all of them. A thread's workspace
+is a `Workspace`; the default is `WorkCopy`, where a saved version is a git commit.
 """
 
 from __future__ import annotations
@@ -15,10 +16,11 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import aclosing, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+from bakeoff.shared import permissions
 from bakeoff.shared.contract import (
     Event,
     Item,
@@ -27,13 +29,18 @@ from bakeoff.shared.contract import (
     ModelConfig,
     Resume,
     ToolHost,
+    ToolResult,
     TurnInput,
+    UserContent,
 )
 from bakeoff.shared.sessionlog import EventRow, SessionLog, event_row, item_to_json
-from bakeoff.shared.workcopy import WorkCopy
+from bakeoff.shared.workcopy import WorkCopy, Workspace
 
 Sink = Callable[[dict[str, Any]], None]
 MakeTools = Callable[[Path, dict[str, Any], Callable[[Event], None]], ToolHost]
+# Opens a thread's workspace at its directory; the second argument is the descriptor of the
+# thread's lock, for a workspace whose processes must keep it (see `_try_lock`).
+MakeWorkspace = Callable[[Path, int | None], Workspace]
 
 _BATCH = 64  # non-item events buffered before a flush
 _CANCEL_POLL_S = 0.05
@@ -41,18 +48,31 @@ _LOCK_POLL_S = 0.02
 _STATUS = {"end_turn": "done", "max_steps": "done", "budget": "done", "cancelled": "cancelled"}
 _DEFAULT_LIMITS = Limits()
 _THREAD_ID = re.compile(r"[\w-]+")
-# While the last git turn is paused, its pending calls must be answered first: a new user
+# While the last workspace turn is paused, its pending calls must be answered first: a new user
 # message or a summary between a call and its result breaks the history (see `Runner.turn`).
 _PAUSED = {"paused": "is paused: resolve the pending approval first"}
-# A revert also waits while the last turn has changes that no commit holds (see `Runner.revert`).
+# The same holds while calls wait for their results (contract rule 9): `_refuse_while` then also
+# refuses while any call of the thread waits, whatever turn started it.
+_OPEN = {**_PAUSED, "waiting": "is waiting for tool results: deliver them first"}
+# A revert also waits while the last turn has changes that no saved version holds (see
+# `Runner.revert`).
 _REVERT_WAITS = {
-    **_PAUSED,
-    "error": "failed to commit its changes: run a turn first, its commit includes them",
+    **_OPEN,
+    "error": "failed to save its changes: run a turn first, its saved version includes them",
 }
+# The stops after which a turn is not saved: its calls are still open (answered by a resume).
+_OPEN_STOPS = ("paused", "waiting")
 logger = logging.getLogger(__name__)
 
 # Starts the content of a compaction item; see contract rule 8.
 SUMMARY_PREFIX = "[harness] Conversation summary:"
+# Starts the content of the item that notes a change of the thread's settings (`Runner.turn`).
+CONFIG_PREFIX = "[harness] Configuration changed:"
+# How that note names a new system prompt: I1 lets the system messages change only at such a note.
+NEW_SYSTEM_PROMPT = "a new system prompt"
+# The most a user message's content may take as JSON (UTF-8). Inline data (an image as a data URL)
+# counts; a large file goes by reference (a URL) instead.
+MAX_USER_BYTES = 256 * 1024
 
 try:
     import fcntl
@@ -118,11 +138,58 @@ async def _wait_lock(lock_path: Path, wait_s: float) -> int | None:
 
 def _check_loop_item(item: Any, turn_id: str) -> None:
     """A loop's items belong to its own turn, and only the runner writes compaction items
-    (contract rule 8): a loop cannot make history before an item of its own disappear."""
+    (contract rule 8) and notes of changed settings: a loop cannot make history before an item
+    of its own disappear, or change the system prompt behind one (I1)."""
     if getattr(item, "compaction", False):
         raise ValueError(f"item {item.id!r} is a compaction item: only the runner compacts")
+    if getattr(item, "id", None) in (f"{turn_id}:user", f"{turn_id}:config"):
+        raise ValueError(f"item {item.id!r} has the id of a runner item")
     if getattr(item, "turn_id", turn_id) != turn_id:
         raise ValueError(f"item {item.id!r} belongs to turn {item.turn_id!r}, not {turn_id!r}")
+
+
+def _content_problem(content: Any) -> str | None:
+    """What is wrong with a user message's content (`contract.UserContent`), or None."""
+    if isinstance(content, list):
+        if not content:
+            return "it has no content parts"
+        for n, part in enumerate(content):
+            kind = part.get("type") if isinstance(part, dict) else None
+            image = part.get("image_url") if kind == "image_url" else None
+            if not (
+                (kind == "text" and isinstance(part.get("text"), str))
+                or (isinstance(image, dict) and isinstance(image.get("url"), str))
+            ):
+                return f"part {n} is not a text part or an image_url part with a url"
+    elif not isinstance(content, str):
+        return "the content must be text or a list of content parts"
+    # A lone surrogate (half an emoji, say) is valid JSON text: it counts, it is not an error.
+    size = len(json.dumps(content, ensure_ascii=False).encode(errors="surrogatepass"))
+    if size > MAX_USER_BYTES:
+        return (
+            f"its content takes {size} bytes as JSON, more than {MAX_USER_BYTES}:"
+            " pass large files by URL"
+        )
+    return None
+
+
+def _complete_answer(item: Item) -> bool:
+    return item.message.get("role") == "assistant" and item.status == "complete"
+
+
+def _new_settings(
+    thread: dict[str, Any], system: str | None, rules: dict[str, Any] | None
+) -> tuple[dict[str, Any], str] | None:
+    """The thread's settings (`{"system", "meta"}`) with a new system prompt and new rules, and
+    the note that says what changed; None if nothing changes."""
+    changes, settings = [], {"system": thread["system"], "meta": thread["meta"]}
+    if system is not None and system != thread["system"]:
+        changes.append(NEW_SYSTEM_PROMPT)
+        settings["system"] = system
+    if rules is not None and rules != thread["meta"]["rules"]:
+        changes.append(f"new permission rules {json.dumps(rules)}")
+        settings["meta"] = {**thread["meta"], "rules": rules}
+    return (settings, f"{CONFIG_PREFIX} {', and '.join(changes)}.") if changes else None
 
 
 @contextmanager
@@ -135,7 +202,8 @@ def _logged_failure(what: str) -> Iterator[None]:
 
 
 class _Publisher:
-    """Stamps one turn's events, persists them and publishes them to the sink.
+    """Stamps one turn's events, persists them and publishes them to the sink. It stores every
+    event, the live-only ones too (`contract.LIVE_ONLY_EVENTS`), and numbers them all.
 
     `item` and `tool.start` events are persisted (with everything buffered before them) before
     they are published, a `tool.start` before its tool runs, so no crash can hide a run from I2.
@@ -169,12 +237,19 @@ class _Publisher:
         # that is not JSON fails here, at the event that carries it.
         return event_row(env)
 
-    def emit(self, type_: str, data: dict[str, Any]) -> None:
+    def emit(
+        self, type_: str, data: dict[str, Any], *, settings: dict[str, Any] | None = None
+    ) -> None:
+        """Stamp, persist and publish one event. `settings` (with an `item`) replaces the
+        thread's system prompt and meta in the item's transaction."""
         row = self._row(self._seq, type_, data)
         if type_ == "item":
-            self._log.append_item(self._thread, data["item"], [*self._batch, row])
+            self._log.append_item(
+                self._thread, data["item"], [*self._batch, row], settings=settings
+            )
             self._batch.clear()
-        elif type_ == "tool.start":
+        elif type_ == "tool.start" or (type_ == "tool.end" and data.get("pending")):
+            # A pending tool.end is stored at once too: a crash resume must know the call waits.
             self._log.append_events([*self._batch, row])
             self._batch.clear()
         else:
@@ -207,8 +282,8 @@ class _Publisher:
 
     def publish(self, event: Event) -> None:
         """The ToolHost's `emit` callback. A tool event after the loop's `turn.end` cannot
-        join the stream (`commit` must follow `turn.end` directly), so it is stored on the turn
-        row (`late`) at once: also after the row is complete, e.g. from a tool task that
+        join the stream (`turn.saved` must follow `turn.end` directly), so it is stored on the
+        turn row (`late`) at once: also after the row is complete, e.g. from a tool task that
         outlived its loop."""
         if not self.ended:
             self.emit(event.type, event.data)
@@ -230,24 +305,25 @@ class _Publisher:
         stop: str | None = None,
         pending: list[str] | None = None,
         item: Item | None = None,
-        commit: tuple[str, list[str]] | None = None,
+        saved: tuple[str, list[str]] | None = None,
     ) -> None:
-        """Record the end of the turn in one transaction: its status (and commit sha), what is
-        still buffered, and the runner's last events (`item`, then `commit`). They are published
-        only after that, so a consumer that sees `commit` finds the turn complete in the log
-        (rule 7), and nothing is published that the log does not have."""
+        """Record the end of the turn in one transaction: its status (and saved version), what
+        is still buffered, and the runner's last events (`item`, then `turn.saved`). They are
+        published only after that, so a consumer that sees `turn.saved` finds the turn complete
+        in the log (rule 7), and nothing is published that the log does not have."""
         rows = []
         if item is not None:
             rows.append(self._row(self._seq, "item", {"item": item}))
-        if commit is not None:
-            sha, files = commit
-            rows.append(self._row(self._seq + len(rows), "commit", {"sha": sha, "files": files}))
+        if saved is not None:
+            version, files = saved
+            data = {"version": version, "files": files}
+            rows.append(self._row(self._seq + len(rows), "turn.saved", data))
         self._log.set_turn_status(
             self.turn_id,
             status,
             stop=stop,
             pending=pending,
-            commit_sha=None if commit is None else commit[0],
+            commit_sha=None if saved is None else saved[0],
             events=[*self._batch, *rows],
             item=item,
         )
@@ -280,12 +356,13 @@ class NdjsonMirror:
 
 
 class Runner:
-    """Runs turns of any `Loop` against the session log and one git working copy per thread.
+    """Runs turns of any `Loop` against the session log and one workspace per thread
+    (`make_workspace`, by default a git `WorkCopy`).
 
     Each turn, revert and compaction holds the thread's OS lock (see `_try_lock`) while it runs.
-    A resume (approval or crash) waits up to `lock_wait_s` seconds for it: it follows the end of
-    the turn before it, whose worker, or that worker's last git process, may still hold it.
-    Anything else raises ThreadBusy at once.
+    A resume (approval, tool results or crash) waits up to `lock_wait_s` seconds for it: it
+    follows the end of the turn before it, whose worker, or that worker's last git process, may
+    still hold it. Anything else raises ThreadBusy at once.
     """
 
     def __init__(
@@ -295,15 +372,17 @@ class Runner:
         make_tools: MakeTools,
         sink: Sink | None = None,
         lock_wait_s: float = 5.0,
+        make_workspace: MakeWorkspace = WorkCopy,
     ) -> None:
         self.log = log
         self.wc_root = wc_root
         self.make_tools = make_tools
         self.sink = sink
         self.lock_wait_s = lock_wait_s
+        self.make_workspace = make_workspace
 
     def workdir(self, thread_id: str) -> Path:
-        """The thread's git working copy."""
+        """The directory of the thread's workspace."""
         return (self.wc_root / thread_id).absolute()
 
     def new_thread(
@@ -316,14 +395,14 @@ class Runner:
         thread_id: str | None = None,
     ) -> str:
         """Create a thread (its meta keeps rules and the model config minus the api key) and
-        its git working copy."""
+        its workspace."""
         thread_id = thread_id or uuid.uuid4().hex[:12]
         if not _THREAD_ID.fullmatch(thread_id):
             raise ValueError(f"thread id must match {_THREAD_ID.pattern}: {thread_id!r}")
         model_meta = asdict(model)
         del model_meta["api_key"]
-        # The repository first: once the thread row exists, every turn can rely on it.
-        WorkCopy(self.workdir(thread_id)).init_sync()
+        # The workspace first: once the thread row exists, every turn can rely on it.
+        self.make_workspace(self.workdir(thread_id), None).init_sync()
         self.log.create_thread(
             thread_id, impl=impl, system=system, meta={"rules": rules, "model": model_meta}
         )
@@ -335,39 +414,62 @@ class Runner:
         thread_id: str,
         *,
         model: ModelConfig,
-        user_text: str | None = None,
+        user_text: UserContent | None = None,
         resume: Resume | None = None,
         limits: Limits = _DEFAULT_LIMITS,
         cancel: asyncio.Event | None = None,
         watch_cancel: bool = False,
+        system: str | None = None,
+        rules: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run one turn: a new user message, or a resume (approval or crash).
+        """Run one turn: a new user message, or a resume (approval, tool results or crash).
+
+        `user_text` is the message's content, text or content parts (`contract.UserContent`),
+        stored as given. One whose JSON is larger than `MAX_USER_BYTES`, or with a part that is
+        not text or an image URL, is refused (ValueError) before anything is recorded.
 
         While the last turn is paused, a new user message is refused: the pending calls need an
         approval resume first (it may deny them, with a reason), since a user message between a
-        call and its result breaks the history.
+        call and its result breaks the history. The same goes while calls wait for results
+        (contract rule 9): a turn that ends "waiting" is recorded like a paused one, not saved,
+        and `Resume(kind="tool_result", results={call_id: ToolResult})` delivers them, in any
+        process and as they come. Each must be a waiting call's (ValueError otherwise), and a
+        delivery waits for a pending approval. On every resume the runner sets `Resume.waiting`
+        to the calls still waiting, which the loop never runs, and a crash resume of a
+        tool_result turn delivers again the results that turn had not saved.
 
-        Returns `{"turn_id", "stop", "pending", "commit"}`. A loop exception ends the turn with
-        stop="error" instead of raising. `asyncio.CancelledError` propagates and leaves the turn
-        "running", like a crash; resume it with `Resume(kind="crash")`. Any other failure (git,
-        or the session log) is raised after the turn is recorded without a commit: as "error"
-        (the next turn's commit includes its changes), or still "paused" if it paused. If even
-        that cannot be written, the turn stays "running" for a crash resume.
+        `system` and `rules` are the thread's system prompt and permission rules from this turn
+        on (rules that are not valid raise ValueError at once). If they differ from the thread's
+        (read once the lock is held), the runner stores them and appends a runner item
+        before the user's message, a user message that starts with `CONFIG_PREFIX` and names
+        what changed, so the history explains why the request prefix changed (I1 lets it reset
+        there). Only a new user message changes them: on a resume they must be None or unchanged,
+        since a note between a call and its result breaks the history.
+
+        Returns `{"turn_id", "stop", "pending", "version"}` (`version`: the saved version, None
+        if the turn was not saved). A loop exception ends the turn with stop="error" instead of
+        raising. `asyncio.CancelledError` propagates and leaves the turn "running", like a crash;
+        resume it with `Resume(kind="crash")`. Any other failure (the workspace, or the session
+        log) is raised after the turn is recorded without a saved version: as "error" (the next
+        turn's saved version includes its changes), or still "paused" or "waiting" if it ended
+        so. If even that cannot be written, the turn stays "running" for a crash resume.
 
         A resume waits up to `lock_wait_s` for the thread's lock; a new user message raises
         ThreadBusy at once while another turn, revert or compaction holds it.
         """
         if (user_text is None) == (resume is None):
             raise ValueError("pass exactly one of user_text and resume")
-        thread = self._thread(thread_id)
-        if loop.name != thread["impl"]:
-            raise ValueError(f"thread {thread_id} belongs to {thread['impl']!r}, not {loop.name!r}")
+        if user_text is not None and (problem := _content_problem(user_text)):
+            raise ValueError(f"cannot send this user message: {problem}")
+        if rules is not None:
+            permissions.validate_rules(rules)  # before they are stored: else no turn could run
+        if loop.name != (impl := self._thread(thread_id)["impl"]):
+            raise ValueError(f"thread {thread_id} belongs to {impl!r}, not {loop.name!r}")
         wait_s = self.lock_wait_s if resume is not None else 0.0
         lock_fd = await _wait_lock(self._lock_path(thread_id), wait_s)
         try:
             return await self._turn(
                 loop,
-                thread,
                 thread_id,
                 model,
                 user_text,
@@ -376,6 +478,8 @@ class Runner:
                 cancel,
                 watch_cancel,
                 lock_fd,
+                system,
+                rules,
             )
         finally:
             _unlock(lock_fd)
@@ -383,23 +487,30 @@ class Runner:
     async def _turn(
         self,
         loop: Loop,
-        thread: dict[str, Any],
         thread_id: str,
         model: ModelConfig,
-        user_text: str | None,
+        user_text: UserContent | None,
         resume: Resume | None,
         limits: Limits,
         cancel: asyncio.Event | None,
         watch_cancel: bool,
         lock_fd: int | None,
+        system: str | None,
+        rules: dict[str, Any] | None,
     ) -> dict[str, Any]:
         kind = resume.kind if resume else "user"
+        # Read with the lock held: a resume may have waited for a turn that changed the settings.
+        thread = self._thread(thread_id)
+        if resume is not None and _new_settings(thread, system, rules):
+            raise ValueError("the system prompt and the rules change with a user message only")
         self._retire_dead(thread_id, lock_fd)
         if resume is None:
-            self._refuse_while(thread_id, "start a user turn", _PAUSED)
+            self._refuse_while(thread_id, "start a user turn", _OPEN)
+        else:
+            resume = self._resume(thread_id, resume)
         row = self.log.start_turn(thread_id, kind)  # raises if a turn is running (unless crash)
         turn_id = row["id"]
-        wc = WorkCopy(self.workdir(thread_id), lock_fd)
+        ws = self.make_workspace(self.workdir(thread_id), lock_fd)
         pub = _Publisher(self.log, self.sink, thread_id, turn_id, thread["impl"])
         cancel = cancel or asyncio.Event()
         watcher = (
@@ -408,11 +519,16 @@ class Runner:
             else None
         )
         try:
-            await self._reconcile(wc, thread_id, turn_id)
+            await self._reconcile(ws, thread_id, turn_id)
             start: dict[str, Any] = {"turn_id": turn_id}
             if resume is not None:
                 start["resume"] = asdict(resume)
             pub.emit("turn.start", start)
+            if changed := _new_settings(thread, system, rules):
+                settings, note = changed
+                item = Item(f"{turn_id}:config", turn_id, {"role": "user", "content": note})
+                pub.emit("item", {"item": item}, settings=settings)
+                thread = {**thread, **settings}
             if user_text is not None:
                 message = {"role": "user", "content": user_text}
                 pub.emit("item", {"item": Item(f"{turn_id}:user", turn_id, message)})
@@ -427,14 +543,14 @@ class Runner:
             )
             end = await self._drive(loop, turn_input, cancel, pub, thread["meta"]["rules"])
             stop = end.get("stop", "error")
-            if stop == "paused":
+            if stop in _OPEN_STOPS:
                 pending = list(end.get("pending") or [])
-                pub.finish("paused", stop=stop, pending=pending)
-                return {"turn_id": turn_id, "stop": stop, "pending": pending, "commit": None}
-            sha, files = await wc.commit(f"turn {row['idx'] + 1}: {stop}")
-            # The row's status and sha with the `commit` event, which is published after it.
-            pub.finish(_STATUS.get(stop, "error"), stop=stop, commit=(sha, files))
-            return {"turn_id": turn_id, "stop": stop, "pending": [], "commit": sha}
+                pub.finish(stop, stop=stop, pending=pending)
+                return {"turn_id": turn_id, "stop": stop, "pending": pending, "version": None}
+            saved = await ws.save(f"turn {row['idx'] + 1}: {stop}")
+            # The row's status and version with `turn.saved`, which is published after it.
+            pub.finish(_STATUS.get(stop, "error"), stop=stop, saved=saved)
+            return {"turn_id": turn_id, "stop": stop, "pending": [], "version": saved[0]}
         except Exception:  # unlike a crash (CancelledError), a failure ends the turn
             self._record_failure(pub)
             raise
@@ -485,59 +601,59 @@ class Runner:
         return end
 
     async def revert(self, thread_id: str, turn_id: str) -> dict[str, Any]:
-        """Undo a committed turn's changes with a new commit, recorded as a new "revert" turn.
+        """Undo a saved turn's changes with a new version, recorded as a new "revert" turn.
 
         Appends a runner item telling the model what was reverted. Returns the same summary
-        shape as `turn()`. The note, the sha and the `commit` event are recorded in one
-        transaction; if git fails (e.g. a conflict) or the log cannot record them, git is
-        undone and no turn is recorded. If its process dies, the next call on the thread undoes
-        it (see `_retire_dead`). It refuses while the last turn is paused or failed to
-        commit: that turn's changes are not committed, so the revert would take them into its
-        own commit, or lose them if git aborts it.
+        shape as `turn()`. The note, the version and `turn.saved` are recorded in one
+        transaction; if the workspace fails (e.g. a git conflict) or the log cannot record them,
+        the workspace is reset and no turn is recorded. If its process dies, the next call on
+        the thread undoes it (see `_retire_dead`). It refuses while the last turn is paused or
+        failed to save: that turn's changes are in no version, so the revert would take them
+        into its own, or lose them if the workspace aborts it.
         """
         thread = self._thread(thread_id)
         target = next((t for t in self.log.turns(thread_id) if t["id"] == turn_id), None)
         if target is None or not target["commit_sha"]:
-            raise ValueError(f"turn {turn_id} of thread {thread_id} has no commit to revert")
+            raise ValueError(f"turn {turn_id} of thread {thread_id} has no saved version to revert")
         # Held until the revert is fully recorded: while its row says "running", a crash resume
-        # that got the lock would take git's revert commit for one that no turn recorded.
+        # that got the lock would take the workspace's revert for a version no turn recorded.
         with _exclusive(self._lock_path(thread_id)) as lock_fd:
             self._retire_dead(thread_id, lock_fd)
             self._refuse_while(thread_id, "revert", _REVERT_WAITS)
             row = self.log.start_turn(thread_id, "revert")
-            wc = WorkCopy(self.workdir(thread_id), lock_fd)
+            ws = self.make_workspace(self.workdir(thread_id), lock_fd)
             try:
-                await self._reconcile(wc, thread_id, row["id"])  # e.g. after a failed revert
-                head = await wc.head()
-                sha, files = await wc.revert(target["commit_sha"])
+                await self._reconcile(ws, thread_id, row["id"])  # e.g. after a failed revert
+                head = await ws.head()
+                saved = await ws.revert(target["commit_sha"])
             except Exception:
                 self._drop_turn(row["id"])  # it recorded nothing
                 raise
-            files_text = ", ".join(files) or "none"
+            files_text = ", ".join(saved[1]) or "none"
             note = f"[harness] Reverted turn {target['idx'] + 1}; files: {files_text}"
             message = {"role": "user", "content": note}
             try:
                 pub = _Publisher(self.log, self.sink, thread_id, row["id"], thread["impl"])
                 item = Item(f"{row['id']}:revert", row["id"], message)
-                pub.finish("done", item=item, commit=(sha, files))
+                pub.finish("done", item=item, saved=saved)
             except Exception:  # nothing is recorded: the thread goes back to where it was
-                with _logged_failure(f"undoing git's revert for turn {row['id']}"):
-                    await wc.recover(head, keep=False)
+                with _logged_failure(f"undoing the workspace's revert for turn {row['id']}"):
+                    await ws.recover(head, keep=False)
                 self._drop_turn(row["id"])
                 raise
-        return {"turn_id": row["id"], "stop": None, "pending": [], "commit": sha}
+        return {"turn_id": row["id"], "stop": None, "pending": [], "version": saved[0]}
 
     def compact(self, thread_id: str, summary: str) -> Item:
         """Append a compaction item (contract rule 8) as its own "compact" turn.
 
         The item and the finished row are recorded in one transaction, or nothing is.
-        Compaction changes no files, so the turn has no commit. It is refused while the last
+        Compaction changes no files, so the turn saves no version. It is refused while the last
         turn is paused: the summary would come between the pending calls and their results.
         """
         thread = self._thread(thread_id)
         with _exclusive(self._lock_path(thread_id)) as lock_fd:
             self._retire_dead(thread_id, lock_fd)
-            self._refuse_while(thread_id, "compact", _PAUSED)
+            self._refuse_while(thread_id, "compact", _OPEN)
             row = self.log.start_turn(thread_id, "compact")
             item = Item(
                 id=f"{row['id']}:compact",
@@ -554,7 +670,7 @@ class Runner:
         return item
 
     def _lock_path(self, thread_id: str) -> Path:
-        # Next to the working copy, not inside it, so it is never committed.
+        # Next to the workspace, not inside it, so it is never saved.
         return self.workdir(thread_id).parent / f"{thread_id}.lock"
 
     def _thread(self, thread_id: str) -> dict[str, Any]:
@@ -564,20 +680,21 @@ class Runner:
         return thread
 
     def _record_failure(self, pub: _Publisher) -> None:
-        """Record the end of a turn that failed before its commit was recorded, with its
+        """Record the end of a turn that failed before its saved version was recorded, with its
         buffered events (e.g. a turn.end whose flush failed).
 
-        A paused turn stays "paused" with its pending calls: the next turn must answer them.
-        Any other turn becomes "error" without a commit, so it does not block the thread; the
-        next turn repairs git and its commit includes the changes. Best effort: if the log fails
-        again (e.g. it is still locked), that is only logged, so the caller raises the first
-        error, and the turn stays "running" for a crash resume to take over.
+        A paused (or waiting) turn stays so with its pending calls: the next turn must answer
+        them.
+        Any other turn becomes "error" without a version, so it does not block the thread; the
+        next turn repairs the workspace and its version includes the changes. Best effort: if
+        the log fails again (e.g. it is still locked), that is only logged, so the caller raises
+        the first error, and the turn stays "running" for a crash resume to take over.
         """
         end = pub.end or {}
         stop = end.get("stop", "error")
         with _logged_failure(f"recording the end of turn {pub.turn_id}"):
-            if stop == "paused":
-                pub.finish("paused", stop=stop, pending=list(end.get("pending") or []))
+            if stop in _OPEN_STOPS:
+                pub.finish(stop, stop=stop, pending=list(end.get("pending") or []))
             else:
                 pub.finish("error", stop=stop)
 
@@ -598,9 +715,9 @@ class Runner:
         Called with the thread's lock held. Every revert and compaction holds it while it runs,
         so a "running" one is dead: its process died, or its failure could not be recorded. It
         recorded nothing (each records its end in one transaction). A compaction is deleted; a
-        revert is marked "error" and the next `_reconcile` undoes what git did for it. A dead
-        loop turn is left for a crash resume. Without OS locks (`lock_fd` None) a running turn
-        may be alive, so nothing is retired.
+        revert is marked "error" and the next `_reconcile` undoes what the workspace did for it.
+        A dead loop turn is left for a crash resume. Without OS locks (`lock_fd` None) a running
+        turn may be alive, so nothing is retired.
         """
         last = self.log.last_turn(thread_id)
         if lock_fd is None or last is None or last["status"] != "running":
@@ -611,40 +728,104 @@ class Runner:
             self.log.set_turn_status(last["id"], "error")
 
     def _refuse_while(self, thread_id: str, what: str, waits: dict[str, str]) -> None:
-        """Raise if the thread's last git turn has no commit and a status in `waits`: it left
-        something that must be resolved before `what`."""
-        turns = self._git_turns(thread_id)
+        """Raise if the thread's last workspace turn has no saved version and a status in
+        `waits`: it left something that must be resolved before `what`. With "waiting" in
+        `waits`, also while any call of the thread waits for its result (say, one whose turn
+        then failed)."""
+        if "waiting" in waits and (waiting := self._waiting(thread_id)):
+            raise RuntimeError(f"cannot {what}: calls {waiting} wait for their results")
+        turns = self._ws_turns(thread_id)
         last = turns[-1] if turns else None
-        # A revert without a sha recorded nothing, and `_reconcile` undoes what git did for it.
+        # A revert without a version recorded nothing, and `_reconcile` undoes its changes.
         if last is None or last["kind"] == "revert" or last["commit_sha"]:
             return
         if last["status"] in waits:
             raise RuntimeError(f"cannot {what}: turn {last['id']} {waits[last['status']]}")
 
-    def _git_turns(self, thread_id: str) -> list[dict[str, Any]]:
-        """The thread's turns that use the working copy (all but compactions), in order."""
+    def _waiting(self, thread_id: str) -> list[str]:
+        """The calls that wait for their results (contract rule 9): calls of the last complete
+        assistant item that no result item after it answers, whose run said `pending` (a stored
+        `tool.end`) in that item's turn or a later one. A pending run whose call never reached
+        history (a read-only call started early, before its response failed or was cut off)
+        waits for nothing, and neither does an older call with the same id."""
+        items = self.log.items(thread_id)
+        last = next((n for n in reversed(range(len(items))) if _complete_answer(items[n])), None)
+        if last is None:
+            return []
+        order = {t["id"]: t["idx"] for t in self.log.turns(thread_id)}
+        since = order.get(items[last].turn_id, 0)
+        ends = self.log.events(thread_id, types=("tool.end",))
+        pending = {
+            e["data"].get("call_id")
+            for e in ends
+            if e["data"].get("pending") and order.get(e["turn"], -1) >= since
+        }
+        answered = {item.message.get("tool_call_id") for item in items[last + 1 :]}
+        calls = [call.get("id") for call in items[last].message.get("tool_calls") or ()]
+        return [c for c in calls if c in pending and c not in answered]
+
+    def _resume(self, thread_id: str, resume: Resume) -> Resume:
+        """`resume` as the loop gets it: with the calls still waiting in `waiting` and, for the
+        crash resume of a tool_result turn, the results that turn delivered but did not save.
+        Raises ValueError for a delivery of a call that does not wait."""
+        waiting = self._waiting(thread_id)
+        results = dict(resume.results)
+        if resume.decisions and resume.kind != "approval":
+            raise ValueError("only an approval resume carries decisions")
+        if asked := [c for c in resume.decisions if c in waiting]:
+            raise ValueError(f"calls {asked} wait for their results: nobody asked about them")
+        if results and resume.kind == "approval":
+            raise ValueError("results come with a tool_result resume")
+        if resume.kind == "tool_result":
+            self._refuse_while(thread_id, "deliver tool results", _PAUSED)
+            wrong = [
+                c for c, r in results.items() if c not in waiting or r.call_id != c or r.pending
+            ]
+            if wrong or not results:
+                raise ValueError(f"cannot deliver results for {wrong}: waiting for {waiting}")
+        elif resume.kind == "crash":
+            last = self.log.last_turn(thread_id)
+            died = last["id"] if last is not None and last["status"] == "running" else None
+            delivered = self._delivered(thread_id, died) if died else {}
+            results = {c: r for c, r in delivered.items() if c in waiting}
+        return replace(
+            resume, results=results, waiting=tuple(c for c in waiting if c not in results)
+        )
+
+    def _delivered(self, thread_id: str, turn_id: str) -> dict[str, ToolResult]:
+        """The results the `turn.start` of turn `turn_id` delivered, if it was a resume."""
+        start = next(
+            (e for e in self.log.events(thread_id, types=("turn.start",)) if e["turn"] == turn_id),
+            None,
+        )
+        resume = (start or {}).get("data", {}).get("resume") or {}
+        return {c: ToolResult(**r) for c, r in (resume.get("results") or {}).items()}
+
+    def _ws_turns(self, thread_id: str) -> list[dict[str, Any]]:
+        """The thread's turns that use the workspace (all but compactions), in order."""
         return [t for t in self.log.turns(thread_id) if t["kind"] != "compact"]
 
-    async def _reconcile(self, wc: WorkCopy, thread_id: str, turn_id: str) -> None:
-        """Before turn `turn_id` uses git, repair what the git turn before it left, if that turn
-        died ("running") or failed ("error" without a sha): git may hold a commit that no turn
-        recorded, a stale lock, or a revert in progress.
+    async def _reconcile(self, ws: Workspace, thread_id: str, turn_id: str) -> None:
+        """Before turn `turn_id` uses the workspace, repair what the workspace turn before it
+        left, if that turn died ("running") or failed ("error" without a version): the workspace
+        may hold a version that no turn recorded (with git: a commit, a stale lock, or a revert
+        in progress).
 
-        A revert records its note, sha and commit event at once, so one without a sha recorded
-        nothing: undo all that git did for it (it started from a clean tree at the last recorded
-        commit) and mark it "error", so the model never sees changes it was not told about. For
-        any other turn, move HEAD back to the last recorded commit; the changes after it stay
-        staged, so this turn's commit includes them.
+        A revert records its note, version and `turn.saved` at once, so one without a version
+        recorded nothing: undo all that the workspace did for it (it started from a clean tree
+        at the last recorded version) and mark it "error", so the model never sees changes it
+        was not told about. For any other turn, go back to the last recorded version and keep
+        the files, so this turn's version includes the changes.
         """
-        turns = [t for t in self._git_turns(thread_id) if t["id"] != turn_id]
+        turns = [t for t in self._ws_turns(thread_id) if t["id"] != turn_id]
         last = turns[-1] if turns else None
         if last is None or last["status"] not in ("running", "error") or last["commit_sha"]:
             return
-        shas = [t["commit_sha"] for t in turns if t["commit_sha"]]
+        versions = [t["commit_sha"] for t in turns if t["commit_sha"]]
         if last["kind"] != "revert":
-            await wc.recover(shas[-1] if shas else None)
+            await ws.recover(versions[-1] if versions else None)
             return
-        await wc.recover(shas[-1] if shas else None, keep=False)
+        await ws.recover(versions[-1] if versions else None, keep=False)
         if last["status"] == "running":
             self.log.set_turn_status(last["id"], "error")
 

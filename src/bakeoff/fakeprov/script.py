@@ -55,6 +55,9 @@ class Scenario:
     # completions), or "responses" (the Responses API, the only style of its scenarios).
     style: str
     strict: dict[str, Any]
+    # Tools whose runs start work that finishes later (`ToolHostImpl`'s `background`): their
+    # calls wait until a `deliver` step delivers their results.
+    background_tools: list[str] = field(default_factory=list)
 
     @property
     def api(self) -> Api:
@@ -220,8 +223,27 @@ _RESPONSES_OPS = {
 # The ops that end a Responses stream: every stream has exactly one, as its last op.
 _RESPONSES_ENDS = ("completed", "incomplete", "error", "failed", "stall")
 
+_DECISION = {"enum": ["allow", "ask", "deny"]}
+_RULES = {
+    "type": "object",
+    "additionalProperties": {
+        "anyOf": [_DECISION, {"type": "object", "additionalProperties": _DECISION}]
+    },
+}
 _STEPS = {
-    "user": _obj({"user": _STR, "cancel_after_ms": _INT0}, "user"),
+    # `user` is text or chat content parts (`contract.UserContent`). `system` and `rules` change
+    # the thread's settings from this turn on (`Runner.turn`).
+    "user": _obj(
+        {
+            "user": {
+                "anyOf": [_STR, {"type": "array", "minItems": 1, "items": {"type": "object"}}]
+            },
+            "cancel_after_ms": _INT0,
+            "system": _STR,
+            "rules": _RULES,
+        },
+        "user",
+    ),
     "approve": _obj(
         {
             "approve": _obj(
@@ -235,6 +257,14 @@ _STEPS = {
         {"crash_after": {"enum": [*LOOP_EVENTS, *SHARED_EVENTS]}, "call_id": _STR}, "crash_after"
     ),
     "resume": _obj({"resume": {"const": "crash"}}, "resume"),
+    # {call id: content}: the finished results of waiting calls, as a "tool_result" resume.
+    "deliver": _obj(
+        {
+            "deliver": {"type": "object", "minProperties": 1, "additionalProperties": _STR},
+            "new_process": _BOOL,
+        },
+        "deliver",
+    ),
     "revert": _obj({"revert": _INT1}, "revert"),
     "compact": _obj({"compact": _STR}, "compact"),
 }
@@ -243,13 +273,14 @@ _STEPS = {
 _REQUIRED = tuple("id title system model rules limits engine driver exchanges expect".split())
 # Event types a `crash_after` step can narrow down to one tool call (see fakeprov/README.md).
 _CALL_EVENTS = ("tool_call.ready", "permission.asked", "tool.start", "tool.end", "item")
-_DECISION = {"enum": ["allow", "ask", "deny"]}
 _KINDS = {"enum": ["openrouter", "openai_compat", "openai_responses"]}
 _STYLE = {"enum": ["openrouter", "openai"]}
 _STRICT = {
     "chat": _obj({"reject_params": _STRS, "reject_unsigned_reasoning": _BOOL}),
     "responses": _obj({"reject_params": _STRS, "reject_unencrypted_reasoning": _BOOL}),
 }
+# A message's content parts, each checked on the keys it lists (nested objects too).
+_PARTS = {"type": "array", "items": {"type": "object"}}
 # Exchange `expect` keys that read the body as it is, in both APIs.
 _BODY_EXPECT = {
     "body_has": _STRS,
@@ -272,10 +303,13 @@ _EXCHANGE_EXPECT = {
             "last_content_contains": _STR,
             "messages_len": _INT1,
             "tool_result_contains": {"type": "object", "additionalProperties": _STR},
-            # Checks on specific messages; `index` may be negative (from the end).
+            # Checks on specific messages; `index` may be negative (from the end). `parts`: the
+            # content is exactly that many parts, each with the given keys and values.
             "messages_at": {
                 "type": "array",
-                "items": _obj({"index": {"type": "integer"}, "role": _STR, "contains": _STR}),
+                "items": _obj(
+                    {"index": {"type": "integer"}, "role": _STR, "contains": _STR, "parts": _PARTS}
+                ),
             },
         }
     ),
@@ -299,6 +333,7 @@ _EXCHANGE_EXPECT = {
                         "role": _STR,
                         "contains": _STR,
                         "phase": _STR,
+                        "parts": _PARTS,
                     },
                     "index",
                 ),
@@ -326,6 +361,12 @@ _FINAL_EXPECT = _obj(
         "tools_overlap": {"type": "array", "items": _STR, "minItems": 2, "uniqueItems": True},
         # Every turn the driver cancels (`cancel_after_ms`) ends this soon after the cancel.
         "cancel_within_ms": {"type": "number", "minimum": 0},
+        # {event type: n}: how many events of that type the log holds, all turns together.
+        "events": {
+            "type": "object",
+            "propertyNames": {"enum": [*LOOP_EVENTS, *SHARED_EVENTS]},
+            "additionalProperties": _INT0,
+        },
     },
     "stops",
 )
@@ -357,12 +398,7 @@ def _schema(api: Api) -> dict[str, Any]:
         # null: send no temperature (reasoning models reject one); absent: ModelConfig's default
         "temperature": {"type": ["number", "null"]},
         "compat": {"type": "object"},
-    }
-    rules = {
-        "type": "object",
-        "additionalProperties": {
-            "anyOf": [_DECISION, {"type": "object", "additionalProperties": _DECISION}]
-        },
+        "context_window": _INT1,
     }
     return _obj(
         {
@@ -370,11 +406,12 @@ def _schema(api: Api) -> dict[str, Any]:
             "title": _STR,
             "system": _STR,
             "model": _obj(model, "kind", "model"),
-            "rules": rules,
+            "rules": _RULES,
             "limits": _obj({"max_steps": _INT1}, "max_steps"),
             "engine": _obj({"delay_ms": _INT0}, "delay_ms"),
             **styles,
             "strict": _STRICT[api],
+            "background_tools": {"type": "array", "items": _STR, "uniqueItems": True},
             "driver": {"type": "array", "minItems": 1, "items": _kinds(_STEPS)},
             "exchanges": {
                 "type": "array",
@@ -414,6 +451,7 @@ def load_scenario(path: Path) -> Scenario:
         **{key: data[key] for key in _REQUIRED},
         style=data.get("style", default_style or "openrouter"),
         strict=data.get("strict", {}),
+        background_tools=data.get("background_tools", []),
     )
 
 
@@ -474,10 +512,23 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
     turns = 0  # steps that run a turn to its end in this process
     for i, step in enumerate(steps):
         crashed = i > 0 and "crash_after" in steps[i - 1]
-        if "approve" in step or "resume" in step or ("user" in step and not crashed):
+        if (
+            "approve" in step
+            or "resume" in step
+            or ({"user", "deliver"} & set(step) and not crashed)
+        ):
             turns += 1
-        if "crash_after" in step and (i + 1 == len(steps) or "user" not in steps[i + 1]):
-            fail(f"$.driver[{i}]", "crash_after must be followed by a user step")
+        if "crash_after" in step and (
+            i + 1 == len(steps) or not {"user", "deliver"} & set(steps[i + 1])
+        ):
+            fail(f"$.driver[{i}]", "crash_after must be followed by a user or deliver step")
+        if (
+            crashed
+            and "user" in step
+            and ({"system", "rules"} & set(step) or not isinstance(step["user"], str))
+        ):
+            # It runs as `bakeoff turn --user TEXT` in a child process.
+            fail(f"$.driver[{i}]", "the user step after crash_after takes text only, no settings")
         if "call_id" in step:
             referenced.add(step["call_id"])
             if step["crash_after"] not in _CALL_EVENTS:
@@ -486,6 +537,7 @@ def _check_semantics(name: str, data: dict[str, Any], api: Api) -> None:
             allowed = approve.get("allow", [])
             referenced |= set(approve.get("deny", []))
             referenced |= set() if allowed == "all" else set(allowed)
+        referenced |= set(step.get("deliver", {}))
     if unknown := sorted(referenced - set(call_ids)):
         fail("$.expect", f"unknown tool call ids: {unknown}")
     if len(data["expect"]["stops"]) != turns:
@@ -685,7 +737,28 @@ def _expect_failures(
             )
         if "contains" in check and check["contains"] not in _text(message.get("content")):
             failures.append(f"message {i} lacks {check['contains']!r}")
+        if "parts" in check and (problem := _parts_problem(message.get("content"), check["parts"])):
+            failures.append(f"message {i} {problem}")
     return failures
+
+
+def _parts_problem(content: object, want: list[dict[str, Any]]) -> str | None:
+    """Why `content` is not exactly the parts `want` lists (each with at least its keys), or
+    None."""
+    got = content if isinstance(content, list) else []
+    if len(got) != len(want):
+        return f"has {len(got)} content parts, expected {len(want)}"
+    for n, (part, expected) in enumerate(zip(got, want, strict=True)):
+        if not _has(part, expected):
+            return f"content part {n} is {json.dumps(part)[:200]}, expected {json.dumps(expected)}"
+    return None
+
+
+def _has(got: object, want: object) -> bool:
+    """Whether `got` equals `want`, where an object needs only the keys `want` has."""
+    if isinstance(want, dict):
+        return isinstance(got, dict) and all(k in got and _has(got[k], v) for k, v in want.items())
+    return got == want
 
 
 def _text(content: object) -> str:
@@ -925,6 +998,11 @@ def _malformed_parts(parts: str | list[Any], types: tuple[str, ...], at: str) ->
             problem := _field_problem(part, "text", (str,), where)
         ):
             return problem
+        # An image is a URL (a data URL too) or an uploaded file's id.
+        if part["type"] == "input_image" and not any(
+            isinstance(part.get(key), str) for key in ("image_url", "file_id")
+        ):
+            return _missing(f"{where}.image_url")
     return None
 
 
@@ -1102,6 +1180,8 @@ def _input_failures(
                 failures.append(f"input item {i} {key} is {got[key]!r}, expected {check[key]!r}")
         if "contains" in check and check["contains"] not in _item_text(item):
             failures.append(f"input item {i} lacks {check['contains']!r}")
+        if "parts" in check and (problem := _parts_problem(item.get("content"), check["parts"])):
+            failures.append(f"input item {i} {problem}")
     scripted = _scripted_reasoning(scenario, index)  # the loader checks each id is in it
     for rid in expect.get("reasoning_replayed", []):
         # A thread's model config is fixed, so this request asks for summaries if the one that

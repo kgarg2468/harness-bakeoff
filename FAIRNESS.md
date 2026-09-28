@@ -7,8 +7,9 @@
    session log.
 3. **A is used the recommended way.** See `A_CHECKLIST.md`. Its reviewer can change it.
 4. **Same feature floor.** Both have retries with backoff, provider-reported cost, bad-argument
-   feedback, cancel, a step cap, approvals that survive a restart, and crash resume. Each is
-   covered by a test, so B can't look small by skipping work.
+   feedback, cancel, a step cap, approvals that survive a restart, tool results that arrive
+   later (waiting turns), images in user messages, `context.near_limit`, and crash resume. Each
+   is covered by a test, so B can't look small by skipping work.
 5. **Scenarios that favour A are included** (cancel repair, built-in features), and the report
    has a "where A wins" section.
 6. **Predictions first.** `PREDICTIONS.md` was committed before either loop was written.

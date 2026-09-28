@@ -323,13 +323,18 @@ def _args(raw: Any) -> str:
 
 
 def _text(content: Any) -> str:
-    """A message's content as text (list content is joined text parts)."""
+    """A message's content as text (list content is joined text parts; an image part shows as
+    `[image]`)."""
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+        return "".join(
+            "[image]" if p.get("type") == "image_url" else str(p.get("text", ""))
+            for p in content
+            if isinstance(p, dict)
+        )
     return json.dumps(content, ensure_ascii=False)
 
 
@@ -471,7 +476,7 @@ def build_replay(events: list[dict[str, Any]], turns: list[dict[str, Any]]) -> d
 
     Lanes: `model` (one segment per request: waiting for the first token, then streaming),
     `tools` (tool.start to tool.end, stacked when they overlap), `perm` (approval asked and
-    answered) and `git` (commits, reverts, compaction)."""
+    answered) and `git` (saved versions, i.e. git commits, reverts, compaction)."""
     rows = {t["id"]: t for t in turns}
     by_turn: dict[str, list[dict]] = {}
     for e in events:
@@ -693,12 +698,16 @@ class _TurnWalk:
                       "usage": dict(self.usage)})  # fmt: skip
 
     def on_commit(self, t: float, data: dict, is_late: bool) -> None:
+        """A log written before `turn.saved` replaced it ends a saved turn with `commit`."""
+        self.on_turn_saved(t, {"version": data.get("sha"), "files": data.get("files")}, is_late)
+
+    def on_turn_saved(self, t: float, data: dict, is_late: bool) -> None:
         files = sorted(map(str, data.get("files") or []))
-        sha = data.get("sha")
+        version = data.get("version")
         self.lanes["git"].append(
-            {"turn": self.ti, "t": t, "kind": "commit", "sha": sha, "files": files}
+            {"turn": self.ti, "t": t, "kind": "saved", "version": version, "files": files}
         )
-        self.card(t, {"k": "commit", "sha": sha, "files": files})
+        self.card(t, {"k": "saved", "version": version, "files": files})
 
 
 # --- wire recordings ----------------------------------------------------------------------

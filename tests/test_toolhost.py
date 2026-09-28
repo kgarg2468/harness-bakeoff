@@ -1,11 +1,14 @@
 import asyncio
+import dataclasses
 import json
 
 import pytest
 
+from bakeoff.shared import toolhost
 from bakeoff.shared.contract import ToolCall
 from bakeoff.shared.engine.mock import MockEngine
 from bakeoff.shared.toolhost import MAX_OUTPUT, ToolHostImpl, build_toolhost
+from bakeoff.shared.tools import ToolPending
 
 ORDER = [
     "list_components",
@@ -79,13 +82,13 @@ async def test_default_engine_is_the_mock(make):
     assert result.ok and json.loads(result.content)["lanes"] == {"_source": ["questions"]}
 
 
-def test_check_uses_rules_and_paths(make):
+async def test_check_uses_rules_and_paths(make):
     host = make({"*": "allow", "write_file": {"*.pipe": "allow", "*": "ask"}, "edit_file": "deny"})
-    assert host.check(call("write_file", {"path": "dir/../a.pipe", "content": ""})) == "allow"
-    assert host.check(call("write_file", {"path": "a.txt", "content": ""})) == "ask"
+    assert await host.check(call("write_file", {"path": "dir/../a.pipe", "content": ""})) == "allow"
+    assert await host.check(call("write_file", {"path": "a.txt", "content": ""})) == "ask"
     edit = {"path": "a.pipe", "old_string": "a", "new_string": "b"}
-    assert host.check(call("edit_file", edit)) == "deny"
-    assert host.check(call("list_components")) == "allow"
+    assert await host.check(call("edit_file", edit)) == "deny"
+    assert await host.check(call("list_components")) == "allow"
 
 
 @pytest.mark.parametrize(
@@ -103,7 +106,7 @@ def test_check_uses_rules_and_paths(make):
 )
 async def test_path_escape_is_always_denied(make, events, name, args):
     host = make({"*": "allow"})
-    assert host.check(call(name, args)) == "deny"
+    assert await host.check(call(name, args)) == "deny"
     result = await host.run(call(name, args))
     assert not result.ok and result.content.startswith("Denied: ")
     assert host.run_counts == {}
@@ -121,7 +124,7 @@ async def test_deny_is_enforced_by_run(make, tmp_path):
 async def test_ask_is_the_loops_job(make, tmp_path):
     host = make({"*": "ask"})
     args = {"path": "a.pipe", "content": "{}"}
-    assert host.check(call("write_file", args)) == "ask"
+    assert await host.check(call("write_file", args)) == "ask"
     assert (await host.run(call("write_file", args))).ok  # run() only enforces deny
     assert (tmp_path / "a.pipe").exists()
 
@@ -160,7 +163,7 @@ async def test_bad_calls_are_reported_not_raised(make, name, arguments, message)
     host = make({"*": "ask"})
     bad = ToolCall(id="c1", name=name, arguments=arguments)
     # run() rejects these without executing, so the loop need not ask first.
-    assert host.check(bad) == "allow"
+    assert await host.check(bad) == "allow"
     result = await host.run(bad)
     assert not result.ok
     assert result.content.startswith(message)
@@ -276,3 +279,103 @@ async def test_a_failed_end_emit_still_returns_the_result(tmp_path):
     result = await host.run(call("write_file", {"path": "a.txt", "content": "x"}))
     assert result.ok and (tmp_path / "a.txt").read_text() == "x"
     assert [str(e) for e in host.emit_errors] == ["end lost"]
+
+
+def swap_tool(monkeypatch, name, fn=None, **spec_changes):
+    """Replace a registered tool's function or spec fields for one test."""
+    tool = toolhost._BY_NAME[name]
+    new = dataclasses.replace(
+        tool, fn=fn or tool.fn, spec=dataclasses.replace(tool.spec, **spec_changes)
+    )
+    monkeypatch.setitem(toolhost._BY_NAME, name, new)
+
+
+async def test_a_tool_over_its_time_limit_fails(make, events, monkeypatch):
+    swap_tool(monkeypatch, "describe_component", timeout_s=0.05)
+    host = make(engine=MockEngine(delay_ms=2_000))
+    result = await host.run(call("describe_component", {"name": "chat"}))
+    assert (result.ok, result.error) == (False, "failed")
+    assert result.content == "describe_component timed out after 0.05 s"
+    assert events[-1].data["ok"] is False and events[-1].data["ms"] < 1_000
+    fast = await make(engine=MockEngine(delay_ms=0)).run(
+        call("describe_component", {"name": "chat"})
+    )
+    assert fast.ok  # within the limit
+
+
+async def test_a_timeout_the_tool_raises_itself_is_an_ordinary_failure(make, monkeypatch):
+    async def gives_up(args, ctx):
+        raise TimeoutError("the engine did not answer")
+
+    swap_tool(monkeypatch, "list_components", gives_up)
+    result = await make().run(call("list_components"))
+    assert result.content == "list_components failed: TimeoutError: the engine did not answer"
+
+
+async def test_progress_goes_out_as_tool_progress_events(make, events, monkeypatch):
+    async def counts(args, ctx):
+        for n in (1, 2):
+            ctx.progress(f"step {n} of 2")
+        return "done"
+
+    swap_tool(monkeypatch, "list_components", counts)
+    result = await make().run(call("list_components"))
+    assert result.ok and result.content == "done"
+    assert [(e.type, e.data) for e in events] == [
+        ("tool.start", {"call_id": "c1", "name": "list_components", "read_only": True}),
+        ("tool.progress", {"call_id": "c1", "name": "list_components", "message": "step 1 of 2"}),
+        ("tool.progress", {"call_id": "c1", "name": "list_components", "message": "step 2 of 2"}),
+        ("tool.end", events[-1].data),
+    ]
+    assert "pending" not in events[-1].data
+
+
+async def test_a_tool_that_starts_work_for_later_gives_a_pending_result(make, events, monkeypatch):
+    async def starts(args, ctx):
+        raise ToolPending("run 42 started")
+
+    swap_tool(monkeypatch, "list_components", starts)
+    result = await make().run(call("list_components"))
+    assert (result.ok, result.content, result.error, result.pending) == (
+        True,
+        "run 42 started",
+        None,
+        True,
+    )
+    assert events[-1].type == "tool.end" and events[-1].data["pending"] is True
+
+
+async def test_a_background_tool_only_starts_its_work(tmp_path, events):
+    host = build_toolhost(tmp_path, {"*": "allow"}, events.append, background=["validate_pipeline"])
+    result = await host.run(call("validate_pipeline", {"path": "a.pipe"}))  # no such file yet
+    assert result.pending and result.ok
+    assert result.content == "validate_pipeline started; its result comes when it finishes"
+    assert host.run_counts == {"c1": 1}
+    assert [e.type for e in events] == ["tool.start", "tool.end"]
+    assert events[-1].data["pending"] is True
+    # Bad arguments and deny rules still answer at once, as for any tool.
+    bad = await host.run(call("validate_pipeline", {}, "c2"))
+    assert (bad.pending, bad.error) == (False, "invalid_args")
+    denied = build_toolhost(
+        tmp_path,
+        {"*": "allow", "validate_pipeline": "deny"},
+        events.append,
+        background=["validate_pipeline"],
+    )
+    assert (await denied.run(call("validate_pipeline", {"path": "a.pipe"}, "c3"))).error == "denied"
+
+
+async def test_a_pending_run_that_cannot_be_recorded_as_waiting_is_answered_now(tmp_path):
+    """Without a stored pending tool.end nothing says the call waits, and a resume could run it
+    again: like an unrecorded start, it fails now (the model sees why)."""
+
+    def loses_pending_ends(event):
+        if event.type == "tool.end" and event.data.get("pending"):
+            raise RuntimeError("log locked")
+
+    host = build_toolhost(
+        tmp_path, {"*": "allow"}, loses_pending_ends, background=["validate_pipeline"]
+    )
+    result = await host.run(call("validate_pipeline", {"path": "a.pipe"}))
+    assert (result.ok, result.error, result.pending) == (False, "failed", False)
+    assert "not recorded as waiting" in result.content

@@ -41,7 +41,7 @@ from typing import Any, Literal
 from bakeoff import loops
 from bakeoff.fakeprov.script import SCENARIOS_DIR, Scenario, load_scenario
 from bakeoff.fakeprov.server import FakeProvider
-from bakeoff.shared.contract import Event, Limits, Loop, ModelConfig, Resume, ToolHost
+from bakeoff.shared.contract import Event, Limits, Loop, ModelConfig, Resume, ToolHost, ToolResult
 from bakeoff.shared.engine.mock import MockEngine
 from bakeoff.shared.invariants import (
     Check,
@@ -58,7 +58,8 @@ from bakeoff.shared.workcopy import GIT_CONFIG, git_env
 
 RESULT_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[3]
-LOOP_TURNS = ("user", "approval", "crash")  # turn kinds that run a loop (not revert/compact)
+# Turn kinds that run a loop (not revert/compact).
+LOOP_TURNS = ("user", "approval", "crash", "tool_result")
 MODEL_TIMEOUT_S = 30.0  # a scenario request that hangs longer than this is a failure anyway
 CHILD_TIMEOUT_S = 60.0
 # What a child step runs after the interpreter: `bakeoff`, whose registry loads the thread's loop.
@@ -127,11 +128,12 @@ def check_quiet(stdout: str, stderr: str) -> Check:
 # --- sessions: one directory with log.sqlite, wc/ and events.ndjson -------------------------
 
 
-class Workspace:
+class RunDir:
     """A run directory: the session log, the working copies and the event mirror.
 
     `sinks` get every published event after the mirror has it (so a crash in a sink never loses
     the event from events.ndjson). Paths default to the layout above, relative to `db`'s folder.
+    `background` names the tools whose runs only start their work (`ToolHostImpl`).
     """
 
     def __init__(
@@ -142,18 +144,21 @@ class Workspace:
         events: Path | None = None,
         engine_delay_ms: int = 0,
         sinks: Sequence[Sink] = (),
+        background: Sequence[str] = (),
     ) -> None:
         self.root = db.parent
         self.log = SessionLog(db)
         self.mirror = NdjsonMirror(events or self.root / "events.ndjson")
         self.engine_delay_ms = engine_delay_ms
+        self.background = list(background)
         self.sinks = list(sinks)
         self.runner = Runner(self.log, wc or self.root / "wc", self._tools, sink=self._publish)
 
     def _tools(
         self, workdir: Path, rules: dict[str, Any], emit: Callable[[Event], None]
     ) -> ToolHost:
-        return build_toolhost(workdir, rules, emit, MockEngine(delay_ms=self.engine_delay_ms))
+        engine = MockEngine(delay_ms=self.engine_delay_ms)
+        return build_toolhost(workdir, rules, emit, engine, self.background)
 
     def _publish(self, envelope: dict[str, Any]) -> None:
         self.mirror(envelope)
@@ -244,12 +249,21 @@ async def worker_turn(
     wc: Path | None = None,
     events: Path | None = None,
     sinks: Sequence[Sink] = (),
+    background: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """Run one turn of an existing thread in this process (the `bakeoff turn/approve/resume`
-    workers). The loop comes from the registry by the thread's impl; the model from its meta.
-    A `bakeoff cancel` from another process stops it. Returns the runner's summary plus the pid.
+    """Run one turn of an existing thread in this process (the `bakeoff turn/approve/deliver/
+    resume` workers). The loop comes from the registry by the thread's impl; the model from its
+    meta. A `bakeoff cancel` from another process stops it. Returns the runner's summary plus
+    the pid.
     """
-    ws = Workspace(db, wc=wc, events=events, engine_delay_ms=engine_delay_ms, sinks=sinks)
+    ws = RunDir(
+        db,
+        wc=wc,
+        events=events,
+        engine_delay_ms=engine_delay_ms,
+        sinks=sinks,
+        background=background,
+    )
     try:
         thread = ws.thread(thread_id)
         loop = loops.load(thread["impl"])()
@@ -326,11 +340,15 @@ class _ScenarioRun:
             kind=sc.model["kind"],  # as the scenario says: it picks the API a loop must speak
             reasoning=sc.model.get("reasoning"),
             compat=sc.model.get("compat") or {},
+            context_window=sc.model.get("context_window"),
             timeout_s=MODEL_TIMEOUT_S,
             **temperature,
         )
-        self.ws = Workspace(
-            directory / "log.sqlite", engine_delay_ms=sc.engine["delay_ms"], sinks=[self._on_event]
+        self.ws = RunDir(
+            directory / "log.sqlite",
+            engine_delay_ms=sc.engine["delay_ms"],
+            sinks=[self._on_event],
+            background=sc.background_tools,
         )
         # I5: what this process wrote while the loop existed, then each child's extra output.
         self.stdout: list[str] = []
@@ -359,16 +377,25 @@ class _ScenarioRun:
             try:
                 if "crash_after" in step:
                     crash = step
-                elif "user" in step and crash is not None:
-                    args = ["--user", step["user"], "--crash-after", crash["crash_after"]]
-                    if "call_id" in crash:
-                        args += ["--call-id", crash["call_id"]]
-                    await self._child(n, "turn", args, killed=True)
+                elif crash is not None:  # the user or deliver step after crash_after
+                    point = ["--crash-after", crash["crash_after"]]
+                    point += ["--call-id", crash["call_id"]] if "call_id" in crash else []
+                    if "user" in step:
+                        await self._child(n, "turn", ["--user", step["user"], *point], killed=True)
+                    else:
+                        await self._child(n, "deliver", [*_delivery(step), *point], killed=True)
                     crash = None
                 elif "user" in step:
-                    await self._turn(user_text=step["user"], cancel_ms=step.get("cancel_after_ms"))
+                    await self._turn(
+                        user_text=step["user"],
+                        cancel_ms=step.get("cancel_after_ms"),
+                        system=step.get("system"),
+                        rules=step.get("rules"),
+                    )
                 elif "approve" in step:
                     await self._approve(n, step)
+                elif "deliver" in step:
+                    await self._deliver(n, step)
                 elif "resume" in step:
                     await self._turn(resume=Resume(kind="crash"))
                 elif "revert" in step:
@@ -385,6 +412,8 @@ class _ScenarioRun:
         user_text: str | None = None,
         resume: Resume | None = None,
         cancel_ms: int | None = None,
+        system: str | None = None,
+        rules: dict[str, Any] | None = None,
     ) -> None:
         cancel = asyncio.Event()
         timers: list[asyncio.TimerHandle] = []
@@ -411,6 +440,8 @@ class _ScenarioRun:
                 resume=resume,
                 limits=self.limits,
                 cancel=cancel,
+                system=system,
+                rules=rules,
             )
         finally:
             self._on_start = None
@@ -430,6 +461,14 @@ class _ScenarioRun:
             args.append(f"--reason={reason}")
         await self._child(n, "approve", args, killed=False)
 
+    async def _deliver(self, n: int, step: dict[str, Any]) -> None:
+        """Deliver finished results of waiting calls (a "tool_result" resume)."""
+        if step.get("new_process"):
+            await self._child(n, "deliver", _delivery(step), killed=False)
+            return
+        results = {c: ToolResult(c, True, text) for c, text in step["deliver"].items()}
+        await self._turn(resume=Resume(kind="tool_result", results=results))
+
     async def _child(self, n: int, command: str, args: list[str], *, killed: bool) -> None:
         """Run `bakeoff <command>` for this thread as a separate OS process.
 
@@ -444,6 +483,7 @@ class _ScenarioRun:
             f"--db={self.ws.log_path}",
             f"--max-steps={self.limits.max_steps}",
             f"--engine-delay-ms={self.sc.engine['delay_ms']}",
+            *(f"--background-tool={name}" for name in self.sc.background_tools),
             *args,
         ]
         # Unbuffered, so what the child writes before a SIGKILL still reaches the pipe.
@@ -486,6 +526,11 @@ class _ScenarioRun:
                 f"{command} process {proc.pid} exited with {proc.returncode}: {err.strip()[-300:]}"
             )
         record["summary"] = json.loads(last)
+
+
+def _delivery(step: dict[str, Any]) -> list[str]:
+    """A deliver step's results as `bakeoff deliver` options."""
+    return [f"--ok={call_id}={text}" for call_id, text in step["deliver"].items()]
 
 
 async def run_scenario(
@@ -635,6 +680,7 @@ class Observed:
     # per cancelled turn: (turn id, ms from the cancel to turn.end); ms is 0.0 if the turn
     # ended before its cancel fired, None if it never started or never ended
     cancels: list[tuple[str | None, float | None]] = field(default_factory=list)
+    events: dict[str, int] = field(default_factory=dict)  # event type -> how many the log has
 
 
 ToolSpan = tuple[str, int, int | None]
@@ -678,6 +724,7 @@ def observe(
         bodies=bodies,
         tool_spans=tool_spans(events),
         cancels=[cancel_latency(events, mark) for mark in cancels],
+        events=dict(Counter(e["type"] for e in events)),
     )
 
 
@@ -801,6 +848,8 @@ def _expect(key: str, want: Any, obs: Observed) -> tuple[bool, str]:
             return equal(sources[0] if len(sources) == 1 else sources)
         case "tools_overlap":
             return _overlap(want, obs.tool_spans)
+        case "events":
+            return equal({kind: obs.events.get(kind, 0) for kind in want})
         case "cancel_within_ms":
             if not obs.cancels:
                 return False, "no turn was cancelled"

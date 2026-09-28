@@ -63,13 +63,14 @@ a file (JSON schema plus cross-checks) and raises `ScenarioError` naming the exa
 | Key | Meaning |
 |---|---|
 | `id`, `title` | `S01` ...; one-line description |
-| `system` | the thread's frozen system prompt |
-| `model` | `{"kind": "openrouter" \| "openai_compat" \| "openai_responses", "model", "reasoning"?, "temperature"?, "compat"?}` → `ModelConfig` (passed through unchanged; `temperature: null` sends none, absent keeps `ModelConfig`'s default). `openai_responses` scripts the [Responses API](#responses-api-mode) |
+| `system` | the thread's system prompt (a user step may change it) |
+| `model` | `{"kind": "openrouter" \| "openai_compat" \| "openai_responses", "model", "reasoning"?, "temperature"?, "compat"?, "context_window"?}` → `ModelConfig` (passed through unchanged; `temperature: null` sends none, absent keeps `ModelConfig`'s default). `openai_responses` scripts the [Responses API](#responses-api-mode) |
 | `rules` | permission rules, e.g. `{"*": "allow", "write_file": "ask"}` |
 | `limits` | `{"max_steps"}` → `Limits` |
 | `engine` | `{"delay_ms"}` → `MockEngine(delay_ms=...)` |
 | `style` | optional wire style of every exchange: `"openrouter"`, or `"openai"` (BYOK endpoints). Default: `"openai"` for `openai_compat`, else `"openrouter"`. Not in Responses scenarios (their style is `"responses"`) |
 | `strict` | optional strict modes for every exchange (see below) |
+| `background_tools` | optional tool names whose runs only start their work (`ToolHostImpl`'s `background`): `run()` returns a pending result, the turn ends `waiting`, and a `deliver` step brings the result |
 | `driver` | the steps the scenario runner performs, in order |
 | `exchanges` | the scripted model responses, in request order |
 | `expect` | final assertions, checked after the driver finishes |
@@ -78,9 +79,10 @@ a file (JSON schema plus cross-checks) and raises `ScenarioError` naming the exa
 
 | Step | Meaning |
 |---|---|
-| `{"user": str, "cancel_after_ms"?: int}` | run a turn with this user message; set `cancel` that many ms after the turn starts |
+| `{"user": str \| [part, ...], "cancel_after_ms"?: int, "system"?: str, "rules"?: {...}}` | run a turn with this user message (text, or chat content parts: `text`, `image_url`); set `cancel` that many ms after the turn starts; `system` and `rules` change the thread's settings from this turn on (`Runner.turn`, which notes the change in history). After `crash_after`: text only, no settings |
 | `{"approve": {"allow"?: [ids] \| "all", "deny"?: [ids], "reason"?: str}, "new_process": bool}` | answer the pending `permission.asked` calls and resume (`Resume(kind="approval")`), in a fresh process if `new_process` |
-| `{"crash_after": "<event type>", "call_id"?: str}` | run the **next** user step in a child process that SIGKILLs itself when its runner publishes the first event of this type; with `call_id`, the first one about that call (see below) |
+| `{"crash_after": "<event type>", "call_id"?: str}` | run the **next** user or deliver step in a child process that SIGKILLs itself when its runner publishes the first event of this type; with `call_id`, the first one about that call (see below) |
+| `{"deliver": {call_id: text}, "new_process": bool}` | deliver the finished results of waiting calls (`Resume(kind="tool_result")`, each `ok` with that text), in a fresh process (`bakeoff deliver`) if `new_process` |
 | `{"resume": "crash"}` | resume the killed turn (`Resume(kind="crash")`) |
 | `{"revert": n}` | `Runner.revert()` the thread's n-th turn (1-based, creation order) |
 | `{"compact": str}` | `Runner.compact()` with this summary |
@@ -118,8 +120,9 @@ Only `respond` is required. Before answering, the server applies, in order:
    it; `""` only checks that the result exists), `body_equals: {"dotted.path": value}` (exact
    value at a path in the body; an integer segment indexes a list, e.g. `"tools.0.name"`),
    `body_contains: {"dotted.path": value}` (the value at that path is a list that contains
-   it), `messages_at: [{index, role?, contains?}]` (checks one message; a negative index
-   counts from the end), and `min_gap_ms` (the request must arrive at least this long after
+   it), `messages_at: [{index, role?, contains?, parts?}]` (checks one message; a negative index
+   counts from the end; `parts`: the content is exactly that many parts, each with at least the
+   listed keys and values, nested objects too), and `min_gap_ms` (the request must arrive at least this long after
    the cursor's previous one, e.g. a retry that honours `retry-after`). Responses scenarios
    check `input` instead of `messages` (see below).
 
@@ -151,7 +154,7 @@ Responses are deterministic: identical for every run and impl.
 
 | Key | Passes when |
 |---|---|
-| `stops` (required) | the stop of each loop turn the driver runs to its end, in order: `user` (unless crashed), `approve` and `resume` steps. The runner's own `revert`/`compact` turns run no loop and have no stop, so they are not listed. The loader checks the count |
+| `stops` (required) | the stop of each loop turn the driver runs to its end, in order: `user` and `deliver` (unless crashed), `approve` and `resume` steps. The runner's own `revert`/`compact` turns run no loop and have no stop, so they are not listed. The loader checks the count |
 | `files` | `{path: substring}`: the file exists in the working copy and contains it; `{path: null}`: absent |
 | `tool_runs` | `{call_id: n}`: `tool.start` events for that call over the whole scenario, all processes included. `ToolHost` emits one per `run()`, so a deny rule or bad arguments count too; no scenario lists such a call |
 | `commits` | number of git commits the scenario's turns and reverts created |
@@ -161,6 +164,7 @@ Responses are deterministic: identical for every run and impl.
 | `usage` | `{input_tokens, output_tokens, cached_tokens}`: the totals over all usage events |
 | `cost_source` | every usage event's `cost_source` equals it: `provider` (billed cost from the provider), `estimate` (a price table) or `none` (no cost available, never guessed) |
 | `tools_overlap` | `[call_id, ...]` (at least 2): the tools of these calls ran at the same time. Each ran once, in one turn, and the last `tool.start` comes before the first `tool.end` (event `t_us`) |
+| `events` | `{event type: n}`: the log holds exactly n events of that type, all turns and processes together (e.g. `{"context.near_limit": 1}`) |
 | `cancel_within_ms` | every turn the driver cancels (`cancel_after_ms`) has its `turn.end` at most this many ms after the driver set `cancel`. The driver notes when it set it; `t_us` in the log gives the rest. A turn that ends before its cancel fires passes this key; `stops` judges it |
 
 Tool call ids are `call_<scenario>_<n>`, unique per scenario; the loader rejects references
@@ -181,7 +185,8 @@ shape, `param` naming the field (e.g. `Missing required parameter: 'input[3].out
 
 - `message` (`type` may be left out): `role` (`user`, `assistant`, `system`, `developer`) and
   `content`, a string or parts (`input_text`, `input_image`, `input_file`; for `assistant`,
-  `output_text` or `refusal`); a text part has a string `text`;
+  `output_text` or `refusal`); a text part has a string `text`, an `input_image` a string
+  `image_url` or `file_id`;
 - `function_call`: strings `call_id`, `name` and `arguments`;
 - `function_call_output`: a string `call_id` and `output`, a string or input parts;
 - `reasoning`: a string `id`, a `summary` list of `summary_text` parts, and `encrypted_content`
@@ -246,7 +251,7 @@ loop puts it. An item without a `type` but with a `role` is a `message`.
 | `last_type` | the last item's type: `message`, `function_call`, `function_call_output` or `reasoning` |
 | `last_role` | the last item's `role` (`user`, `assistant`) |
 | `last_content_contains` | the last item's text contains it: a message's text (a string or text parts), a `function_call_output`'s `output`, a `function_call`'s `arguments`, a reasoning summary |
-| `input_at` | `[{index, type?, role?, phase?, contains?}]`: checks one item; a negative index counts from the end |
+| `input_at` | `[{index, type?, role?, phase?, contains?, parts?}]`: checks one item; a negative index counts from the end; `parts` as in chat's `messages_at` |
 | `tool_result_contains` | `{call_id: substring}`: a `function_call_output` with that `call_id` contains it (`""`: it exists) |
 | `reasoning_replayed` | `[reasoning id]`: `input` has that reasoning item exactly once, equal to its done item (same keys and values; `encrypted_content` byte for byte; with a summary if this request asks for one, since a thread's requests all do or all don't). The loader checks that an earlier exchange sends it |
 
@@ -324,11 +329,17 @@ The next request replays the done reasoning item verbatim, the function call and
 | S13 | BYOK thinking: `openai_compat`, `qwen3-32b`, `reasoning_effort` on the wire, `reasoning_content` back |
 | S14 | BYOK strict endpoint: 400 on `reasoning`, `reasoning_effort` or `stream_options` |
 | S15 | compaction: after the summary a request is `[system, summary, new user]`, then append-only |
+| S16 | tools that run for minutes (`background_tools: ["validate_pipeline"]`): two validate calls wait, `describe_component` runs, the turn ends `waiting`; a `bakeoff deliver` process delivers both results and dies once the first is saved; the crash resume delivers the second again from that turn's `turn.start`; one result per call, each tool started once |
+| S17 | settings change between turns: a new system prompt and rules under which `write_file` asks; the request after the change is `[new system, history, note, new user]`; approve |
+| S18 | a user message with images: a text part, an `image_url` by URL and one inline (a data URL, `detail: low`); both requests carry the parts as sent |
+| S19 | context nearly full (`context_window` 10,000): 8,200 then 8,600 input tokens in one turn give one `context.near_limit`; the driver compacts; the next turn is small |
 | R01 | Responses API, `gpt-6-luna` at effort `xhigh`: the request shape (`store: false`, `include` has `reasoning.encrypted_content`, Responses-style tools, no `temperature`/`max_tokens`/`reasoning_effort`); reasoning with a summary, then the answer |
 | R02 | reasoning (two summary parts), one `describe_component` call, its output, then the answer; the reasoning item is replayed exactly as its done event sent it |
 | R03 | reasoning, a `commentary` message and three calls in one response (`validate_pipeline` and `describe_component` allowed, `write_file` asks); approve in a new process; the resumed request replays everything, `phase` included |
 | R04 | 429 with `retry-after: 1`, then OK; next turn: a complete reasoning item, cut text and an `error` event mid-stream, then the same request again, keeping nothing of the failed attempt |
 | R05 | cancel while a reasoning item streams (cut before its done event); strict `reject_unencrypted_reasoning`: the next turn must not replay the cut item |
+| R06 | the same user message as S18: `input_text` and `input_image` parts (the URL flat, `detail` `auto` unless the part says), in both requests |
+| R07 | as S16's first turn, on the Responses API with a reasoning item; one result is delivered in-process (still waiting: no request), the other by `bakeoff deliver`; the request replays the reasoning item and has one result per call |
 
 Every R scenario uses model kind `openai_responses`, `gpt-6-luna`, `reasoning: {"effort":
 "xhigh"}`, `temperature: null`, and strict `reject_params` (`temperature`, `max_tokens`,

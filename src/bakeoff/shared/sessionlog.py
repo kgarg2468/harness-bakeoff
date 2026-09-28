@@ -19,17 +19,19 @@ from typing import Any
 
 from bakeoff.shared.contract import Item
 
-_SCHEMA = """
+_TURNS = """CREATE TABLE IF NOT EXISTS turns(
+    id TEXT PRIMARY KEY, thread TEXT NOT NULL, idx INTEGER NOT NULL,
+    kind TEXT NOT NULL
+        CHECK (kind IN ('user', 'approval', 'crash', 'tool_result', 'revert', 'compact')),
+    status TEXT NOT NULL
+        CHECK (status IN ('running', 'paused', 'waiting', 'done', 'error', 'cancelled')),
+    stop TEXT, pending TEXT, commit_sha TEXT, started_us INTEGER NOT NULL, ended_us INTEGER,
+    late TEXT, UNIQUE (thread, idx))"""
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS threads(
     id TEXT PRIMARY KEY, impl TEXT NOT NULL, system TEXT NOT NULL, meta TEXT NOT NULL,
     created_us INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS turns(
-    id TEXT PRIMARY KEY, thread TEXT NOT NULL, idx INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('user', 'approval', 'crash', 'revert', 'compact')),
-    status TEXT NOT NULL
-        CHECK (status IN ('running', 'paused', 'done', 'error', 'cancelled')),
-    stop TEXT, pending TEXT, commit_sha TEXT, started_us INTEGER NOT NULL, ended_us INTEGER,
-    late TEXT, UNIQUE (thread, idx));
+{_TURNS};
 CREATE TABLE IF NOT EXISTS items(
     thread TEXT NOT NULL, seq INTEGER NOT NULL, turn TEXT NOT NULL, id TEXT NOT NULL,
     json TEXT NOT NULL, PRIMARY KEY (thread, seq));
@@ -56,6 +58,7 @@ CREATE TRIGGER IF NOT EXISTS events_no_replace BEFORE INSERT ON events
 """
 
 _ITEM_FIELDS = tuple(f.name for f in fields(Item))
+_TURN_COLUMNS = "id thread idx kind status stop pending commit_sha started_us ended_us late".split()
 
 # One stored event: thread, seq, turn, type, t_us and the envelope as JSON.
 EventRow = tuple[str, int, str, str, int, str]
@@ -74,6 +77,22 @@ def item_to_json(item: Item) -> dict[str, Any]:
 def item_from_json(data: dict[str, Any]) -> Item:
     """Inverse of `item_to_json`."""
     return Item(**data)
+
+
+# Logs written before `turn.saved` replaced it end each saved turn with a `commit` event
+# ({sha, files}). Events are append-only, so they stay as written and readers accept both.
+LEGACY_SAVED_EVENT = "commit"
+
+
+def saved_data(event: dict[str, Any]) -> dict[str, Any] | None:
+    """A stored `turn.saved` event's data (`{version, files}`), also for a legacy `commit`
+    event; None for any other event."""
+    data = event.get("data") or {}
+    if event.get("type") == "turn.saved":
+        return data
+    if event.get("type") == LEGACY_SAVED_EVENT:
+        return {"version": data.get("sha"), "files": data.get("files") or []}
+    return None
 
 
 def event_row(envelope: dict[str, Any]) -> EventRow:
@@ -102,9 +121,27 @@ class SessionLog:
             with self._tx() as db:
                 if "late" not in self._columns("turns"):  # another process may have added it
                     db.execute("ALTER TABLE turns ADD COLUMN late TEXT")
+        # One created before waiting turns has no "waiting" status or "tool_result" kind in its
+        # CHECKs, which SQLite cannot alter: the table is copied into the current one.
+        if "'waiting'" not in self._table_sql("turns"):
+            with self._tx() as db:
+                if "'waiting'" not in self._table_sql("turns"):
+                    columns = ", ".join(_TURN_COLUMNS)
+                    db.execute("ALTER TABLE turns RENAME TO turns_before_waiting")
+                    db.execute(_TURNS)
+                    db.execute(
+                        f"INSERT INTO turns ({columns}) SELECT {columns} FROM turns_before_waiting"
+                    )
+                    db.execute("DROP TABLE turns_before_waiting")
 
     def _columns(self, table: str) -> set[str]:
         return {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
+
+    def _table_sql(self, table: str) -> str:
+        row = self._db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        return row[0]
 
     def close(self) -> None:
         self._db.close()
@@ -228,9 +265,22 @@ class SessionLog:
 
     # items and events
 
-    def append_item(self, thread_id: str, item: Item, events: Iterable[EventRow] = ()) -> int:
-        """Append an item (seq = its position in history) plus `events`, in one transaction."""
+    def append_item(
+        self,
+        thread_id: str,
+        item: Item,
+        events: Iterable[EventRow] = (),
+        *,
+        settings: dict[str, Any] | None = None,
+    ) -> int:
+        """Append an item (seq = its position in history) plus `events`, in one transaction.
+        `settings` (`{"system", "meta"}`) replaces the thread's in the same transaction."""
         with self._tx() as db:
+            if settings is not None:
+                db.execute(
+                    "UPDATE threads SET system = ?, meta = ? WHERE id = ?",
+                    (settings["system"], json.dumps(settings["meta"]), thread_id),
+                )
             seq = self._insert_item(db, thread_id, item)
             self._insert_events(db, events)
         return seq
@@ -262,10 +312,12 @@ class SessionLog:
     def _insert_events(db: sqlite3.Connection, events: Iterable[EventRow]) -> None:
         db.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)", events)
 
-    def events(self, thread_id: str) -> list[dict[str, Any]]:
-        """All event envelopes of a thread in seq order."""
+    def events(self, thread_id: str, types: Iterable[str] = ()) -> list[dict[str, Any]]:
+        """All event envelopes of a thread in seq order; only those of `types`, if given."""
+        types = tuple(types)
+        where = f" AND type IN ({', '.join('?' * len(types))})" if types else ""
         rows = self._db.execute(
-            "SELECT json FROM events WHERE thread = ? ORDER BY seq", (thread_id,)
+            f"SELECT json FROM events WHERE thread = ?{where} ORDER BY seq", (thread_id, *types)
         ).fetchall()
         return [json.loads(r[0]) for r in rows]
 
