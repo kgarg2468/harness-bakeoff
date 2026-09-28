@@ -470,7 +470,11 @@ def _unfinished(events: Sequence[dict[str, Any]], stops: dict[Any, Any]) -> list
 
 
 def check_seq(events: Sequence[dict[str, Any]], items: Sequence[Item]) -> Check:
-    """I3: event seqs are 1..n without gaps, and `item` events match the item rows."""
+    """I3: the stored events' seqs are 1..n without gaps, and `item` events match the item rows.
+
+    A runtime may deliver the live-only events (`contract.LIVE_ONLY_EVENTS`) without storing
+    them; it gives them no seq, so this holds either way. The reference runner stores them all.
+    """
     seqs = [e["seq"] for e in events]
     seen = set(seqs)
     item_events = [e["data"]["item"]["id"] for e in events if e["type"] == "item"]

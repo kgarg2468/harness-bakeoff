@@ -140,7 +140,8 @@ def _logged_failure(what: str) -> Iterator[None]:
 
 
 class _Publisher:
-    """Stamps one turn's events, persists them and publishes them to the sink.
+    """Stamps one turn's events, persists them and publishes them to the sink. It stores every
+    event, the live-only ones too (`contract.LIVE_ONLY_EVENTS`), and numbers them all.
 
     `item` and `tool.start` events are persisted (with everything buffered before them) before
     they are published, a `tool.start` before its tool runs, so no crash can hide a run from I2.

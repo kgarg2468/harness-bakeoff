@@ -76,6 +76,25 @@ other implementation. Git is not part of the contract.
 `ToolHost` is built by the runner with an `emit` callback, so `tool.start` and `tool.end` are
 timed identically for every loop.
 
+**Live-only events.** `contract.LIVE_ONLY_EVENTS` (`text.delta`, `reasoning.delta`) are for
+watching a turn as it happens; nothing that resumes or judges a turn reads them. A runtime may
+deliver them without storing them, and then gives them no `seq`, so the stored events still
+number 1..n (I3). Stored events are the rest: messages (`item`), tool start and end, permission
+requests, usage and the turn boundaries, plus `request.start`, `tool_call.ready`, `retry` and
+`error`. The reference runner stores every event (the report's replay draws streaming from the
+deltas).
+
+### Turn ownership
+
+The runtime runs each turn in its own task, independent of any client connection: a client that
+disconnects neither stops nor pauses the turn (only `cancel` does), and it can attach to the
+turn's events again. One conversation runs in one place at a time, under a lock that expires if
+its holder dies: every turn, revert and compaction of a thread takes it, and a crash resume takes
+it once the dead holder's lock is gone. Here a turn runs in the task that calls `Runner.turn`
+(for `bakeoff turn`, `approve` and `resume`, a worker process that no client holds open), and the
+lock is an OS file lock per thread (`runner._try_lock`) that the kernel drops when the process
+holding it dies. Its git processes inherit it, so a dead worker's last git process releases it.
+
 ### Items and history
 
 `Item.message` is an OpenAI chat-completions message, exactly as it goes on the wire:

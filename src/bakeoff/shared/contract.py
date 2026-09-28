@@ -32,6 +32,20 @@ Rules every Loop must follow (tests enforce them, see DESIGN.md):
    as "turn fully done" and `turn.end` as "the loop is done".
 8. If history contains a compaction item (`Item.compaction`), a request carries
    only the system prompt plus the last compaction item and everything after it.
+
+Turn ownership (the runtime's side of the seam):
+
+- The runtime runs each turn in its own task, independent of any client
+  connection. A client that disconnects neither stops nor pauses the turn; only
+  `cancel` stops it, and a client may attach to its events again later.
+- One conversation (thread) runs in one place at a time, under a lock that
+  expires if its holder dies. Turns, reverts and compactions of a thread take it;
+  a resume after a crash takes it once the dead holder's lock has expired.
+
+In this repo a turn runs in the task that calls `Runner.turn`: a worker process
+of its own for `bakeoff turn`, `approve` and `resume`, which no client holds
+open. The lock is an OS file lock per thread (`runner._try_lock`), which
+the kernel drops when the process that holds it dies.
 """
 
 from __future__ import annotations
@@ -63,6 +77,13 @@ SHARED_EVENTS = (
     "tool.end",  # {call_id, name, ok, ms}: ToolHost
     "turn.saved",  # {version, files}: runner, after a turn completes (a git sha here)
 )
+# Events a runtime may deliver live without storing them: they show a turn as it happens, and
+# nothing that resumes or judges a turn reads them. The stored events are the rest: messages
+# (`item`), tool start and end, permission requests, usage, and the turn boundaries (turn.start,
+# turn.end, turn.saved), plus request.start, tool_call.ready, retry and error. A runtime that
+# does not store an event gives it no `seq`, so the stored seqs still have no gaps (I3). The
+# reference runner stores every event.
+LIVE_ONLY_EVENTS = ("text.delta", "reasoning.delta")
 
 
 @dataclass(slots=True, frozen=True)

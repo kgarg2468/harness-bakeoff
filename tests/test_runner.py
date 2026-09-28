@@ -7,7 +7,15 @@ from typing import ClassVar
 import pytest
 
 from bakeoff.shared import workcopy
-from bakeoff.shared.contract import Event, Item, ModelConfig, Resume, ToolCall, ToolResult
+from bakeoff.shared.contract import (
+    LIVE_ONLY_EVENTS,
+    Event,
+    Item,
+    ModelConfig,
+    Resume,
+    ToolCall,
+    ToolResult,
+)
 from bakeoff.shared.invariants import check_commits, check_seq, check_tool_results
 from bakeoff.shared.runner import (
     NdjsonMirror,
@@ -482,6 +490,28 @@ async def test_a_loop_item_must_be_an_ordinary_item_of_its_turn(runner, log, tid
     assert summary["stop"] == "error"
     assert error in log.events(tid)[2]["data"]["message"]
     assert [i.id for i in log.items(tid)] == [f"{tid}.0:user"]
+
+
+async def test_the_checks_hold_without_the_live_only_events(runner, log, tid):
+    """A runtime may deliver LIVE_ONLY_EVENTS without storing them (and give them no seq). The
+    reference runner stores them, but I2 and I3 read none of them."""
+
+    async def chatty(turn, tools, cancel):
+        yield Event("request.start", {"step": 1, "attempt": 1})
+        yield Event("reasoning.delta", {"text": "hmm"})
+        call = write_call(turn, "a.pipe")
+        yield Event("text.delta", {"text": "Writing."})
+        yield item(turn, "a", {**assistant(call), "content": "Writing."})
+        yield tool_item(turn, await tools.run(call))
+        yield Event("turn.end", {"stop": "end_turn", "steps": 1})
+
+    await runner.turn(FakeLoop(chatty), tid, model=MODEL, user_text="go")
+    stored = [e for e in log.events(tid) if e["type"] not in LIVE_ONLY_EVENTS]
+    stored = [{**e, "seq": n} for n, e in enumerate(stored, 1)]
+    assert len(stored) == len(log.events(tid)) - 2
+    items = log.items(tid)
+    for check in (check_seq(stored, items), check_tool_results(items, stored, log.turns(tid))):
+        assert check.ok, check.detail
 
 
 async def test_events_are_recorded_as_emitted(runner, log, tid, published):
