@@ -743,7 +743,8 @@ def _expect_failures(
 
 
 def _parts_problem(content: object, want: list[dict[str, Any]]) -> str | None:
-    """Why `content` is not exactly the parts `want` lists (each with at least its keys), or None."""
+    """Why `content` is not exactly the parts `want` lists (each with at least its keys), or
+    None."""
     got = content if isinstance(content, list) else []
     if len(got) != len(want):
         return f"has {len(got)} content parts, expected {len(want)}"

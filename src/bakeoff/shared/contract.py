@@ -101,9 +101,8 @@ SHARED_EVENTS = (
 # nothing that resumes or judges a turn reads them. The stored events are the rest: messages
 # (`item`), tool start and end, permission requests, usage, and the turn boundaries (turn.start,
 # turn.end, turn.saved), plus request.start, tool_call.ready, context.near_limit, retry and
-# error. A runtime that
-# does not store an event gives it no `seq`, so the stored seqs still have no gaps (I3). The
-# reference runner stores every event.
+# error. A runtime that does not store an event gives it no `seq`, so the stored seqs still
+# have no gaps (I3). The reference runner stores every event.
 LIVE_ONLY_EVENTS = ("text.delta", "reasoning.delta", "tool.progress")
 
 
@@ -228,7 +227,8 @@ class TurnInput:
 
 
 class ToolHost(Protocol):
-    """Shared tool registry + permission rules. Emits tool.start/tool.end itself."""
+    """Shared tool registry + permission rules. Emits tool.start, tool.progress and tool.end
+    itself."""
 
     def specs(self) -> list[ToolSpec]:
         """All tools, always in the same order (keeps the prompt prefix stable)."""
@@ -239,7 +239,8 @@ class ToolHost(Protocol):
         ...
 
     async def run(self, call: ToolCall) -> ToolResult:
-        """Validate args, enforce deny, execute. Never raises."""
+        """Validate args, enforce deny, execute within the spec's `timeout_s`. Never raises. A
+        pending result means the tool's work goes on (rule 9)."""
         ...
 
 

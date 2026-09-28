@@ -274,8 +274,8 @@ class _Publisher:
 
     def publish(self, event: Event) -> None:
         """The ToolHost's `emit` callback. A tool event after the loop's `turn.end` cannot
-        join the stream (`turn.saved` must follow `turn.end` directly), so it is stored on the turn
-        row (`late`) at once: also after the row is complete, e.g. from a tool task that
+        join the stream (`turn.saved` must follow `turn.end` directly), so it is stored on the
+        turn row (`late`) at once: also after the row is complete, e.g. from a tool task that
         outlived its loop."""
         if not self.ended:
             self.emit(event.type, event.data)
@@ -352,9 +352,9 @@ class Runner:
     (`make_workspace`, by default a git `WorkCopy`).
 
     Each turn, revert and compaction holds the thread's OS lock (see `_try_lock`) while it runs.
-    A resume (approval or crash) waits up to `lock_wait_s` seconds for it: it follows the end of
-    the turn before it, whose worker, or that worker's last git process, may still hold it.
-    Anything else raises ThreadBusy at once.
+    A resume (approval, tool results or crash) waits up to `lock_wait_s` seconds for it: it
+    follows the end of the turn before it, whose worker, or that worker's last git process, may
+    still hold it. Anything else raises ThreadBusy at once.
     """
 
     def __init__(
@@ -442,8 +442,8 @@ class Runner:
         raising. `asyncio.CancelledError` propagates and leaves the turn "running", like a crash;
         resume it with `Resume(kind="crash")`. Any other failure (the workspace, or the session
         log) is raised after the turn is recorded without a saved version: as "error" (the next
-        turn's saved version includes its changes), or still "paused" if it paused. If even
-        that cannot be written, the turn stays "running" for a crash resume.
+        turn's saved version includes its changes), or still "paused" or "waiting" if it ended
+        so. If even that cannot be written, the turn stays "running" for a crash resume.
 
         A resume waits up to `lock_wait_s` for the thread's lock; a new user message raises
         ThreadBusy at once while another turn, revert or compaction holds it.

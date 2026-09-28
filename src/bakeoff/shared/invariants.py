@@ -132,9 +132,10 @@ def check_prefix(
             f" {requests[v['request'] - 1].label(v['message'])} changed or was dropped"
         )
     else:
+        byte_prefix = "yes" if not byte_mismatches else "no"
         detail = (
             f"{len(requests)} requests append-only ({len(resets)} resets at a compaction or a"
-            f" configuration change); byte-identical prefix: {'yes' if not byte_mismatches else 'no'}"
+            f" configuration change); byte-identical prefix: {byte_prefix}"
         )
     return Check("I1", not violations, detail, info)
 
@@ -530,10 +531,10 @@ def check_commits(log: SessionLog, thread_id: str, wc_path: Path) -> Check:
     The workspace here is a git `WorkCopy`, so a version is a commit.
 
     Completed = done, error or cancelled. Compaction turns change no files and save no
-    version; paused and waiting turns are saved by the turn that resumes them. An "error" turn without a
-    version failed to save: a later turn's version includes its changes, so a later workspace
-    turn must have one. (A revert without a version recorded nothing, and the runner undid what
-    git did for it.)
+    version; paused and waiting turns are saved by the turn that resumes them. An "error" turn
+    without a version failed to save: a later turn's version includes its changes, so a later
+    workspace turn must have one. (A revert without a version recorded nothing, and the runner
+    undid what git did for it.)
     """
     all_turns = log.turns(thread_id)
     rows = [t for t in all_turns if t["kind"] != "compact"]
